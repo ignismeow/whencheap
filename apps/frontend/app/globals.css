@@ -1,0 +1,34 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --background: #f7f7f4;
+  --foreground: #171717;
+  --panel: #ffffff;
+  --panel-strong: #f1f5f3;
+  --border: #d8ded8;
+  --muted: #5f6b66;
+  --accent: #116149;
+  --accent-strong: #0b4635;
+  --warning: #a15c16;
+  --danger: #a33434;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}

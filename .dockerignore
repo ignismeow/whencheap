@@ -1,0 +1,15 @@
+node_modules
+**/node_modules
+.next
+**/.next
+dist
+**/dist
+coverage
+.git
+.env
+.env.local
+contracts/cache
+contracts/broadcast
+contracts/out
+contracts/lib
+*.log

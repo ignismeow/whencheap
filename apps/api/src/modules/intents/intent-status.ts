@@ -1,0 +1,17 @@
+export enum IntentStatus {
+  PendingIntent = 'PENDING_INTENT',
+  Submitted = 'SUBMITTED',
+  Confirming = 'CONFIRMING',
+  Confirmed = 'CONFIRMED',
+  Finalized = 'FINALIZED',
+  Stuck = 'STUCK',
+  SpeedUpSubmitted = 'SPEED_UP_SUBMITTED',
+  Dropped = 'DROPPED',
+  Resubmitted = 'RESUBMITTED',
+  DeadlineExceeded = 'DEADLINE_EXCEEDED',
+  Cancelled = 'CANCELLED',
+  InsufficientBalance = 'INSUFFICIENT_BALANCE',
+  NeedsReauthorization = 'NEEDS_REAUTHORIZATION',
+  NonceConflict = 'NONCE_CONFLICT',
+  Rescheduled = 'RESCHEDULED'
+}

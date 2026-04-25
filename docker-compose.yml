@@ -1,0 +1,51 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file:
+      - apps/api/.env
+    environment:
+      HOST: 0.0.0.0
+      DATABASE_URL: postgresql://whencheap:whencheap@postgres:5432/whencheap
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "3001:3001"
+    depends_on:
+      - postgres
+      - redis
+
+  frontend:
+    build:
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
+        NEXT_PUBLIC_CHAIN_ID: ${NEXT_PUBLIC_CHAIN_ID:-11155111}
+        NEXT_PUBLIC_WALLETCONNECT_ID: ${NEXT_PUBLIC_WALLETCONNECT_ID:-65d52a70398ba52d4f9f60b9bb6a1c97}
+        NEXT_PUBLIC_SESSION_CONTRACT: ${NEXT_PUBLIC_SESSION_CONTRACT:-0x61029974BAcb70EB7C6FEab146Da0b6A76224e59}
+    env_file:
+      - apps/frontend/.env
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: whencheap
+      POSTGRES_PASSWORD: whencheap
+      POSTGRES_DB: whencheap
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6389:6379"
+
+volumes:
+  postgres_data:

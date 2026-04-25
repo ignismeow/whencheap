@@ -1,0 +1,22 @@
+{
+  "name": "whencheap",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Gas-aware autonomous transaction agent",
+  "workspaces": [
+    "apps/api",
+    "apps/frontend"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace apps/api",
+    "dev:api": "npm run dev --workspace apps/api",
+    "dev:frontend": "npm run dev --workspace apps/frontend",
+    "deploy:session": "zsh scripts/deploy-session.zsh",
+    "build": "npm run build --workspace apps/api && npm run build --workspace apps/frontend",
+    "lint": "npm run lint --workspace apps/api && npm run lint --workspace apps/frontend",
+    "typecheck": "npm run typecheck --workspace apps/api && npm run typecheck --workspace apps/frontend"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
