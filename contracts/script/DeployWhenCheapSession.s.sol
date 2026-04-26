@@ -6,8 +6,9 @@ import "../src/WhenCheapSession.sol";
 
 contract DeployWhenCheapSession is Script {
     function run() external returns (WhenCheapSession deployed) {
+        address agentAddress = vm.envAddress("AGENT_ADDRESS");
         vm.startBroadcast();
-        deployed = new WhenCheapSession();
+        deployed = new WhenCheapSession(agentAddress);
         vm.stopBroadcast();
     }
 }

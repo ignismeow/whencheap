@@ -27,6 +27,11 @@ if [[ -z "${DEPLOYER_PRIVATE_KEY:-}" ]]; then
   exit 1
 fi
 
+if [[ -z "${AGENT_ADDRESS:-}" ]]; then
+  echo "AGENT_ADDRESS is missing. Set it in contracts/.env to the public address for your agent signer."
+  exit 1
+fi
+
 source "$HOME/.zshenv" 2>/dev/null || true
 
 cd "$ROOT_DIR/contracts"

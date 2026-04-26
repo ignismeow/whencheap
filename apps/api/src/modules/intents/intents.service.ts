@@ -1,7 +1,7 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { randomUUID } from 'crypto';
-import { OllamaIntentParser } from '../agent/ollama-intent-parser.service';
+import { GeminiIntentParser } from '../agent/gemini-intent-parser.service';
 import { GasOracleService } from '../gas/gas-oracle.service';
 import { KeeperHubService } from '../keeperhub/keeperhub.service';
 import { SessionSignerService } from '../session/session-signer.service';
@@ -15,7 +15,7 @@ export class IntentsService {
   private readonly intents = new Map<string, IntentRecord>();
 
   constructor(
-    private readonly parser: OllamaIntentParser,
+    private readonly parser: GeminiIntentParser,
     private readonly gas: GasOracleService,
     private readonly keeperHub: KeeperHubService,
     private readonly sessionSigner: SessionSignerService
@@ -39,6 +39,10 @@ export class IntentsService {
     this.addAudit(intent, 'INTENT_CREATED', 'Intent accepted and parsed.', { parsed });
     this.intents.set(id, intent);
     return intent;
+  }
+
+  storeAuthorization(userAddress: string, authorization: unknown): void {
+    this.sessionSigner.storeAuthorization(userAddress, authorization);
   }
 
   list(): IntentRecord[] {
@@ -102,9 +106,9 @@ export class IntentsService {
       }
       this.addAudit(intent, 'SESSION_CHECK_PASSED', 'Session valid and within limits. Proceeding to execution.');
 
-      // Prefer direct execution (agent wallet) — fall back to KeeperHub if not configured
-      if (this.sessionSigner.agentAddress) {
-        await this.executeDirectly(intent, baseFeeGwei);
+      const authorization = this.sessionSigner.getAuthorization(intent.wallet);
+      if (authorization) {
+        await this.executeEIP7702(intent, authorization, baseFeeGwei);
       } else {
         await this.submitToKeeperHub(intent, baseFeeGwei);
       }
@@ -138,12 +142,36 @@ export class IntentsService {
       this.transition(
         intent,
         IntentStatus.Submitted,
-        `Transaction broadcast by agent ${this.sessionSigner.agentAddress}. Hash: ${txHash}.`,
-        { txHash, agentAddress: this.sessionSigner.agentAddress }
+        `Agent-funded fallback transaction broadcast. Hash: ${txHash}.`,
+        { txHash, agentAddress: this.sessionSigner.agentAddress, senderModel: 'agent-funded-fallback' }
       );
     } catch (err) {
       this.logger.warn(`Direct execution failed for intent ${intent.id}: ${String(err)}`);
       this.addAudit(intent, 'EXECUTION_FAILED', `Broadcast failed: ${String(err)}. Will retry next gas check.`);
+    }
+  }
+
+  private async executeEIP7702(intent: IntentRecord, authorization: unknown, baseFeeGwei: number) {
+    try {
+      this.addAudit(
+        intent,
+        'EIP7702_EXECUTION',
+        'Attempting EIP-7702 authorization-list execution.',
+        { userWallet: intent.wallet }
+      );
+
+      const txHash = await this.sessionSigner.broadcastEIP7702Intent(intent, authorization, baseFeeGwei);
+      intent.txHash = txHash;
+      this.transition(
+        intent,
+        IntentStatus.Submitted,
+        `EIP-7702 authorization-list transaction broadcast. Hash: ${txHash}.`,
+        { txHash, senderModel: 'eip7702-authorization-list', userWallet: intent.wallet }
+      );
+    } catch (err) {
+      this.logger.warn(`EIP-7702 execution failed for intent ${intent.id}: ${String(err)}`);
+      this.addAudit(intent, 'EIP7702_FAILED', `EIP-7702 failed: ${String(err)}. Falling back to KeeperHub.`);
+      await this.submitToKeeperHub(intent, baseFeeGwei);
     }
   }
 
@@ -157,6 +185,18 @@ export class IntentsService {
         return;
       }
       if (receipt.status === 1) {
+        const feePaid = receipt.gasUsed * receipt.gasPrice;
+        try {
+          const spendTxHash = await this.sessionSigner.recordSpend(intent.wallet, feePaid);
+          if (spendTxHash) {
+            this.addAudit(intent, 'SESSION_SPEND_RECORDED', `Session spend recorded. Tx: ${spendTxHash}`, {
+              spendTxHash,
+              feePaidWei: feePaid.toString()
+            });
+          }
+        } catch (err) {
+          this.addAudit(intent, 'SESSION_SPEND_RECORD_FAILED', `Could not record session spend: ${String(err)}`);
+        }
         this.transition(intent, IntentStatus.Finalized, `Confirmed in block ${receipt.blockNumber}.`, {
           txHash: intent.txHash,
           blockNumber: receipt.blockNumber
@@ -175,8 +215,20 @@ export class IntentsService {
       intent.keeperHubWorkflowId = workflowId;
       this.transition(intent, IntentStatus.Submitted, `KeeperHub workflow triggered: ${workflowId}.`, { workflowId });
     } catch (err) {
-      this.logger.warn(`KeeperHub submission failed for intent ${intent.id}: ${String(err)}`);
-      this.addAudit(intent, 'SUBMISSION_FAILED', `KeeperHub unavailable: ${String(err)}. Will retry next gas check.`);
+      const message = this.keeperHub.describeError(err);
+      this.logger.warn(`KeeperHub submission failed for intent ${intent.id}: ${message}`);
+      this.addAudit(
+        intent,
+        'SUBMISSION_FAILED',
+        `${message} Falling back to direct agent-wallet execution.`,
+        { keeperHubUnavailable: this.keeperHub.isUnavailableError(err) }
+      );
+      this.addAudit(
+        intent,
+        'AGENT_FALLBACK_USED',
+        'KeeperHub unavailable. Executing directly from agent wallet.'
+      );
+      await this.executeDirectly(intent, baseFeeGwei);
     }
   }
 

@@ -47,8 +47,34 @@ type IntentRecord = {
   audit: AuditEvent[];
 };
 
+type Eip1193Provider = {
+  isRabby?: boolean;
+  providers?: Eip1193Provider[];
+  request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
+};
+
+type WalletWindow = Window & {
+  ethereum?: Eip1193Provider;
+  rabby?: { ethereum?: Eip1193Provider };
+};
+
 const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 const fetcher = (url: string) => fetch(url).then((res) => res.json());
+
+function getInjectedSigningProvider(): Eip1193Provider | undefined {
+  if (typeof window === 'undefined') return undefined;
+
+  const walletWindow = window as WalletWindow;
+  if (walletWindow.rabby?.ethereum) return walletWindow.rabby.ethereum;
+
+  const ethereum = walletWindow.ethereum;
+  if (ethereum?.providers) {
+    const providers: Eip1193Provider[] = ethereum.providers;
+    return providers.find((provider: Eip1193Provider) => provider.isRabby) ?? providers[0];
+  }
+
+  return ethereum;
+}
 
 export default function Home() {
   const { address, chainId, isConnected } = useAccount();
@@ -107,7 +133,7 @@ export default function Home() {
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-5 py-4">
           <div>
             <h1 className="text-2xl font-semibold tracking-normal">WhenCheap</h1>
-            <p className="mt-1 text-sm text-[var(--muted)]">Gas-aware intent execution with local Ollama parsing.</p>
+            <p className="mt-1 text-sm text-[var(--muted)]">Gas-aware intent execution with Gemini intent parsing.</p>
           </div>
           <div className="flex items-center gap-2 text-sm text-[var(--muted)]">
             <ShieldCheck size={18} className="text-[var(--accent)]" />
@@ -145,7 +171,7 @@ export default function Home() {
               value={input}
               onChange={(event) => setInput(event.target.value)}
               className="mt-2 min-h-36 w-full resize-y rounded-md border border-[var(--border)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
-              placeholder="Swap 0.1 ETH to USDC when gas is under $1 before midnight"
+              placeholder="Send 0.1 ETH to USDC when gas is under $1 before midnight"
             />
 
             {error ? <p className="mt-3 text-sm text-[var(--danger)]">{error}</p> : null}
@@ -223,7 +249,7 @@ function WalletSessionPanel({
   const { disconnect } = useDisconnect();
   const { switchChain, isPending: isSwitching } = useSwitchChain();
   const { data: walletClient } = useWalletClient();
-  const { writeContract, data: hash, isPending: isWriting, error: writeError } = useWriteContract();
+  const { writeContract, writeContractAsync, data: hash, isPending: isWriting, error: writeError } = useWriteContract();
   const { isLoading: isConfirming, isSuccess: isConfirmed } = useWaitForTransactionReceipt({ hash });
   const [maxFeePerTxEth, setMaxFeePerTxEth] = useState('0.001');
   const [maxTotalSpendEth, setMaxTotalSpendEth] = useState('0.01');
@@ -246,34 +272,70 @@ function WalletSessionPanel({
   }, [isConfirmed, refetch]);
 
   const isWrongChain = isConnected && chainId !== sepolia.id;
-  const injectedConnector = connectors[0];
+  const visibleConnectors = connectors.filter((connector, index, all) => {
+    const key = `${connector.id}:${connector.name}`;
+    return all.findIndex((item) => `${item.id}:${item.name}` === key) === index;
+  });
 
   async function authorizeSession() {
     if (!sessionContractAddress || !walletClient) return;
 
-    const expiresAt = BigInt(Math.floor(Date.now() / 1000) + Number(expiryHours) * 60 * 60);
+    const durationSeconds = BigInt(Number(expiryHours) * 60 * 60);
 
-    // Attempt EIP-7702 delegation — delegates EOA code to the session contract so
-    // the agent can call recordSpend with msg.sender == user's wallet.
-    // Falls back silently if the wallet doesn't support it yet.
+    // Attempt EIP-7702 delegation through direct JSON-RPC. Rabby currently exposes
+    // eth_signAuthorization here even when wagmi's walletClient has no wrapper.
+    let authorization: unknown;
     let authorizationList: unknown[] | undefined;
     try {
-      const auth = await (walletClient as { signAuthorization?: (args: { contractAddress: `0x${string}`; chainId: number }) => Promise<unknown> }).signAuthorization?.({
-        contractAddress: sessionContractAddress,
-        chainId: sepolia.id
+      const provider = getInjectedSigningProvider();
+      if (!provider) throw new Error('No injected wallet provider found');
+
+      authorization = await provider.request({
+        method: 'eth_signAuthorization',
+        params: [{
+          contractAddress: sessionContractAddress,
+          chainId: `0x${sepolia.id.toString(16)}`
+        }]
       });
-      if (auth) authorizationList = [auth];
-    } catch {
+
+      console.log('signAuthorization result:', authorization);
+      if (authorization) authorizationList = [authorization];
+    } catch (err) {
+      console.error('signAuthorization failed:', err);
       // wallet doesn't support EIP-7702 yet — plain updateSession still works
     }
 
-    writeContract({
+    const txHash = await writeContractAsync({
       address: sessionContractAddress,
       abi: whenCheapSessionAbi,
-      functionName: 'updateSession',
-      args: [parseEther(maxFeePerTxEth), parseEther(maxTotalSpendEth), expiresAt, []],
+      functionName: 'authorize',
+      args: [parseEther(maxFeePerTxEth), parseEther(maxTotalSpendEth), durationSeconds],
       ...(authorizationList ? { authorizationList } : {})
     } as Parameters<typeof writeContract>[0]);
+
+    if (authorization && address) {
+      const response = await fetch(`${apiUrl}/intents/session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userAddress: address, authorization, txHash })
+      });
+
+      const body = await response.text();
+      console.log('POST /intents/session response:', {
+        ok: response.ok,
+        status: response.status,
+        body
+      });
+
+      if (!response.ok) {
+        throw new Error(body || `Session authorization storage failed with status ${response.status}`);
+      }
+    } else {
+      console.warn('Skipping POST /intents/session because no EIP-7702 authorization was returned.', {
+        hasAuthorization: Boolean(authorization),
+        address
+      });
+    }
   }
 
   function revokeSession() {
@@ -313,15 +375,23 @@ function WalletSessionPanel({
         </div>
 
         {!isConnected ? (
-          <button
-            type="button"
-            onClick={() => injectedConnector && connect({ connector: injectedConnector })}
-            disabled={isConnecting || !injectedConnector}
-            className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-[var(--accent)] px-4 py-2.5 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            <Wallet size={16} />
-            {isConnecting ? 'Connecting' : 'Connect MetaMask'}
-          </button>
+          <div className="grid gap-2">
+            {visibleConnectors.map((connector) => (
+              <button
+                key={connector.uid}
+                type="button"
+                onClick={() => connect({ connector })}
+                disabled={isConnecting}
+                className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-[var(--accent)] px-4 py-2.5 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <Wallet size={16} />
+                {isConnecting ? 'Connecting' : `Connect ${connector.name}`}
+              </button>
+            ))}
+            {visibleConnectors.length === 0 ? (
+              <p className="text-sm text-[var(--muted)]">No browser wallet detected.</p>
+            ) : null}
+          </div>
         ) : (
           <div className="grid gap-3">
             <div className="rounded-md border border-[var(--border)] bg-[var(--panel-strong)] px-3 py-2">

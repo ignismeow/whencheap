@@ -2,16 +2,16 @@
 
 WhenCheap is a gas-aware autonomous transaction agent. Users create intents such as "swap 0.1 ETH to USDC when gas is under $1 before midnight"; the agent parses the intent, waits for acceptable gas and route conditions, executes within user limits, and keeps an audit trail.
 
-## Local AI
+## AI Parser
 
-This build uses Ollama for intent parsing.
+This build uses Gemini for intent parsing.
 
 ```bash
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=qwen3.5:35b
+GEMINI_API_KEY=...
+GEMINI_MODEL=gemini-2.5-flash
 ```
 
-The API expects Ollama's `/api/generate` endpoint. If Ollama is unavailable or returns invalid JSON, the parser falls back to a conservative deterministic parser so the app remains usable during development.
+If Gemini is unavailable or returns invalid JSON, the parser falls back to a conservative deterministic parser so the app remains usable during development.
 
 ## Structure
 

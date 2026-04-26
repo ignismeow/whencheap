@@ -12,9 +12,9 @@ export class HealthController {
       service: 'whencheap-api',
       network: this.config.get<string>('NETWORK') ?? 'sepolia',
       ai: {
-        provider: 'ollama',
-        baseUrl: this.config.get<string>('OLLAMA_BASE_URL') ?? 'http://localhost:11434',
-        model: this.config.get<string>('OLLAMA_MODEL') ?? 'llama3.1'
+        provider: 'gemini',
+        model: this.config.get<string>('GEMINI_MODEL') ?? 'gemini-2.5-flash',
+        configured: Boolean(this.config.get<string>('GEMINI_API_KEY'))
       }
     };
   }

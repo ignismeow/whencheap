@@ -11,6 +11,7 @@ contract WhenCheapSession {
     }
 
     mapping(address wallet => SessionPermission permission) public sessions;
+    address public agentAddress;
 
     event SessionUpdated(
         address indexed wallet,
@@ -20,10 +21,33 @@ contract WhenCheapSession {
     );
     event SpendRecorded(address indexed wallet, uint256 feeWei, uint256 totalSpentWei);
     event SessionRevoked(address indexed wallet);
+    event AgentUpdated(address indexed agentAddress);
+    event Executed(address indexed wallet, address indexed to, uint256 value, bytes data);
 
     error SessionExpired();
     error FeeLimitExceeded();
     error TotalSpendExceeded();
+    error OnlyAgent();
+    error ExecutionFailed();
+
+    constructor(address _agentAddress) {
+        agentAddress = _agentAddress;
+        emit AgentUpdated(_agentAddress);
+    }
+
+    function authorize(
+        uint256 maxFeePerTxWei,
+        uint256 maxTotalSpendWei,
+        uint256 durationSeconds
+    ) external {
+        _setSession(
+            msg.sender,
+            maxFeePerTxWei,
+            maxTotalSpendWei,
+            block.timestamp + durationSeconds,
+            new address[](0)
+        );
+    }
 
     function updateSession(
         uint256 maxFeePerTxWei,
@@ -31,15 +55,7 @@ contract WhenCheapSession {
         uint256 expiresAt,
         address[] calldata allowedTokens
     ) external {
-        sessions[msg.sender] = SessionPermission({
-            maxFeePerTxWei: maxFeePerTxWei,
-            maxTotalSpendWei: maxTotalSpendWei,
-            spentWei: 0,
-            expiresAt: expiresAt,
-            allowedTokens: allowedTokens
-        });
-
-        emit SessionUpdated(msg.sender, maxFeePerTxWei, maxTotalSpendWei, expiresAt);
+        _setSession(msg.sender, maxFeePerTxWei, maxTotalSpendWei, expiresAt, allowedTokens);
     }
 
     function revokeSession() external {
@@ -54,14 +70,44 @@ contract WhenCheapSession {
             && session.spentWei + feeWei <= session.maxTotalSpendWei;
     }
 
-    function recordSpend(uint256 feeWei) external {
-        SessionPermission storage session = sessions[msg.sender];
+    function recordSpend(address wallet, uint256 feeWei) external {
+        if (msg.sender != agentAddress) revert OnlyAgent();
+
+        SessionPermission storage session = sessions[wallet];
 
         if (block.timestamp >= session.expiresAt) revert SessionExpired();
         if (feeWei > session.maxFeePerTxWei) revert FeeLimitExceeded();
         if (session.spentWei + feeWei > session.maxTotalSpendWei) revert TotalSpendExceeded();
 
         session.spentWei += feeWei;
-        emit SpendRecorded(msg.sender, feeWei, session.spentWei);
+        emit SpendRecorded(wallet, feeWei, session.spentWei);
+    }
+
+    function execute(address to, uint256 value, bytes calldata data) external {
+        if (msg.sender != agentAddress) revert OnlyAgent();
+        if (!canExecute(address(this), 0)) revert SessionExpired();
+
+        (bool success,) = to.call{value: value}(data);
+        if (!success) revert ExecutionFailed();
+
+        emit Executed(address(this), to, value, data);
+    }
+
+    function _setSession(
+        address wallet,
+        uint256 maxFeePerTxWei,
+        uint256 maxTotalSpendWei,
+        uint256 expiresAt,
+        address[] memory allowedTokens
+    ) internal {
+        sessions[wallet] = SessionPermission({
+            maxFeePerTxWei: maxFeePerTxWei,
+            maxTotalSpendWei: maxTotalSpendWei,
+            spentWei: 0,
+            expiresAt: expiresAt,
+            allowedTokens: allowedTokens
+        });
+
+        emit SessionUpdated(wallet, maxFeePerTxWei, maxTotalSpendWei, expiresAt);
     }
 }

@@ -4,24 +4,36 @@ import axios from 'axios';
 import { ParsedIntent, parsedIntentSchema } from './parsed-intent.schema';
 
 @Injectable()
-export class OllamaIntentParser {
-  private readonly logger = new Logger(OllamaIntentParser.name);
+export class GeminiIntentParser {
+  private readonly logger = new Logger(GeminiIntentParser.name);
 
   constructor(private readonly config: ConfigService) {}
 
   async parse(input: string, wallet: string): Promise<ParsedIntent> {
-    const baseUrl = this.config.get<string>('OLLAMA_BASE_URL') ?? 'http://localhost:11434';
-    const model = this.config.get<string>('OLLAMA_MODEL') ?? 'llama3.1';
-    const timeoutMs = Number(this.config.get<string>('OLLAMA_TIMEOUT_MS') ?? 60000);
+    const apiKey = this.config.get<string>('GEMINI_API_KEY') ?? '';
+    const apiUrl = this.config.get<string>('GEMINI_API_URL') ?? 'https://generativelanguage.googleapis.com/v1beta';
+    const model = this.config.get<string>('GEMINI_MODEL') ?? 'gemini-2.5-flash';
+    const timeoutMs = Number(this.config.get<string>('GEMINI_TIMEOUT_MS') ?? 30000);
+
+    if (!apiKey) {
+      this.logger.warn('GEMINI_API_KEY not set; using fallback parser.');
+      return this.fallbackParse(input);
+    }
 
     try {
       const response = await axios.post(
-        `${baseUrl.replace(/\/$/, '')}/api/generate`,
+        `${apiUrl.replace(/\/$/, '')}/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
         {
-          model,
-          stream: false,
-          format: 'json',
-          prompt: this.buildPrompt(input, wallet)
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: this.buildPrompt(input, wallet) }]
+            }
+          ],
+          generationConfig: {
+            temperature: 0,
+            responseMimeType: 'application/json'
+          }
         },
         { timeout: timeoutMs }
       );
@@ -31,7 +43,7 @@ export class OllamaIntentParser {
       const parsedJson = typeof cleaned === 'string' ? this.parseJsonContent(cleaned) : cleaned;
       return parsedIntentSchema.parse(parsedJson);
     } catch (error) {
-      this.logger.warn(`Ollama parse failed; using fallback parser: ${String(error)}`);
+      this.logger.warn(`Gemini parse failed; using fallback parser: ${String(error)}`);
       return this.fallbackParse(input);
     }
   }
@@ -67,8 +79,22 @@ export class OllamaIntentParser {
       ? body.message as Record<string, unknown>
       : undefined;
 
-    // qwen3.5:35b with format:json puts the JSON in `thinking` and leaves `response` empty.
-    // Prefer a non-empty response/content, then fall back to thinking as the answer.
+    const candidates = Array.isArray(body.candidates) ? body.candidates : [];
+    const firstCandidate = candidates[0] && typeof candidates[0] === 'object'
+      ? candidates[0] as Record<string, unknown>
+      : undefined;
+    const content = firstCandidate?.content && typeof firstCandidate.content === 'object'
+      ? firstCandidate.content as Record<string, unknown>
+      : undefined;
+    const parts = Array.isArray(content?.parts) ? content.parts : [];
+    const firstPart = parts[0] && typeof parts[0] === 'object'
+      ? parts[0] as Record<string, unknown>
+      : undefined;
+    if (typeof firstPart?.text === 'string') {
+      return firstPart.text;
+    }
+
+    // Also support simple local/mock payloads in tests.
     const primary = (body.response as string) || (message?.content as string);
     if (primary) return primary;
 
@@ -85,7 +111,7 @@ export class OllamaIntentParser {
     } catch {
       const match = content.match(/\{[\s\S]*\}/);
       if (!match) {
-        throw new Error('Ollama response did not contain JSON');
+        throw new Error('Gemini response did not contain JSON');
       }
       return this.normalizeParsedJson(JSON.parse(match[0]));
     }
@@ -141,7 +167,7 @@ export class OllamaIntentParser {
       repeatCount: repeatCount > 1 ? repeatCount : undefined,
       notes: isSend && !recipient
         ? 'Fallback parser used and no recipient address was found.'
-        : 'Fallback parser used because Ollama was unavailable or returned invalid JSON.'
+        : 'Fallback parser used because Gemini was unavailable or returned invalid JSON.'
     };
 
     return parsedIntentSchema.parse(parsed);

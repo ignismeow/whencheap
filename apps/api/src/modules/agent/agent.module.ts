@@ -1,10 +1,10 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
-import { OllamaIntentParser } from './ollama-intent-parser.service';
+import { GeminiIntentParser } from './gemini-intent-parser.service';
 
 @Module({
   imports: [ConfigModule],
-  providers: [OllamaIntentParser],
-  exports: [OllamaIntentParser]
+  providers: [GeminiIntentParser],
+  exports: [GeminiIntentParser]
 })
 export class AgentModule {}
