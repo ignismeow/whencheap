@@ -147,7 +147,7 @@ export class GeminiIntentParser {
       ?? '0';
     const maxFeeUsd = Number(lower.match(/\$ ?(\d+(?:\.\d+)?)/)?.[1] ?? 1);
     const deadline = this.extractDeadline(lower);
-    const repeatCount = Number(lower.match(/\b(\d+)\s*(?:times|x)\b/)?.[1] ?? 1);
+    const repeatCount = this.extractRepeatCount(lower);
     const recipient = input.match(/0x[a-fA-F0-9]{40}/)?.[0];
 
     const tokenPair = lower.match(/\b(eth|weth|usdc|usdt|dai)\s+(?:to|for|into)\s+(eth|weth|usdc|usdt|dai)\b/);
@@ -185,6 +185,17 @@ export class GeminiIntentParser {
     }
 
     return new Date(Date.now() + 6 * 60 * 60 * 1000);
+  }
+
+  private extractRepeatCount(input: string): number {
+    if (/\btwice\b/.test(input)) return 2;
+    if (/\bthrice\b/.test(input)) return 3;
+
+    const explicitCount = input.match(
+      /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*(?:times|x)\b/,
+    )?.[1];
+
+    return explicitCount ? this.numberWordToNumber(explicitCount) : 1;
   }
 
   private numberWordToNumber(value: string): number {

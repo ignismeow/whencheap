@@ -5,6 +5,7 @@ export const parsedIntentSchema = z.object({
   fromToken: z.string().min(1),
   toToken: z.string().min(1).optional(),
   recipient: z.string().optional(),
+  resolvedRecipient: z.string().regex(/^0x[a-fA-F0-9]{40}$/).optional(),
   amount: z.string().min(1),
   maxFeeUsd: z.number().positive(),
   deadlineIso: z.string().datetime(),

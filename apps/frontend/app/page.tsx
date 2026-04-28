@@ -1,27 +1,25 @@
 'use client';
 
-import { Activity, Clock3, Link2, PlugZap, RefreshCcw, Send, ShieldCheck, Wallet } from 'lucide-react';
-import { FormEvent, useEffect, useMemo, useState } from 'react';
-import { formatEther, parseEther } from 'viem';
-import { sepolia } from 'viem/chains';
 import {
-  useAccount,
-  useConnect,
-  useDisconnect,
-  useReadContract,
-  useSwitchChain,
-  useWaitForTransactionReceipt,
-  useWalletClient,
-  useWriteContract
-} from 'wagmi';
-import { sessionContractAddress, whenCheapSessionAbi } from '../lib/session-contract';
+  Copy,
+  LogOut,
+  RefreshCcw,
+  Send,
+  ShieldCheck,
+  XCircle
+} from 'lucide-react';
+import { FormEvent, KeyboardEvent, ReactNode, RefObject, useEffect, useMemo, useRef, useState } from 'react';
+import { formatEther } from 'viem';
+import { useReadContract } from 'wagmi';
 import useSWR from 'swr';
+import { sessionContractAddress, whenCheapSessionAbi } from '../lib/session-contract';
 
 type AuditEvent = {
   id: string;
   at: string;
   type: string;
   message: string;
+  metadata?: Record<string, unknown>;
 };
 
 type IntentRecord = {
@@ -29,11 +27,13 @@ type IntentRecord = {
   wallet: string;
   rawInput: string;
   status: string;
+  txHash?: string;
   parsed: {
     type: string;
     fromToken: string;
     toToken?: string;
     recipient?: string;
+    resolvedRecipient?: string;
     amount: string;
     maxFeeUsd: number;
     deadlineIso: string;
@@ -47,42 +47,62 @@ type IntentRecord = {
   audit: AuditEvent[];
 };
 
-type Eip1193Provider = {
-  isRabby?: boolean;
-  providers?: Eip1193Provider[];
-  request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
+type ExecutionDetails = {
+  txHash?: string;
+  blockNumber?: number | string;
+  gasPaidWei?: string;
 };
 
-type WalletWindow = Window & {
-  ethereum?: Eip1193Provider;
-  rabby?: { ethereum?: Eip1193Provider };
+type ManagedIdentity = {
+  email: string;
+  address: `0x${string}`;
+  created?: boolean;
 };
 
-const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
-const fetcher = (url: string) => fetch(url).then((res) => res.json());
+type GoogleCredentialResponse = {
+  credential: string;
+};
 
-function getInjectedSigningProvider(): Eip1193Provider | undefined {
-  if (typeof window === 'undefined') return undefined;
-
-  const walletWindow = window as WalletWindow;
-  if (walletWindow.rabby?.ethereum) return walletWindow.rabby.ethereum;
-
-  const ethereum = walletWindow.ethereum;
-  if (ethereum?.providers) {
-    const providers: Eip1193Provider[] = ethereum.providers;
-    return providers.find((provider: Eip1193Provider) => provider.isRabby) ?? providers[0];
+declare global {
+  interface Window {
+    google?: {
+      accounts: {
+        id: {
+          initialize: (options: {
+            client_id: string;
+            callback: (response: GoogleCredentialResponse) => void;
+          }) => void;
+          renderButton: (
+            element: HTMLElement,
+            options: Record<string, string | number | boolean>,
+          ) => void;
+          disableAutoSelect: () => void;
+        };
+      };
+    };
   }
-
-  return ethereum;
 }
 
+const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+const googleClientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ?? '';
+const fetcher = (url: string) => fetch(url).then((res) => res.json());
+const authStorageKey = 'whencheap-google-identity';
+
 export default function Home() {
-  const { address, chainId, isConnected } = useAccount();
-  const [wallet, setWallet] = useState('0x0000000000000000000000000000000000000000');
-  const [input, setInput] = useState('Swap 0.1 ETH to USDC when gas is under $1 before midnight');
+  const [input, setInput] = useState('Send 0.001 ETH to 0xfC2b1688B9776ae0cA6dbf8Fc335a69a6e97578D when gas is under $1 in next 30 minutes'
+);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [managedIdentity, setManagedIdentity] = useState<ManagedIdentity | null>(null);
+  const [isSessionCardOpen, setIsSessionCardOpen] = useState(false);
+  const [isAuthenticating, setIsAuthenticating] = useState(false);
+  const [ensCandidate, setEnsCandidate] = useState<string | null>(null);
+  const [resolvedEnsAddress, setResolvedEnsAddress] = useState<string | null>(null);
+  const [ensResolutionError, setEnsResolutionError] = useState<string | null>(null);
+  const [isResolvingEns, setIsResolvingEns] = useState(false);
+  const googleButtonRef = useRef<HTMLDivElement | null>(null);
 
   const { data, mutate, isLoading } = useSWR<IntentRecord[]>(`${apiUrl}/intents`, fetcher, {
     refreshInterval: 5000
@@ -90,18 +110,164 @@ export default function Home() {
 
   const intents = data ?? [];
   const selected = useMemo(
-    () => intents.find((intent) => intent.id === selectedId) ?? intents[0],
+    () => intents.find((intent) => intent.id === selectedId) ?? intents[0] ?? null,
     [intents, selectedId]
   );
+  const effectiveAddress = managedIdentity?.address;
 
   useEffect(() => {
-    if (address) {
-      setWallet(address);
+    try {
+      const raw = window.localStorage.getItem(authStorageKey);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as ManagedIdentity;
+      if (parsed?.email && parsed?.address) {
+        setManagedIdentity(parsed);
+      }
+    } catch {
+      window.localStorage.removeItem(authStorageKey);
     }
-  }, [address]);
+  }, []);
+
+  useEffect(() => {
+    const candidate = extractEnsCandidate(input);
+    setEnsCandidate(candidate);
+
+    if (!candidate) {
+      setResolvedEnsAddress(null);
+      setEnsResolutionError(null);
+      setIsResolvingEns(false);
+      return;
+    }
+
+    const timeout = window.setTimeout(async () => {
+      setIsResolvingEns(true);
+      setEnsResolutionError(null);
+
+      try {
+        const response = await fetch(
+          `${apiUrl}/intents/resolve-name/lookup?name=${encodeURIComponent(candidate)}`
+        );
+        const payload = (await response.json()) as { address?: string | null; message?: string };
+
+        if (!response.ok) {
+          throw new Error(payload.message || 'ENS lookup failed');
+        }
+
+        setResolvedEnsAddress(payload.address ?? null);
+        setEnsResolutionError(payload.address ? null : `No address found for ${candidate}`);
+      } catch (err) {
+        setResolvedEnsAddress(null);
+        setEnsResolutionError(err instanceof Error ? err.message : 'ENS lookup failed');
+      } finally {
+        setIsResolvingEns(false);
+      }
+    }, 300);
+
+    return () => window.clearTimeout(timeout);
+  }, [input]);
+
+  useEffect(() => {
+    if (!googleClientId || managedIdentity) {
+      return;
+    }
+
+    const initialize = () => {
+      if (!window.google || !googleButtonRef.current) {
+        return;
+      }
+
+      window.google.accounts.id.initialize({
+        client_id: googleClientId,
+        callback: (response) => {
+          void authenticateWithGoogle(response.credential);
+        }
+      });
+
+      googleButtonRef.current.innerHTML = '';
+      window.google.accounts.id.renderButton(googleButtonRef.current, {
+        theme: 'filled_black',
+        size: 'large',
+        width: 320,
+        text: 'continue_with',
+        shape: 'rectangular',
+        logo_alignment: 'left'
+      });
+    };
+
+    if (window.google) {
+      initialize();
+      return;
+    }
+
+    const existingScript = document.querySelector<HTMLScriptElement>(
+      'script[data-whencheap-google-auth="true"]'
+    );
+    if (existingScript) {
+      existingScript.addEventListener('load', initialize, { once: true });
+      return;
+    }
+
+    const script = document.createElement('script');
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.async = true;
+    script.defer = true;
+    script.dataset.whencheapGoogleAuth = 'true';
+    script.addEventListener('load', initialize, { once: true });
+    script.addEventListener(
+      'error',
+      () => setAuthError('Could not load Google authentication.'),
+      { once: true },
+    );
+    document.head.appendChild(script);
+  }, [managedIdentity]);
+
+  async function authenticateWithGoogle(credential: string) {
+    try {
+      setIsAuthenticating(true);
+      setAuthError(null);
+
+      const response = await fetch(`${apiUrl}/intents/google-auth`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ credential })
+      });
+
+      const rawBody = await response.text();
+      const payload = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
+      if (!response.ok || payload.ok !== true) {
+        throw new Error(
+          typeof payload.message === 'string' ? payload.message : rawBody || 'Google authentication failed',
+        );
+      }
+
+      const identity: ManagedIdentity = {
+        email: String(payload.email),
+        address: String(payload.address) as `0x${string}`,
+        created: Boolean(payload.created)
+      };
+      setManagedIdentity(identity);
+      window.localStorage.setItem(authStorageKey, JSON.stringify(identity));
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : 'Google authentication failed');
+    } finally {
+      setIsAuthenticating(false);
+    }
+  }
+
+  function signOutManagedIdentity() {
+    setManagedIdentity(null);
+    setSelectedId(null);
+    window.localStorage.removeItem(authStorageKey);
+    window.google?.accounts.id.disableAutoSelect();
+  }
 
   async function createIntent(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!effectiveAddress) {
+      setError('Verify with Google first.');
+      return;
+    }
+
     setIsSubmitting(true);
     setError(null);
 
@@ -109,7 +275,7 @@ export default function Home() {
       const response = await fetch(`${apiUrl}/intents`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ wallet, input })
+        body: JSON.stringify({ wallet: effectiveAddress, input })
       });
 
       if (!response.ok) {
@@ -127,134 +293,329 @@ export default function Home() {
     }
   }
 
+  function submitIntentOnEnter(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      event.currentTarget.form?.requestSubmit();
+    }
+  }
+
+  if (!managedIdentity) {
+    return (
+      <main className="console-shell">
+        <AuthGate
+          authError={authError}
+          isAuthenticating={isAuthenticating}
+          googleButtonRef={googleButtonRef}
+        />
+      </main>
+    );
+  }
+
   return (
-    <main className="min-h-screen">
-      <section className="border-b border-[var(--border)] bg-[var(--panel)]">
-        <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-5 py-4">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-normal">WhenCheap</h1>
-            <p className="mt-1 text-sm text-[var(--muted)]">Gas-aware intent execution with Gemini intent parsing.</p>
-          </div>
-          <div className="flex items-center gap-2 text-sm text-[var(--muted)]">
-            <ShieldCheck size={18} className="text-[var(--accent)]" />
-            Sepolia demo mode
-          </div>
-        </div>
-      </section>
+    <main className="console-shell">
+      <HeaderBar
+        address={effectiveAddress}
+        email={managedIdentity.email}
+        onOpenSessionCard={() => setIsSessionCardOpen(true)}
+      />
 
-      <section className="mx-auto grid max-w-7xl gap-5 px-5 py-5 lg:grid-cols-[420px_1fr]">
-        <div className="grid content-start gap-5">
-          <WalletSessionPanel address={address} chainId={chainId} isConnected={isConnected} />
+      <div className="console-root">
+        <aside className="console-sidebar">
+          <ConsolePanel title="Intent Input" eyebrow="TRANSLATE NATURAL LANGUAGE" className="console-intent-panel">
+            <form onSubmit={createIntent} className="space-y-4">
+              <textarea
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                onKeyDown={submitIntentOnEnter}
+                className="console-input min-h-[220px] w-full resize-none xl:min-h-[320px]"
+                placeholder="Send 0.1 ETH to vitalik.eth when gas is under $0.50..."
+              />
 
-          <form onSubmit={createIntent} className="rounded-lg border border-[var(--border)] bg-[var(--panel)] p-4">
-            <div className="mb-4 flex items-center gap-2">
-              <Wallet size={18} />
-              <h2 className="text-base font-semibold">Create Intent</h2>
-            </div>
+              <div className="space-y-2 text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
+                <div className="console-subpanel">
+                  <span className="block text-[10px] text-[var(--color-label)]">Managed wallet</span>
+                  <span className="mt-1 block text-[var(--color-text)]">{truncateAddress(effectiveAddress ?? '')}</span>
+                  <span className="mt-2 block normal-case tracking-normal text-[var(--color-muted)]">
+                    Press Enter to submit. Use Shift+Enter for a new line.
+                  </span>
+                </div>
 
-            <label className="block text-sm font-medium" htmlFor="wallet">
-              Wallet
-            </label>
-            <input
-              id="wallet"
-              value={wallet}
-              onChange={(event) => setWallet(event.target.value)}
-              className="mt-2 w-full rounded-md border border-[var(--border)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
-              placeholder="0x..."
-            />
+                {ensCandidate ? (
+                  <div className="console-subpanel">
+                    <span className="block text-[10px] text-[var(--color-label)]">ENS resolver</span>
+                    <span className="mt-1 block text-[var(--color-text)] normal-case tracking-normal">
+                      {isResolvingEns
+                        ? `Resolving ${ensCandidate}...`
+                        : resolvedEnsAddress
+                          ? `${ensCandidate} -> ${truncateAddress(resolvedEnsAddress)}`
+                          : ensResolutionError ?? `No resolution found for ${ensCandidate}`}
+                    </span>
+                  </div>
+                ) : null}
 
-            <label className="mt-4 block text-sm font-medium" htmlFor="intent">
-              Intent
-            </label>
-            <textarea
-              id="intent"
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              className="mt-2 min-h-36 w-full resize-y rounded-md border border-[var(--border)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
-              placeholder="Send 0.1 ETH to USDC when gas is under $1 before midnight"
-            />
-
-            {error ? <p className="mt-3 text-sm text-[var(--danger)]">{error}</p> : null}
-
-            <button
-              type="submit"
-              disabled={isSubmitting}
-              className="mt-4 inline-flex w-full items-center justify-center gap-2 rounded-md bg-[var(--accent)] px-4 py-2.5 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              <Send size={16} />
-              {isSubmitting ? 'Creating' : 'Create Intent'}
-            </button>
-          </form>
-        </div>
-
-        <div className="grid gap-5">
-          <div className="rounded-lg border border-[var(--border)] bg-[var(--panel)]">
-            <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
-              <div className="flex items-center gap-2">
-                <Activity size={18} />
-                <h2 className="text-base font-semibold">Active Intents</h2>
+                {error ? <p className="text-[var(--color-danger)] normal-case tracking-normal">{error}</p> : null}
               </div>
+
               <button
+                type="submit"
+                disabled={isSubmitting}
+                className="console-button console-button-primary w-full"
+              >
+                <Send size={15} />
+                {isSubmitting ? 'Creating Command...' : 'Create Intent'}
+              </button>
+            </form>
+          </ConsolePanel>
+
+          {/* <ConsolePanel
+            title="Recent Commands"
+            eyebrow="QUEUE"
+            action={
+              <button
+                type="button"
                 onClick={() => void mutate()}
-                className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-[var(--border)]"
+                className="console-icon-button"
                 title="Refresh intents"
               >
-                <RefreshCcw size={16} />
+                <RefreshCcw size={14} />
               </button>
+            }
+          >
+            <div className="console-scroll h-[280px] space-y-2 pr-1">
+              {isLoading ? (
+                <p className="text-xs uppercase tracking-[0.14em] text-[var(--color-muted)]">
+                  Loading intents...
+                </p>
+              ) : intents.length === 0 ? (
+                <p className="text-xs uppercase tracking-[0.14em] text-[var(--color-muted)]">
+                  No commands queued.
+                </p>
+              ) : (
+                intents.map((intent) => (
+                  <button
+                    key={intent.id}
+                    type="button"
+                    onClick={() => setSelectedId(intent.id)}
+                    className={`console-list-item ${selected?.id === intent.id ? 'console-list-item-active' : ''}`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="truncate text-xs uppercase tracking-[0.14em] text-[var(--color-text)]">
+                          {intent.rawInput}
+                        </p>
+                        <p className="mt-2 text-[10px] uppercase tracking-[0.18em] text-[var(--color-muted)]">
+                          {new Date(intent.createdAt).toLocaleString()}
+                        </p>
+                      </div>
+                      <StatusBadge status={intent.status} compact />
+                    </div>
+                  </button>
+                ))
+              )}
             </div>
+          </ConsolePanel> */}
+        </aside>
 
-            <div className="grid divide-y divide-[var(--border)]">
-              {isLoading ? <p className="px-4 py-5 text-sm text-[var(--muted)]">Loading intents</p> : null}
-              {!isLoading && intents.length === 0 ? (
-                <p className="px-4 py-5 text-sm text-[var(--muted)]">No intents yet.</p>
-              ) : null}
-              {intents.map((intent) => (
-                <button
-                  key={intent.id}
-                  onClick={() => setSelectedId(intent.id)}
-                  className="grid gap-1 px-4 py-3 text-left hover:bg-[var(--panel-strong)]"
-                >
-                  <span className="flex items-center justify-between gap-3">
-                    <span className="truncate text-sm font-medium">{intent.rawInput}</span>
-                    <span className="shrink-0 rounded-md border border-[var(--border)] px-2 py-1 text-xs">
-                      {intent.status}
-                    </span>
-                  </span>
-                  <span className="text-xs text-[var(--muted)]">
-                    {intent.parsed.amount} {intent.parsed.fromToken}
-                    {intent.parsed.toToken ? ` -> ${intent.parsed.toToken}` : ''} · max ${intent.parsed.maxFeeUsd} USD
-                  </span>
-                </button>
-              ))}
+        <section className="console-main">
+          <div className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)_220px] gap-4">
+            <div className="grid min-h-0 gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(340px,0.85fr)]">
+              {selected ? <CommandCenter intent={selected} /> : <CommandCenterEmpty />}
+              {selected ? <AuditTrail intent={selected} /> : <AuditTrailEmpty />}
             </div>
+            <RecentCommandsPanel
+              intents={intents}
+              selectedId={selected?.id ?? null}
+              onSelect={setSelectedId}
+              onRefresh={() => void mutate()}
+              isLoading={isLoading}
+            />
           </div>
+        </section>
+      </div>
 
-          {selected ? <IntentDetail intent={selected} /> : null}
-        </div>
-      </section>
+      {isSessionCardOpen ? (
+        <SessionCardModal onClose={() => setIsSessionCardOpen(false)}>
+          <SessionCard
+            address={effectiveAddress}
+            email={managedIdentity.email}
+            onLogout={signOutManagedIdentity}
+            onClose={() => setIsSessionCardOpen(false)}
+          />
+        </SessionCardModal>
+      ) : null}
     </main>
   );
 }
 
-function WalletSessionPanel({
+function AuthGate({
+  authError,
+  isAuthenticating,
+  googleButtonRef
+}: {
+  authError: string | null;
+  isAuthenticating: boolean;
+  googleButtonRef: RefObject<HTMLDivElement | null>;
+}) {
+  return (
+    <div className="flex min-h-screen items-center justify-center px-4 py-10">
+      <div className="w-full max-w-[760px] border border-[var(--color-border)] bg-[var(--color-surface)] p-8">
+        <div className="space-y-3 border-b border-[var(--color-border)] pb-6">
+          <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+            Verified Access Required
+          </p>
+          <h1 className="text-xl font-medium uppercase tracking-[0.18em] text-[var(--color-text)]">
+            Link Google to allocate a managed WhenCheap wallet
+          </h1>
+          <p className="max-w-2xl text-sm uppercase tracking-[0.12em] text-[var(--color-muted)]">
+            Each verified Gmail gets a unique wallet generated on the server and bound to that email.
+            A different Google account receives a different wallet.
+          </p>
+        </div>
+
+        <div className="mt-6 grid gap-4 md:grid-cols-2">
+          <div className="space-y-3 border border-[var(--color-border)] p-4">
+            <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+              Wallet policy
+            </p>
+            <ul className="space-y-2 text-xs uppercase tracking-[0.12em] text-[var(--color-text)]">
+              <li>Unique wallet per verified Google identity.</li>
+              <li>Private key encrypted server-side with AES-256-GCM.</li>
+              <li>Use only a dedicated Gmail and dedicated funded wallet.</li>
+            </ul>
+          </div>
+
+          <div className="space-y-4 border border-[var(--color-border)] p-4">
+            <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+              Google verification
+            </p>
+            {googleClientId ? (
+              <div className="space-y-3">
+                <div ref={googleButtonRef} className="min-h-[44px]" />
+                {isAuthenticating ? (
+                  <p className="text-xs uppercase tracking-[0.14em] text-[var(--color-muted)]">
+                    Verifying account and allocating wallet...
+                  </p>
+                ) : null}
+              </div>
+            ) : (
+              <p className="text-xs uppercase tracking-[0.14em] text-[var(--color-danger)]">
+                NEXT_PUBLIC_GOOGLE_CLIENT_ID is not configured.
+              </p>
+            )}
+
+            {authError ? (
+              <p className="text-xs uppercase tracking-[0.14em] text-[var(--color-danger)]">{authError}</p>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HeaderBar({
   address,
-  chainId,
-  isConnected
+  email,
+  onOpenSessionCard
 }: {
   address?: `0x${string}`;
-  chainId?: number;
-  isConnected: boolean;
+  email?: string;
+  onOpenSessionCard: () => void;
 }) {
-  const { connect, connectors, isPending: isConnecting } = useConnect();
-  const { disconnect } = useDisconnect();
-  const { switchChain, isPending: isSwitching } = useSwitchChain();
-  const { data: walletClient } = useWalletClient();
-  const { writeContract, writeContractAsync, data: hash, isPending: isWriting, error: writeError } = useWriteContract();
-  const { isLoading: isConfirming, isSuccess: isConfirmed } = useWaitForTransactionReceipt({ hash });
+  return (
+    <header className="console-header">
+      <div className="mx-auto flex h-[64px] w-full max-w-[1600px] items-center justify-between px-4 sm:px-6 lg:px-8">
+        <div className="min-w-0">
+          <p className="text-base font-semibold uppercase tracking-[0.18em] text-[var(--color-text)]">
+            WhenCheap
+          </p>
+          <p className="mt-1 text-[11px] uppercase tracking-[0.18em] text-[var(--color-muted)]">
+            Google-verified managed execution
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <div className="console-chip">
+            <span className="h-2 w-2 bg-[var(--color-accent)]" />
+            <span>Sepolia</span>
+          </div>
+          {email ? (
+            <button
+              type="button"
+              onClick={onOpenSessionCard}
+              className="console-chip hidden lg:flex hover:bg-[var(--color-accent)] hover:text-black focus-visible:bg-[var(--color-accent)] focus-visible:text-black focus-visible:outline-none"
+            >
+              <span>{email}</span>
+            </button>
+          ) : null}
+          {address ? (
+            <button
+              type="button"
+              onClick={onOpenSessionCard}
+              className="console-chip hidden sm:flex hover:bg-[var(--color-accent)] hover:text-black focus-visible:bg-[var(--color-accent)] focus-visible:text-black focus-visible:outline-none"
+            >
+              <span>{truncateAddress(address)}</span>
+            </button>
+          ) : null}
+        </div>
+      </div>
+    </header>
+  );
+}
+
+function SessionCardModal({
+  children,
+  onClose
+}: {
+  children: ReactNode;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const handleEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        onClose();
+      }
+    };
+
+    window.addEventListener('keydown', handleEscape);
+    return () => window.removeEventListener('keydown', handleEscape);
+  }, [onClose]);
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 px-4 py-6">
+      <button
+        type="button"
+        aria-label="Close session details"
+        className="absolute inset-0 cursor-default"
+        onClick={onClose}
+      />
+      <div className="relative z-10 w-full max-w-[760px]">
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function SessionCard({
+  address,
+  email,
+  onLogout,
+  onClose
+}: {
+  address?: `0x${string}`;
+  email: string;
+  onLogout: () => void;
+  onClose: () => void;
+}) {
   const [maxFeePerTxEth, setMaxFeePerTxEth] = useState('0.001');
   const [maxTotalSpendEth, setMaxTotalSpendEth] = useState('0.01');
   const [expiryHours, setExpiryHours] = useState('6');
-
+  const [sessionMessage, setSessionMessage] = useState<string | null>(null);
+  const [sessionTxHash, setSessionTxHash] = useState<string | null>(null);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const [copiedAddress, setCopiedAddress] = useState(false);
+  const [activeAction, setActiveAction] = useState<'authorize' | 'revoke' | 'disconnect' | null>(null);
   const { data: sessionData, refetch } = useReadContract({
     address: sessionContractAddress,
     abi: whenCheapSessionAbi,
@@ -266,88 +627,92 @@ function WalletSessionPanel({
   });
 
   useEffect(() => {
-    if (isConfirmed) {
-      void refetch();
-    }
-  }, [isConfirmed, refetch]);
-
-  const isWrongChain = isConnected && chainId !== sepolia.id;
-  const visibleConnectors = connectors.filter((connector, index, all) => {
-    const key = `${connector.id}:${connector.name}`;
-    return all.findIndex((item) => `${item.id}:${item.name}` === key) === index;
-  });
+    if (!copiedAddress) return;
+    const timeout = window.setTimeout(() => setCopiedAddress(false), 1200);
+    return () => window.clearTimeout(timeout);
+  }, [copiedAddress]);
 
   async function authorizeSession() {
-    if (!sessionContractAddress || !walletClient) return;
+    if (!address) return;
 
-    const durationSeconds = BigInt(Number(expiryHours) * 60 * 60);
-
-    // Attempt EIP-7702 delegation through direct JSON-RPC. Rabby currently exposes
-    // eth_signAuthorization here even when wagmi's walletClient has no wrapper.
-    let authorization: unknown;
-    let authorizationList: unknown[] | undefined;
     try {
-      const provider = getInjectedSigningProvider();
-      if (!provider) throw new Error('No injected wallet provider found');
+      setActiveAction('authorize');
+      setSessionMessage(null);
+      setSessionTxHash(null);
+      setSessionError(null);
 
-      authorization = await provider.request({
-        method: 'eth_signAuthorization',
-        params: [{
-          contractAddress: sessionContractAddress,
-          chainId: `0x${sepolia.id.toString(16)}`
-        }]
-      });
-
-      console.log('signAuthorization result:', authorization);
-      if (authorization) authorizationList = [authorization];
-    } catch (err) {
-      console.error('signAuthorization failed:', err);
-      // wallet doesn't support EIP-7702 yet — plain updateSession still works
-    }
-
-    const txHash = await writeContractAsync({
-      address: sessionContractAddress,
-      abi: whenCheapSessionAbi,
-      functionName: 'authorize',
-      args: [parseEther(maxFeePerTxEth), parseEther(maxTotalSpendEth), durationSeconds],
-      ...(authorizationList ? { authorizationList } : {})
-    } as Parameters<typeof writeContract>[0]);
-
-    if (authorization && address) {
-      const response = await fetch(`${apiUrl}/intents/session`, {
+      const response = await fetch(`${apiUrl}/intents/wallet/authorize`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userAddress: address, authorization, txHash })
+        body: JSON.stringify({
+          userAddress: address,
+          maxFeePerTxEth,
+          maxTotalSpendEth,
+          expiryHours
+        })
       });
 
-      const body = await response.text();
-      console.log('POST /intents/session response:', {
-        ok: response.ok,
-        status: response.status,
-        body
-      });
-
-      if (!response.ok) {
-        throw new Error(body || `Session authorization storage failed with status ${response.status}`);
+      const rawBody = await response.text();
+      const payload = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
+      if (!response.ok || payload.ok !== true) {
+        throw new Error(typeof payload.message === 'string' ? payload.message : rawBody || 'Authorization failed');
       }
-    } else {
-      console.warn('Skipping POST /intents/session because no EIP-7702 authorization was returned.', {
-        hasAuthorization: Boolean(authorization),
-        address
-      });
+
+      setSessionMessage('Session authorized.');
+      setSessionTxHash(String(payload.txHash ?? ''));
+      await refetch();
+    } catch (err) {
+      setSessionError(err instanceof Error ? err.message : 'Session authorization failed');
+    } finally {
+      setActiveAction(null);
     }
   }
 
-  function revokeSession() {
-    if (!sessionContractAddress) {
-      return;
-    }
+  async function revokeSession() {
+    if (!address) return;
 
-    writeContract({
-      address: sessionContractAddress,
-      abi: whenCheapSessionAbi,
-      functionName: 'revokeSession'
-    });
+    try {
+      setActiveAction('revoke');
+      setSessionMessage(null);
+      setSessionTxHash(null);
+      setSessionError(null);
+
+      const response = await fetch(`${apiUrl}/intents/wallet/revoke`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userAddress: address })
+      });
+
+      const rawBody = await response.text();
+      const payload = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
+      if (!response.ok || payload.ok !== true) {
+        throw new Error(typeof payload.message === 'string' ? payload.message : rawBody || 'Revoke failed');
+      }
+
+      setSessionMessage('Session revoked.');
+      setSessionTxHash(String(payload.txHash ?? ''));
+      await refetch();
+    } catch (err) {
+      setSessionError(err instanceof Error ? err.message : 'Failed to revoke session');
+    } finally {
+      setActiveAction(null);
+    }
+  }
+
+  function disconnectWallet() {
+    setActiveAction('disconnect');
+    setSessionMessage(null);
+    setSessionTxHash(null);
+    setSessionError(null);
+    onLogout();
+    setSessionMessage('Google session disconnected.');
+    setActiveAction(null);
+  }
+
+  async function copyAddress() {
+    if (!address) return;
+    await navigator.clipboard.writeText(address);
+    setCopiedAddress(true);
   }
 
   const session = Array.isArray(sessionData)
@@ -358,185 +723,528 @@ function WalletSessionPanel({
         expiresAt: sessionData[3]
       }
     : null;
+
   const expiresAtMs = session && session.expiresAt > BigInt(0) ? Number(session.expiresAt) * 1000 : null;
   const sessionActive = Boolean(expiresAtMs && expiresAtMs > Date.now());
 
   return (
-    <section className="rounded-lg border border-[var(--border)] bg-[var(--panel)] p-4">
-      <div className="mb-4 flex items-center gap-2">
-        <PlugZap size={18} />
-        <h2 className="text-base font-semibold">Session Authorization</h2>
-      </div>
-
-      <div className="grid gap-3">
-        <div className="rounded-md border border-[var(--border)] bg-[var(--panel-strong)] px-3 py-2">
-          <p className="text-xs font-medium uppercase text-[var(--muted)]">Contract</p>
-          <p className="mt-1 break-all text-xs font-semibold">{sessionContractAddress ?? 'Not configured'}</p>
+    <ConsolePanel
+      title="Session Matrix"
+      eyebrow="MANAGED EXECUTION LAYER"
+      className="console-glitch-panel"
+      action={
+        <button type="button" onClick={onClose} className="console-icon-button" aria-label="Close session details">
+          <XCircle size={15} />
+        </button>
+      }
+    >
+      <div className="space-y-4">
+        <div className="grid gap-3 text-[11px] uppercase tracking-[0.16em] md:grid-cols-2">
+          <div className="console-subpanel">
+            <span className="text-[10px] text-[var(--color-label)]">Status</span>
+            <div className="mt-2">
+              <StatusBadge status={sessionActive ? 'CONFIRMED' : 'PENDING'} compact />
+            </div>
+          </div>
+          <div className="console-subpanel">
+            <span className="text-[10px] text-[var(--color-label)]">Google identity</span>
+            <p className="mt-2 break-all text-[var(--color-text)] normal-case tracking-normal">{email}</p>
+          </div>
         </div>
 
-        {!isConnected ? (
-          <div className="grid gap-2">
-            {visibleConnectors.map((connector) => (
-              <button
-                key={connector.uid}
-                type="button"
-                onClick={() => connect({ connector })}
-                disabled={isConnecting}
-                className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-[var(--accent)] px-4 py-2.5 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                <Wallet size={16} />
-                {isConnecting ? 'Connecting' : `Connect ${connector.name}`}
-              </button>
-            ))}
-            {visibleConnectors.length === 0 ? (
-              <p className="text-sm text-[var(--muted)]">No browser wallet detected.</p>
-            ) : null}
+        <div className="console-subpanel">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-label)]">
+              System-generated wallet
+            </span>
+            <button type="button" onClick={() => void copyAddress()} className="console-icon-button">
+              <Copy size={14} />
+            </button>
           </div>
-        ) : (
+          <p className="mt-2 break-all text-sm text-[var(--color-text)]">{address}</p>
+          <p className="mt-2 text-[10px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
+            {copiedAddress ? 'Address copied' : 'Allocated to this Google account'}
+          </p>
+        </div>
+
+        <div className="console-scroll max-h-[70vh] space-y-4 pr-1">
           <div className="grid gap-3">
-            <div className="rounded-md border border-[var(--border)] bg-[var(--panel-strong)] px-3 py-2">
-              <p className="text-xs font-medium uppercase text-[var(--muted)]">Wallet</p>
-              <p className="mt-1 break-all text-xs font-semibold">{address}</p>
-            </div>
-
-            {isWrongChain ? (
-              <button
-                type="button"
-                onClick={() => switchChain({ chainId: sepolia.id })}
-                disabled={isSwitching}
-                className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-[var(--warning)] px-4 py-2.5 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                <Link2 size={16} />
-                {isSwitching ? 'Switching' : 'Switch to Sepolia'}
-              </button>
-            ) : null}
-
-            <div className="grid gap-3 sm:grid-cols-2">
-              <label className="text-sm font-medium">
-                Max fee per tx ETH
-                <input
-                  value={maxFeePerTxEth}
-                  onChange={(event) => setMaxFeePerTxEth(event.target.value)}
-                  className="mt-2 w-full rounded-md border border-[var(--border)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
-                  inputMode="decimal"
-                />
-              </label>
-              <label className="text-sm font-medium">
-                Total budget ETH
-                <input
-                  value={maxTotalSpendEth}
-                  onChange={(event) => setMaxTotalSpendEth(event.target.value)}
-                  className="mt-2 w-full rounded-md border border-[var(--border)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
-                  inputMode="decimal"
-                />
-              </label>
-            </div>
-
-            <label className="text-sm font-medium">
-              Expiry hours
+            <label className="space-y-1 text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
+              <span>Per-tx limit</span>
+              <input
+                value={maxFeePerTxEth}
+                onChange={(event) => setMaxFeePerTxEth(event.target.value)}
+                className="console-input w-full"
+                inputMode="decimal"
+              />
+            </label>
+            <label className="space-y-1 text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
+              <span>Budget</span>
+              <input
+                value={maxTotalSpendEth}
+                onChange={(event) => setMaxTotalSpendEth(event.target.value)}
+                className="console-input w-full"
+                inputMode="decimal"
+              />
+            </label>
+            <label className="space-y-1 text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
+              <span>Expiry hours</span>
               <input
                 value={expiryHours}
                 onChange={(event) => setExpiryHours(event.target.value)}
-                className="mt-2 w-full rounded-md border border-[var(--border)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--accent)]"
+                className="console-input w-full"
                 inputMode="numeric"
               />
             </label>
+          </div>
 
-            <button
-              type="button"
-              onClick={authorizeSession}
-              disabled={isWrongChain || isWriting || isConfirming || !sessionContractAddress}
-              className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-[var(--accent)] px-4 py-2.5 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              <ShieldCheck size={16} />
-              {isWriting ? 'Confirm in wallet' : isConfirming ? 'Authorizing' : 'Authorize Session'}
-            </button>
+          <div className="grid gap-[1px] border border-[var(--color-border)] bg-[var(--color-border)]">
+            <InfoRow label="PER TX" value={session ? `${formatEther(session.maxFeePerTxWei)} ETH` : '0 ETH'} />
+            <InfoRow label="BUDGET" value={session ? `${formatEther(session.maxTotalSpendWei)} ETH` : '0 ETH'} />
+            <InfoRow label="SPENT" value={session ? `${formatEther(session.spentWei)} ETH` : '0 ETH'} />
+            <InfoRow label="EXPIRES" value={expiresAtMs ? new Date(expiresAtMs).toLocaleString() : 'Not set'} />
+          </div>
 
+          <div className="border border-[var(--color-border)] p-3">
+            <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+              Managed wallet policy
+            </p>
+            <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
+              This wallet was generated for your verified Gmail. Session authorization and revocation are executed from the server using the encrypted managed key.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={authorizeSession}
+            disabled={activeAction !== null}
+            className="console-button console-button-primary w-full"
+          >
+            <ShieldCheck size={15} />
+            {activeAction === 'authorize' ? 'Authorizing...' : 'Authorize'}
+          </button>
+
+          <div className="flex flex-wrap gap-3 text-[11px] uppercase tracking-[0.14em]">
             <button
               type="button"
               onClick={revokeSession}
-              disabled={isWrongChain || isWriting || isConfirming || !sessionContractAddress}
-              className="inline-flex w-full items-center justify-center rounded-md border border-[var(--border)] px-4 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={activeAction !== null && activeAction !== 'revoke'}
+              className="console-text-button text-[var(--color-danger)]"
             >
-              Revoke Session
+              <XCircle size={14} />
+              {activeAction === 'revoke' ? 'Revoking...' : 'Revoke'}
             </button>
-
             <button
               type="button"
-              onClick={() => disconnect()}
-              className="inline-flex w-full items-center justify-center rounded-md border border-[var(--border)] px-4 py-2 text-sm font-semibold"
+              onClick={disconnectWallet}
+              className="console-text-button"
             >
+              <LogOut size={14} />
               Disconnect
             </button>
           </div>
-        )}
+        </div>
 
-        {session ? (
-          <div className="grid gap-2 rounded-md border border-[var(--border)] bg-[var(--panel-strong)] px-3 py-2 text-sm">
-            <p className="font-semibold">{sessionActive ? 'Session active' : 'No active session'}</p>
-            <p className="text-[var(--muted)]">Per tx: {formatEther(session.maxFeePerTxWei)} ETH</p>
-            <p className="text-[var(--muted)]">Budget: {formatEther(session.maxTotalSpendWei)} ETH</p>
-            <p className="text-[var(--muted)]">Spent: {formatEther(session.spentWei)} ETH</p>
-            <p className="text-[var(--muted)]">
-              Expires: {expiresAtMs ? new Date(expiresAtMs).toLocaleString() : 'Not set'}
+        {sessionMessage ? (
+          <div className="console-alert console-alert-success">
+            <span className="console-alert-label">System</span>
+            <p>
+              {sessionMessage}
+              {sessionTxHash ? (
+                <>
+                  {' '}
+                  <a
+                    href={`https://sepolia.etherscan.io/tx/${sessionTxHash}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-[var(--color-accent)] underline"
+                  >
+                    {shortHash(sessionTxHash)}
+                  </a>
+                </>
+              ) : null}
             </p>
           </div>
         ) : null}
-
-        {hash ? <p className="break-all text-xs text-[var(--muted)]">Tx: {hash}</p> : null}
-        {isConfirmed ? <p className="text-sm font-medium text-[var(--accent)]">Session authorized.</p> : null}
-        {writeError ? <p className="text-sm text-[var(--danger)]">{writeError.message}</p> : null}
+        {sessionError ? (
+          <div className="console-alert console-alert-danger">
+            <span className="console-alert-label">Error</span>
+            <p>{sessionError}</p>
+          </div>
+        ) : null}
       </div>
+    </ConsolePanel>
+  );
+}
+
+function CommandCenter({ intent }: { intent: IntentRecord }) {
+  const details = deriveExecutionDetails(intent);
+  const summaryRecipient = intent.parsed.resolvedRecipient
+    ? `${intent.parsed.recipient ?? 'ENS'} -> ${intent.parsed.resolvedRecipient}`
+    : intent.parsed.recipient ?? intent.parsed.toToken ?? 'Not set';
+
+  return (
+    <ConsolePanel title="Command Center" eyebrow="EXECUTION STATE" className="min-h-0">
+      <div className="flex h-full min-h-0 flex-col gap-4">
+        <div className="flex items-center justify-between gap-3">
+          <StatusBadge status={intent.status} />
+          <div className="text-right text-[10px] uppercase tracking-[0.18em] text-[var(--color-muted)]">
+            <div>Intent {intent.id.slice(0, 8)}</div>
+            <div className="mt-1">{new Date(intent.createdAt).toLocaleString()}</div>
+          </div>
+        </div>
+
+        <div className="grid gap-[1px] border border-[var(--color-border)] bg-[var(--color-border)] sm:grid-cols-2 xl:grid-cols-3">
+          <SummaryField label="Type" value={intent.parsed.type} />
+          <SummaryField label="Amount" value={`${intent.parsed.amount} ${intent.parsed.fromToken}`} />
+          <SummaryField label="Recipient" value={summaryRecipient} />
+          <SummaryField label="Max Fee" value={`$${intent.parsed.maxFeeUsd}`} />
+          <SummaryField label="Chain" value={intent.parsed.chain} />
+          <SummaryField label="Deadline" value={new Date(intent.parsed.deadlineIso).toLocaleString()} />
+          <SummaryField label="Slippage" value={`${intent.parsed.slippageBps / 100}%`} />
+          <SummaryField label="Wallet" value={truncateAddress(intent.wallet)} />
+          <SummaryField label="Tx Hash" value={details.txHash ? shortHash(details.txHash) : 'Pending'} />
+          <SummaryField label="Block" value={details.blockNumber ? String(details.blockNumber) : 'Pending'} />
+          <SummaryField
+            label="Gas Paid"
+            value={details.gasPaidWei ? `${formatEther(BigInt(details.gasPaidWei))} ETH` : 'Pending'}
+          />
+          <SummaryField label="Input" value={intent.rawInput} />
+        </div>
+
+        {details.txHash ? (
+          <div className="console-subpanel">
+            <span className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-label)]">Explorer</span>
+            <a
+              href={`https://sepolia.etherscan.io/tx/${details.txHash}`}
+              target="_blank"
+              rel="noreferrer"
+              className="mt-2 inline-flex text-xs uppercase tracking-[0.14em] text-[var(--color-accent)] underline"
+            >
+              Open transaction {shortHash(details.txHash)}
+            </a>
+          </div>
+        ) : null}
+
+        {intent.parsed.notes ? (
+          <div className="border border-[var(--color-warning)] px-3 py-3 text-[11px] uppercase tracking-[0.14em] text-[var(--color-warning)]">
+            {intent.parsed.notes}
+          </div>
+        ) : null}
+
+        <div className="console-subpanel flex-1">
+          <span className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-label)]">Execution feed</span>
+          <div className="console-scroll mt-3 h-[180px] space-y-2 pr-1">
+            {intent.audit.slice(0, 8).map((event) => (
+              <div key={event.id} className="border-l border-[var(--color-border)] pl-3">
+                <div className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-label)]">
+                  {event.type}
+                </div>
+                <div className="mt-1 text-xs uppercase tracking-[0.12em] text-[var(--color-text)]">
+                  {event.message}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </ConsolePanel>
+  );
+}
+
+function AuditTrail({ intent }: { intent: IntentRecord }) {
+  return (
+    <ConsolePanel title="Audit Trail" eyebrow="LIVE TERMINAL" className="min-h-0">
+      <div className="console-scroll h-full min-h-[560px] space-y-2 pr-1">
+        {intent.audit.map((event, index) => (
+          <div key={event.id} className={`terminal-line ${auditToneClass(event.type)}`} style={{ animationDelay: `${Math.min(index, 8) * 40}ms` }}>
+            <div className="terminal-meta">
+              <span>{formatAuditTime(event.at)}</span>
+              <span>{event.type}</span>
+            </div>
+            <p className="mt-1 text-xs uppercase tracking-[0.12em] text-[var(--color-text)]">{event.message}</p>
+          </div>
+        ))}
+      </div>
+    </ConsolePanel>
+  );
+}
+
+function CommandCenterEmpty() {
+  return (
+    <ConsolePanel title="Command Center" eyebrow="EXECUTION STATE" className="min-h-0">
+      <div className="flex h-full min-h-[640px] items-center justify-center px-6 py-12 text-center">
+        <div className="space-y-3">
+          <div className="text-4xl text-[var(--color-accent)]">⚡</div>
+          <h2 className="text-lg font-medium uppercase tracking-[0.18em] text-[var(--color-text)]">
+            Create your first command
+          </h2>
+          <p className="max-w-sm text-xs uppercase tracking-[0.14em] text-[var(--color-muted)]">
+            Verify with Google, use the assigned wallet, and submit a command to start execution.
+          </p>
+        </div>
+      </div>
+    </ConsolePanel>
+  );
+}
+
+function AuditTrailEmpty() {
+  return (
+    <ConsolePanel title="Audit Trail" eyebrow="LIVE TERMINAL" className="min-h-0">
+      <div className="flex h-full min-h-[640px] items-center justify-center px-6 py-12 text-center">
+        <div className="space-y-3">
+          <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+            No events yet
+          </p>
+          <p className="max-w-xs text-xs uppercase tracking-[0.14em] text-[var(--color-muted)]">
+            Audit events will stream here after the first intent is created and evaluated.
+          </p>
+        </div>
+      </div>
+    </ConsolePanel>
+  );
+}
+
+function RecentCommandsPanel({
+  intents,
+  selectedId,
+  onSelect,
+  onRefresh,
+  isLoading
+}: {
+  intents: IntentRecord[];
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+  onRefresh: () => void;
+  isLoading: boolean;
+}) {
+  return (
+    <ConsolePanel
+      title="Recent Commands"
+      eyebrow="QUEUE"
+      action={
+        <button
+          type="button"
+          onClick={onRefresh}
+          className="console-icon-button"
+          title="Refresh intents"
+        >
+          <RefreshCcw size={14} />
+        </button>
+      }
+      className="min-h-0"
+    >
+      <div className="console-scroll grid h-full min-h-0 gap-2 pr-1 xl:grid-cols-3">
+        {isLoading ? (
+          <p className="text-xs uppercase tracking-[0.14em] text-[var(--color-muted)]">
+            Loading intents...
+          </p>
+        ) : intents.length === 0 ? (
+          <p className="text-xs uppercase tracking-[0.14em] text-[var(--color-muted)]">
+            No commands queued.
+          </p>
+        ) : (
+          intents.map((intent) => (
+            <button
+              key={intent.id}
+              type="button"
+              onClick={() => onSelect(intent.id)}
+              className={`console-list-item ${selectedId === intent.id ? 'console-list-item-active' : ''}`}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="truncate text-xs uppercase tracking-[0.14em] text-[var(--color-text)]">
+                    {intent.rawInput}
+                  </p>
+                  <p className="mt-2 text-[10px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
+                    {new Date(intent.createdAt).toLocaleString()}
+                  </p>
+                </div>
+                <StatusBadge status={intent.status} compact />
+              </div>
+            </button>
+          ))
+        )}
+      </div>
+    </ConsolePanel>
+  );
+}
+
+function ConsolePanel({
+  title,
+  eyebrow,
+  action,
+  children,
+  className = ''
+}: {
+  title: string;
+  eyebrow?: string;
+  action?: ReactNode;
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <section className={`console-panel ${className}`}>
+      <div className="mb-4 flex items-start justify-between gap-3 border-b border-[var(--color-border)] pb-3">
+        <div>
+          {eyebrow ? (
+            <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">{eyebrow}</p>
+          ) : null}
+          <h2 className="mt-1 text-sm font-medium uppercase tracking-[0.18em] text-[var(--color-text)]">
+            {title}
+          </h2>
+        </div>
+        {action}
+      </div>
+      {children}
     </section>
   );
 }
 
-function IntentDetail({ intent }: { intent: IntentRecord }) {
+function InfoRow({
+  label,
+  value
+}: {
+  label: string;
+  value: React.ReactNode;
+}) {
   return (
-    <div className="grid gap-5 lg:grid-cols-[1fr_360px]">
-      <section className="rounded-lg border border-[var(--border)] bg-[var(--panel)] p-4">
-        <div className="mb-4 flex items-center gap-2">
-          <Clock3 size={18} />
-          <h2 className="text-base font-semibold">Parsed Execution Plan</h2>
-        </div>
-        <dl className="grid gap-3 sm:grid-cols-2">
-          <Field label="Type" value={intent.parsed.type} />
-          <Field label="Status" value={intent.status} />
-          <Field label="Amount" value={`${intent.parsed.amount} ${intent.parsed.fromToken}`} />
-          <Field
-            label={intent.parsed.type === 'send' ? 'Recipient' : 'Output'}
-            value={intent.parsed.recipient ?? intent.parsed.toToken ?? 'Not set'}
-          />
-          <Field label="Max Fee" value={`$${intent.parsed.maxFeeUsd}`} />
-          <Field label="Chain" value={intent.parsed.chain} />
-          <Field label="Slippage" value={`${intent.parsed.slippageBps / 100}%`} />
-          <Field label="Deadline" value={new Date(intent.parsed.deadlineIso).toLocaleString()} />
-          {intent.parsed.repeatCount ? <Field label="Repeats" value={`${intent.parsed.repeatCount} times`} /> : null}
-        </dl>
-        {intent.parsed.notes ? <p className="mt-4 text-sm text-[var(--warning)]">{intent.parsed.notes}</p> : null}
-      </section>
-
-      <section className="rounded-lg border border-[var(--border)] bg-[var(--panel)] p-4">
-        <h2 className="mb-4 text-base font-semibold">Audit Trail</h2>
-        <div className="grid gap-3">
-          {intent.audit.map((event) => (
-            <div key={event.id} className="border-l-2 border-[var(--accent)] pl-3">
-              <p className="text-sm font-medium">{event.type}</p>
-              <p className="mt-1 text-sm text-[var(--muted)]">{event.message}</p>
-              <p className="mt-1 text-xs text-[var(--muted)]">{new Date(event.at).toLocaleString()}</p>
-            </div>
-          ))}
-        </div>
-      </section>
+    <div className="grid grid-cols-[120px_minmax(0,1fr)] gap-[1px] bg-[var(--color-border)]">
+      <span className="bg-[var(--color-surface)] px-3 py-2 text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+        {label}
+      </span>
+      <span className="bg-[var(--color-surface)] px-3 py-2 text-right text-xs uppercase tracking-[0.12em] text-[var(--color-text)]">
+        {value}
+      </span>
     </div>
   );
 }
 
-function Field({ label, value }: { label: string; value: string }) {
+function SummaryField({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-md border border-[var(--border)] bg-[var(--panel-strong)] px-3 py-2">
-      <dt className="text-xs font-medium uppercase text-[var(--muted)]">{label}</dt>
-      <dd className="mt-1 break-words text-sm font-semibold">{value}</dd>
+    <div className="bg-[var(--color-surface)] px-3 py-3">
+      <dt className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">{label}</dt>
+      <dd className="mt-2 break-words text-xs uppercase tracking-[0.12em] text-[var(--color-text)]">
+        {value}
+      </dd>
     </div>
   );
+}
+
+function StatusBadge({ status, compact = false }: { status: string; compact?: boolean }) {
+  const { bg, text, border } = statusTone(status);
+  return (
+    <span
+      className={`inline-flex items-center border px-2 py-1 font-medium uppercase tracking-[0.18em] ${bg} ${text} ${border} ${
+        compact ? 'text-[10px]' : 'text-[11px]'
+      }`}
+    >
+      {normalizeStatusLabel(status)}
+    </span>
+  );
+}
+
+function extractEnsCandidate(input: string): string | null {
+  const match = input.match(/\b[a-z0-9-]+\.eth\b/i);
+  return match?.[0] ?? null;
+}
+
+function truncateAddress(value: string) {
+  if (!value) return '';
+  return value.length > 10 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value;
+}
+
+function shortHash(hash: string) {
+  return hash.length > 14 ? `${hash.slice(0, 8)}...${hash.slice(-6)}` : hash;
+}
+
+function normalizeStatusLabel(status: string) {
+  const upper = status.toUpperCase();
+  if (upper === 'PENDING_INTENT') return 'PENDING';
+  if (upper === 'DEADLINE_EXCEEDED') return 'EXPIRED';
+  if (upper === 'FINALIZED') return 'CONFIRMED';
+  return upper.replaceAll('_', ' ');
+}
+
+function statusTone(status: string) {
+  const upper = status.toUpperCase();
+  if (upper.includes('FINAL') || upper.includes('CONFIRM')) {
+    return {
+      bg: 'bg-[rgba(255,69,0,0.08)]',
+      text: 'text-[var(--color-accent)]',
+      border: 'border-[var(--color-accent)]'
+    };
+  }
+  if (upper.includes('FAILED')) {
+    return {
+      bg: 'bg-[rgba(255,59,48,0.08)]',
+      text: 'text-[var(--color-danger)]',
+      border: 'border-[var(--color-danger)]'
+    };
+  }
+  if (upper.includes('STUCK')) {
+    return {
+      bg: 'bg-[rgba(255,145,0,0.08)]',
+      text: 'text-[var(--color-warning)]',
+      border: 'border-[var(--color-warning)]'
+    };
+  }
+  if (upper.includes('EXPIRE') || upper.includes('DEADLINE')) {
+    return {
+      bg: 'bg-[rgba(255,255,255,0.03)]',
+      text: 'text-[var(--color-muted)]',
+      border: 'border-[var(--color-muted)]'
+    };
+  }
+  return {
+    bg: 'bg-[rgba(255,255,255,0.03)]',
+    text: 'text-[var(--color-muted)]',
+    border: 'border-[var(--color-border)]'
+  };
+}
+
+function auditToneClass(type: string) {
+  const upper = type.toUpperCase();
+  if (upper.includes('EIP7702')) return 'terminal-info';
+  if (upper.includes('PASSED') || upper.includes('CONFIRMED') || upper.includes('FINALIZED')) {
+    return 'terminal-success';
+  }
+  if (upper.includes('FAILED') || upper.includes('STUCK')) {
+    return 'terminal-danger';
+  }
+  if (upper.includes('WARNING') || upper.includes('SKIPPED')) {
+    return 'terminal-warning';
+  }
+  return 'terminal-neutral';
+}
+
+function deriveExecutionDetails(intent: IntentRecord): ExecutionDetails {
+  let txHash = intent.txHash;
+  let blockNumber: number | string | undefined;
+  let gasPaidWei: string | undefined;
+
+  for (const event of intent.audit) {
+    const metadata = event.metadata;
+    if (!metadata) continue;
+
+    if (!txHash && typeof metadata.txHash === 'string') {
+      txHash = metadata.txHash;
+    }
+    if (!blockNumber && (typeof metadata.blockNumber === 'number' || typeof metadata.blockNumber === 'string')) {
+      blockNumber = metadata.blockNumber;
+    }
+    if (!gasPaidWei && typeof metadata.feePaidWei === 'string') {
+      gasPaidWei = metadata.feePaidWei;
+    }
+  }
+
+  return { txHash, blockNumber, gasPaidWei };
+}
+
+function formatAuditTime(at: string) {
+  return new Date(at).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
 }

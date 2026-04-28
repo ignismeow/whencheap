@@ -7,14 +7,19 @@ export class HealthController {
 
   @Get()
   getHealth() {
+    const zeroGConfigured = Boolean(this.config.get<string>('ZG_BEARER_TOKEN'));
+    const ollamaConfigured = Boolean(this.config.get<string>('OLLAMA_BASE_URL'));
+
     return {
       ok: true,
       service: 'whencheap-api',
       network: this.config.get<string>('NETWORK') ?? 'sepolia',
       ai: {
-        provider: 'gemini',
-        model: this.config.get<string>('GEMINI_MODEL') ?? 'gemini-2.5-flash',
-        configured: Boolean(this.config.get<string>('GEMINI_API_KEY'))
+        provider: zeroGConfigured ? '0g' : 'ollama',
+        model: zeroGConfigured
+          ? (this.config.get<string>('ZG_MODEL') ?? 'auto')
+          : (this.config.get<string>('OLLAMA_MODEL') ?? 'llama3.1:8b'),
+        configured: zeroGConfigured || ollamaConfigured
       }
     };
   }

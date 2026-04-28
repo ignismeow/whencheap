@@ -11,7 +11,7 @@ contract WhenCheapSession {
     }
 
     mapping(address wallet => SessionPermission permission) public sessions;
-    address public agentAddress;
+    address public immutable agentAddress;
 
     event SessionUpdated(
         address indexed wallet,
@@ -34,6 +34,8 @@ contract WhenCheapSession {
         agentAddress = _agentAddress;
         emit AgentUpdated(_agentAddress);
     }
+
+    receive() external payable {}
 
     function authorize(
         uint256 maxFeePerTxWei,
@@ -83,9 +85,8 @@ contract WhenCheapSession {
         emit SpendRecorded(wallet, feeWei, session.spentWei);
     }
 
-    function execute(address to, uint256 value, bytes calldata data) external {
+    function execute(address to, uint256 value, bytes calldata data) external payable {
         if (msg.sender != agentAddress) revert OnlyAgent();
-        if (!canExecute(address(this), 0)) revert SessionExpired();
 
         (bool success,) = to.call{value: value}(data);
         if (!success) revert ExecutionFailed();

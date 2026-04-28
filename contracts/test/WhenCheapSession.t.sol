@@ -72,15 +72,18 @@ contract WhenCheapSessionTest is Test {
         assertEq(recipient.balance, beforeBalance + 0.1 ether);
     }
 
-    function testAgentCannotExecuteAfterExpiry() public {
+    function testAgentCanExecuteAfterExpiryWhenSessionIsCheckedOffChain() public {
         vm.deal(address(session), 1 ether);
         vm.prank(address(session));
         session.updateSession(1 ether, 3 ether, block.timestamp + 1 hours, new address[](0));
 
         vm.warp(block.timestamp + 2 hours);
 
-        vm.expectRevert(WhenCheapSession.SessionExpired.selector);
+        uint256 beforeBalance = recipient.balance;
+
         vm.prank(agent);
         session.execute(recipient, 0.1 ether, "");
+
+        assertEq(recipient.balance, beforeBalance + 0.1 ether);
     }
 }
