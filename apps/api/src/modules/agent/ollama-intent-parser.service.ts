@@ -121,7 +121,8 @@ export class OllamaIntentParserService {
       'For swap intents, omit recipient unless the user explicitly provides one.',
       'recipient may be a 0x address or an ENS name like vitalik.eth.',
       'Use ISO datetime for deadlineIso.',
-      'Use chain sepolia unless the user explicitly names another chain.',
+      "For swap intents, default chain to 'ethereum' unless the user explicitly says 'sepolia' or 'testnet'.",
+      "For send intents, default chain to 'sepolia'.",
       'maxFeeUsd and slippageBps must be numbers. amount must be a string.',
       'Use slippageBps 50 when slippage is unknown.',
       'Omit optional unknown fields instead of returning null.',
@@ -160,8 +161,10 @@ export class OllamaIntentParserService {
     }
     if (parsed.slippageBps === null) parsed.slippageBps = 50;
     if (parsed.maxFeeUsd === null) parsed.maxFeeUsd = 1;
-    if (parsed.chain === 'ethereum') parsed.chain = 'sepolia';
-
+    if (parsed.chain === null) delete parsed.chain;
+    if (typeof parsed.chain !== 'string' || !parsed.chain.trim()) {
+      parsed.chain = parsed.type === 'swap' ? 'ethereum' : 'sepolia';
+    }
     return parsed;
   }
 
@@ -172,6 +175,7 @@ export class OllamaIntentParserService {
   private fallbackParse(input: string): ParsedIntent {
     const lower = input.toLowerCase();
     const isSend = /\bsend\b/.test(lower);
+    const explicitChain = this.extractChain(lower);
     const amount = lower.match(/\b(\d+(?:\.\d+)?)\s*(?:sepolia\s+)?(?:eth|weth|usdc|usdt|dai)\b/)?.[1]
       ?? lower.match(/(\d+(?:\.\d+)?)/)?.[1]
       ?? '0';
@@ -183,15 +187,17 @@ export class OllamaIntentParserService {
     const explicitToken = lower.match(/\b(?:sepolia\s+)?(eth|weth|usdc|usdt|dai)\b/)?.[1];
     const fromToken = tokenPair?.[1]?.toUpperCase() ?? explicitToken?.toUpperCase() ?? 'ETH';
     const toToken = tokenPair?.[2]?.toUpperCase() ?? 'USDC';
+    const type = isSend ? 'send' : 'swap';
+    const chain = explicitChain ?? (type === 'swap' ? 'ethereum' : 'sepolia');
 
     return parsedIntentSchema.parse({
-      type: isSend ? 'send' : 'swap',
+      type,
       fromToken,
       ...(isSend ? { recipient } : { toToken }),
       amount,
       maxFeeUsd,
       deadlineIso: deadline.toISOString(),
-      chain: 'sepolia',
+      chain,
       slippageBps: 50,
       repeatCount: repeatCount > 1 ? repeatCount : undefined,
       notes:
@@ -240,6 +246,12 @@ export class OllamaIntentParserService {
       ten: 10,
     };
     return words[value] ?? Number(value);
+  }
+
+  private extractChain(input: string): string | null {
+    if (/\b(sepolia|testnet)\b/.test(input)) return 'sepolia';
+    if (/\b(ethereum|mainnet| on eth\b| eth chain)\b/.test(input)) return 'ethereum';
+    return null;
   }
 
   private async resolveZeroGModel(baseUrl: string, bearerToken: string): Promise<string> {

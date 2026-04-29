@@ -18,7 +18,9 @@ export class IntentsController {
   }
 
   @Post('session')
-  async storeSession(@Body() body: { userAddress: string; authorization: unknown }) {
+  async storeSession(
+    @Body() body: { userAddress: string; authorization: unknown; chain?: string },
+  ) {
     const authorization =
       body.authorization && typeof body.authorization === 'object'
         ? body.authorization as Record<string, unknown>
@@ -27,10 +29,15 @@ export class IntentsController {
     this.logger.log(
       `POST /intents/session received. ` +
       `User: ${body.userAddress}. ` +
+      `Chain: ${body.chain ?? 'sepolia'}. ` +
       `Auth present: ${!!body.authorization}. ` +
       `Auth keys: ${authorization ? Object.keys(authorization).join(', ') : 'none'}`
     );
-    await this.intents.storeAuthorization(body.userAddress, body.authorization);
+    await this.intents.storeAuthorization(
+      body.userAddress,
+      body.authorization,
+      body.chain ?? 'sepolia',
+    );
     return { ok: true };
   }
 
@@ -53,15 +60,20 @@ export class IntentsController {
   }
 
   @Post('wallet/revoke')
-  revokeManagedWalletSession(@Body() body: { userAddress: string }) {
+  revokeManagedWalletSession(@Body() body: { userAddress: string; chain?: string }) {
     this.logger.log(`POST /intents/wallet/revoke received for ${body.userAddress}`);
-    return this.intents.revokeManagedWalletSession(body.userAddress);
+    return this.intents.revokeManagedWalletSession(body.userAddress, body.chain ?? 'sepolia');
   }
 
   @Post('test-eip7702')
   testEip7702(@Body() dto: TestEip7702Dto) {
     this.logger.warn('TEST ENDPOINT — do not expose in production');
     return this.intents.testEip7702(dto);
+  }
+
+  @Post(':id/cancel')
+  cancel(@Param('id') id: string) {
+    return this.intents.cancel(id);
   }
 
   @Get()

@@ -1,13 +1,13 @@
-import { BadGatewayException, BadRequestException, Injectable, Logger } from '@nestjs/common';
+import { BadGatewayException, BadRequestException, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import axios, { AxiosResponse } from 'axios';
+import axios, { AxiosError, AxiosResponse } from 'axios';
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
 import { ethers } from 'ethers';
 import { Repository } from 'typeorm';
-import { createWalletClient, encodeFunctionData, http, parseAbi, parseEther } from 'viem';
+import { Chain, createWalletClient, encodeFunctionData, http, parseAbi, parseEther } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { sepolia } from 'viem/chains';
+import { mainnet, sepolia } from 'viem/chains';
 import { IntentRecord } from '../intents/intent.types';
 import { GoogleAuthDto } from '../intents/dto/google-auth.dto';
 import { ManagedSessionDto } from '../intents/dto/managed-session.dto';
@@ -46,11 +46,40 @@ const ERC20_ABI = [
 
 const GAS_UNITS = { send: 21_000, swap: 150_000 } as const;
 const SEPOLIA_CHAIN_ID = 11155111;
-const NATIVE_ETH = '0x0000000000000000000000000000000000000000';
-const TOKEN_REGISTRY: Record<string, { address: string; decimals: number; symbol: string }> = {
-  ETH: { address: NATIVE_ETH, decimals: 18, symbol: 'ETH' },
+const UNISWAP_NATIVE_ETH = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
+const MAINNET_CHAIN_ID = 1;
+const MAINNET_TOKENS: Record<string, { address: string; decimals: number; symbol: string }> = {
+  ETH: { address: UNISWAP_NATIVE_ETH, decimals: 18, symbol: 'ETH' },
   WETH: {
-    address: '0xfff9976782d46cc05630d1f6ebab18b2324d6b14',
+    address: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+    decimals: 18,
+    symbol: 'WETH',
+  },
+  USDC: {
+    address: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+    decimals: 6,
+    symbol: 'USDC',
+  },
+  USDT: {
+    address: '0xdAC17F958D2ee523a2206206994597C13D831ec7',
+    decimals: 6,
+    symbol: 'USDT',
+  },
+  DAI: {
+    address: '0x6B175474E89094C44Da98b954EedeAC495271d0F',
+    decimals: 18,
+    symbol: 'DAI',
+  },
+  WBTC: {
+    address: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599',
+    decimals: 8,
+    symbol: 'WBTC',
+  },
+};
+const SEPOLIA_TOKENS: Record<string, { address: string; decimals: number; symbol: string }> = {
+  ETH: { address: UNISWAP_NATIVE_ETH, decimals: 18, symbol: 'ETH' },
+  WETH: {
+    address: '0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14',
     decimals: 18,
     symbol: 'WETH',
   },
@@ -119,7 +148,7 @@ interface StoredWalletResult {
 }
 
 @Injectable()
-export class SessionSignerService {
+export class SessionSignerService implements OnModuleInit {
   private readonly logger = new Logger(SessionSignerService.name);
   readonly provider: ethers.JsonRpcProvider;
   private readonly agentWalletPk: string | null;
@@ -184,30 +213,46 @@ export class SessionSignerService {
     void this.logAgentWalletEnsName();
   }
 
+  async onModuleInit(): Promise<void> {
+    await this.ensureSessionAuthorizationChainSchema();
+    await this.migrateLegacyWalletRows();
+  }
+
   get agentAddress(): string | null {
     return this.agentWallet?.address ?? null;
   }
 
-  async storeAuthorization(userAddress: string, authorization: unknown): Promise<void> {
+  getProviderForChain(chain: string): ethers.JsonRpcProvider {
+    return new ethers.JsonRpcProvider(this.getChainConfig(chain).rpcUrl);
+  }
+
+  async storeAuthorization(
+    userAddress: string,
+    authorization: unknown,
+    chain = 'sepolia',
+  ): Promise<void> {
     const key = userAddress.toLowerCase();
+    const normalizedChain = this.normalizeChain(chain);
     const user = await this.resolveOrCreateWalletUser(key);
     await this.sessionRepository.upsert(
       {
         userId: user.id,
         walletAddress: key,
+        chain: normalizedChain,
         authorizationJson: JSON.stringify(authorization),
         isActive: true,
         expiresAt: null,
       },
-      ['walletAddress'],
+      ['walletAddress', 'chain'],
     );
-    this.logger.log(`Stored EIP-7702 authorization for ${userAddress}`);
+    this.logger.log(`Stored EIP-7702 authorization for ${userAddress} on ${normalizedChain}`);
   }
 
-  async getAuthorization(userAddress: string): Promise<unknown | null> {
+  async getAuthorization(userAddress: string, chain = 'sepolia'): Promise<unknown | null> {
     const key = userAddress.toLowerCase();
+    const normalizedChain = this.normalizeChain(chain);
     const persisted = await this.sessionRepository.findOne({
-      where: { walletAddress: key, isActive: true },
+      where: { walletAddress: key, chain: normalizedChain, isActive: true },
     });
 
     if (!persisted) {
@@ -217,14 +262,19 @@ export class SessionSignerService {
     try {
       return JSON.parse(persisted.authorizationJson) as unknown;
     } catch {
-      this.logger.warn(`Stored authorization for ${key} is invalid JSON.`);
+      this.logger.warn(`Stored authorization for ${key} on ${normalizedChain} is invalid JSON.`);
       return null;
     }
   }
 
-  async hasAuthorization(userAddress: string): Promise<boolean> {
+  async hasAuthorization(userAddress: string, chain = 'sepolia'): Promise<boolean> {
     const key = userAddress.toLowerCase();
-    return (await this.sessionRepository.count({ where: { walletAddress: key, isActive: true } })) > 0;
+    const normalizedChain = this.normalizeChain(chain);
+    return (
+      await this.sessionRepository.count({
+        where: { walletAddress: key, chain: normalizedChain, isActive: true },
+      })
+    ) > 0;
   }
 
   async registerWallet(dto: RegisterWalletDto): Promise<{ ok: true; address: string }> {
@@ -276,12 +326,13 @@ export class SessionSignerService {
       (await this.getEncryptedWallet(googleProfile.googleSub));
 
     if (existing) {
+      const payload = this.extractWalletPayload(existing.wallet);
       await this.storeEncryptedWallet(
         googleProfile.email.toLowerCase(),
         UserIdentifierType.Email,
-        existing.wallet.encryptedPrivateKey,
-        existing.wallet.iv,
-        existing.wallet.authTag,
+        payload.encryptedKey,
+        payload.iv,
+        payload.authTag,
         existing.wallet.walletAddress,
       );
 
@@ -316,20 +367,25 @@ export class SessionSignerService {
   async authorizeManagedWalletSession(dto: ManagedSessionDto): Promise<{ ok: true; txHash: string }> {
     try {
       const wallet = await this.requireStoredWallet(dto.userAddress);
-      const sessionContractAddress = this.requireSessionContractAddress();
-      const rpcUrl = this.requireRpcUrl();
+      const chain = dto.chain ?? 'sepolia';
+      const sessionContractAddress = this.requireSessionContractAddress(chain);
+      const rpcUrl = this.requireRpcUrl(chain);
+      const provider = this.getProviderForChain(chain);
+      const chainConfig = this.getChainConfig(chain);
       const account = privateKeyToAccount(wallet);
-      const balance = await this.provider.getBalance(account.address);
+      const balance = await provider.getBalance(account.address);
 
       if (balance === 0n) {
         throw new BadRequestException(
-          `Managed wallet ${account.address} has no Sepolia ETH. Fund it before authorizing a session.`,
+          `Managed wallet ${account.address} has no ${
+            this.isMainnetChain(chain) ? 'mainnet' : 'Sepolia'
+          } ETH. Fund it before authorizing a session.`,
         );
       }
 
       const client = createWalletClient({
         account,
-        chain: sepolia,
+        chain: chainConfig.viemChain,
         transport: http(rpcUrl),
       });
 
@@ -342,17 +398,18 @@ export class SessionSignerService {
           parseEther(dto.maxTotalSpendEth),
           BigInt(dto.expiryHours) * 3600n,
         ],
-        chain: sepolia,
+        chain: chainConfig.viemChain,
         account,
       });
 
-      await this.provider.waitForTransaction(txHash, 1);
+      await provider.waitForTransaction(txHash, 1);
       const normalizedAddress = dto.userAddress.toLowerCase();
       const user = await this.resolveOrCreateWalletUser(normalizedAddress);
       await this.sessionRepository.upsert(
         {
           userId: user.id,
           walletAddress: normalizedAddress,
+          chain: this.normalizeChain(chain),
           authorizationJson: JSON.stringify({
             type: 'managed-wallet-session',
             txHash,
@@ -360,7 +417,7 @@ export class SessionSignerService {
           isActive: true,
           expiresAt: new Date(Date.now() + Number(dto.expiryHours) * 60 * 60 * 1000),
         },
-        ['walletAddress'],
+        ['walletAddress', 'chain'],
       );
       return { ok: true, txHash };
     } catch (error) {
@@ -373,15 +430,20 @@ export class SessionSignerService {
     }
   }
 
-  async revokeManagedWalletSession(userAddress: string): Promise<{ ok: true; txHash: string }> {
+  async revokeManagedWalletSession(
+    userAddress: string,
+    chain = 'sepolia',
+  ): Promise<{ ok: true; txHash: string }> {
     try {
       const wallet = await this.requireStoredWallet(userAddress);
-      const sessionContractAddress = this.requireSessionContractAddress();
-      const rpcUrl = this.requireRpcUrl();
+      const sessionContractAddress = this.requireSessionContractAddress(chain);
+      const rpcUrl = this.requireRpcUrl(chain);
+      const provider = this.getProviderForChain(chain);
+      const chainConfig = this.getChainConfig(chain);
       const account = privateKeyToAccount(wallet);
       const client = createWalletClient({
         account,
-        chain: sepolia,
+        chain: chainConfig.viemChain,
         transport: http(rpcUrl),
       });
 
@@ -390,16 +452,17 @@ export class SessionSignerService {
         abi: SESSION_VIEM_ABI,
         functionName: 'revokeSession',
         args: [],
-        chain: sepolia,
+        chain: chainConfig.viemChain,
         account,
       });
 
-      await this.provider.waitForTransaction(txHash, 1);
+      await provider.waitForTransaction(txHash, 1);
       await this.sessionRepository
         .createQueryBuilder()
         .update(SessionAuthorizationEntity)
         .set({ isActive: false })
         .where('LOWER(walletAddress) = LOWER(:walletAddress)', { walletAddress: userAddress })
+        .andWhere('chain = :chain', { chain: this.normalizeChain(chain) })
         .execute();
       return { ok: true, txHash };
     } catch (error) {
@@ -413,12 +476,17 @@ export class SessionSignerService {
   }
 
   /** View call — no gas, just checks session limits on-chain. */
-  async canExecuteSession(wallet: string, feeWei: bigint): Promise<boolean> {
-    if (!this.sessionContract) return true;
+  async canExecuteSession(
+    wallet: string,
+    feeWei: bigint,
+    chain = 'sepolia',
+  ): Promise<boolean> {
+    const sessionContract = this.getSessionContract(chain);
+    if (!sessionContract) return true;
     try {
-      return (await this.sessionContract.canExecute(wallet, feeWei)) as boolean;
+      return (await sessionContract.canExecute(wallet, feeWei)) as boolean;
     } catch (err) {
-      this.logger.warn(`canExecute check failed for ${wallet}: ${String(err)}`);
+      this.logger.warn(`canExecute check failed for ${wallet} on ${chain}: ${String(err)}`);
       return false;
     }
   }
@@ -457,8 +525,10 @@ export class SessionSignerService {
   ): Promise<string> {
     const decryptedKey = this.decryptPrivateKey(encryptedKeyData);
     const userAccount = privateKeyToAccount(decryptedKey);
-    const sessionContractAddress = this.requireSessionContractAddress();
-    const rpcUrl = this.requireRpcUrl();
+    const chainConfig = this.getChainConfig(intent.parsed.chain ?? 'sepolia');
+    const sessionContractAddress = this.requireSessionContractAddress(intent.parsed.chain ?? 'sepolia');
+    const rpcUrl = chainConfig.rpcUrl;
+    const provider = this.getProviderForChain(intent.parsed.chain ?? 'sepolia');
 
     if (userAccount.address.toLowerCase() !== intent.wallet.toLowerCase()) {
       throw new Error('Stored wallet does not match intent wallet');
@@ -466,21 +536,25 @@ export class SessionSignerService {
 
     const userClient = createWalletClient({
       account: userAccount,
-      chain: sepolia,
+      chain: chainConfig.viemChain,
       transport: http(rpcUrl),
     });
+
+    if (chainConfig.chainId === MAINNET_CHAIN_ID) {
+      await this.ensureAgentWalletBalance(intent, chainConfig);
+    }
 
     const authorizeHash = await userClient.writeContract({
       address: sessionContractAddress,
       abi: SESSION_VIEM_ABI,
       functionName: 'authorize',
       args: [parseEther('0.001'), parseEther('0.01'), 86400n],
-      chain: sepolia,
+      chain: chainConfig.viemChain,
       account: userAccount,
     });
-    await this.provider.waitForTransaction(authorizeHash, 1);
+    await provider.waitForTransaction(authorizeHash, 1);
 
-    const freshNonce = await this.provider.getTransactionCount(userAccount.address, 'latest');
+    const freshNonce = await provider.getTransactionCount(userAccount.address, 'latest');
     const signedAuth = await (
       userClient as unknown as {
         signAuthorization: (request: {
@@ -496,7 +570,7 @@ export class SessionSignerService {
     const agentAccount = privateKeyToAccount(this.requireAgentPrivateKey());
     const agentClient = createWalletClient({
       account: agentAccount,
-      chain: sepolia,
+      chain: chainConfig.viemChain,
       transport: http(rpcUrl),
     });
 
@@ -534,7 +608,12 @@ export class SessionSignerService {
     intent: IntentRecord,
     baseFeeGwei: number,
   ): Promise<string> {
-    const agentWallet = this.requireAgentWallet();
+    const chainConfig = this.getChainConfig(intent.parsed.chain ?? 'sepolia');
+    if (chainConfig.chainId === MAINNET_CHAIN_ID) {
+      await this.ensureAgentWalletBalance(intent, chainConfig);
+    }
+
+    const agentWallet = this.requireAgentWallet(chainConfig.rpcUrl);
     const gasPriceWei = BigInt(Math.round(baseFeeGwei * 1.2 * 1e9));
     const execution = await this.buildExecutionTransaction(intent, agentWallet.address);
     const tx = await agentWallet.sendTransaction({
@@ -563,17 +642,21 @@ export class SessionSignerService {
   ): Promise<string> {
     const pk = this.requireAgentPrivateKey();
     const storedAuthorization = this.normalizeAuthorizationForLogging(authorization);
+    const chainConfig = this.getChainConfig(intent.parsed.chain ?? 'sepolia');
+    if (chainConfig.chainId === MAINNET_CHAIN_ID) {
+      await this.ensureAgentWalletBalance(intent, chainConfig);
+    }
 
     const agentAccount = privateKeyToAccount(pk as `0x${string}`);
-    const rpcUrl = this.config.get<string>('RPC_URL') ?? '';
+    const rpcUrl = chainConfig.rpcUrl;
     const agentClient = createWalletClient({
       account: agentAccount,
-      chain: sepolia,
+      chain: chainConfig.viemChain,
       transport: http(rpcUrl),
     });
 
     const execution = await this.buildExecutionTransaction(intent, agentAccount.address);
-    const sessionContractAddress = this.requireSessionContractAddress();
+    const sessionContractAddress = this.requireSessionContractAddress(intent.parsed.chain ?? 'sepolia');
 
     this.logger.log(
       `Using stored EIP-7702 authorization for ${intent.wallet}: ${JSON.stringify({
@@ -715,26 +798,35 @@ export class SessionSignerService {
     };
   }
 
-  async recordSpend(wallet: string, feeWei: bigint): Promise<string | null> {
-    const agentWallet = this.requireAgentWallet();
-    if (!this.sessionContract) return null;
+  async recordSpend(
+    wallet: string,
+    feeWei: bigint,
+    chain = 'sepolia',
+  ): Promise<string | null> {
+    const sessionContract = this.getSessionContract(chain);
+    if (!sessionContract) return null;
 
-    const writable = this.sessionContract.connect(agentWallet) as ethers.Contract;
+    const agentWallet = this.requireAgentWallet(this.getChainConfig(chain).rpcUrl);
+    const writable = sessionContract.connect(agentWallet) as ethers.Contract;
     const tx = await writable.recordSpend(wallet, feeWei);
     await tx.wait(1);
     return tx.hash as string;
   }
 
-  estimateFeeWei(baseFeeGwei: number, type: 'send' | 'swap' = 'send'): bigint {
+  estimateFeeWei(
+    baseFeeGwei: number,
+    type: 'send' | 'swap' = 'send',
+    _chain = 'sepolia',
+  ): bigint {
     const gasUnits = GAS_UNITS[type] ?? GAS_UNITS.send;
     // 1.2x multiplier matches the priority tip added in broadcastIntent
     return BigInt(Math.round(baseFeeGwei * 1.2 * 1e9)) * BigInt(gasUnits);
   }
 
-  private requireAgentWallet(): ethers.Wallet {
+  private requireAgentWallet(rpcUrl?: string): ethers.Wallet {
     this.requireAgentPrivateKey();
-    if (!this.agentWallet) throw new Error('AGENT_WALLET_PK is invalid or not configured');
-    return this.agentWallet;
+    if (!this.agentWalletPk) throw new Error('AGENT_WALLET_PK is invalid or not configured');
+    return new ethers.Wallet(this.agentWalletPk, new ethers.JsonRpcProvider(rpcUrl ?? this.requireRpcUrl()));
   }
 
   private requireAgentPrivateKey(): `0x${string}` {
@@ -748,18 +840,18 @@ export class SessionSignerService {
     return pk as `0x${string}`;
   }
 
-  private requireSessionContractAddress(): `0x${string}` {
-    const contractAddress = this.config.get<string>('SESSION_CONTRACT_ADDR') ?? '';
+  private requireSessionContractAddress(chain = 'sepolia'): `0x${string}` {
+    const contractAddress = this.getChainConfig(chain).sessionContractAddr;
     if (!ethers.isAddress(contractAddress)) {
-      throw new Error('SESSION_CONTRACT_ADDR is missing or invalid');
+      throw new Error(`${this.isMainnetChain(chain) ? 'MAINNET_SESSION_CONTRACT_ADDR' : 'SESSION_CONTRACT_ADDR'} is missing or invalid`);
     }
     return contractAddress as `0x${string}`;
   }
 
-  private requireRpcUrl(): string {
-    const rpcUrl = this.config.get<string>('RPC_URL') ?? '';
+  private requireRpcUrl(chain = 'sepolia'): string {
+    const rpcUrl = this.getChainConfig(chain).rpcUrl;
     if (!rpcUrl) {
-      throw new Error('RPC_URL is not configured');
+      throw new Error(`${this.isMainnetChain(chain) ? 'MAINNET_RPC_URL' : 'RPC_URL'} is not configured`);
     }
     return rpcUrl;
   }
@@ -859,7 +951,7 @@ export class SessionSignerService {
 
   async resolveName(name: string): Promise<string | null> {
     try {
-      return await this.provider.resolveName(name);
+      return await this.getProviderForChain('ethereum').resolveName(name);
     } catch (error) {
       this.logger.warn(`ENS resolution failed for ${name}: ${String(error)}`);
       return null;
@@ -895,8 +987,10 @@ export class SessionSignerService {
     intent: IntentRecord,
     swapper: string,
   ): Promise<{ to: `0x${string}`; data: `0x${string}`; value: bigint; gasLimit?: bigint }> {
-    const tokenIn = this.resolveToken(intent.parsed.fromToken);
-    const tokenOut = this.resolveToken(intent.parsed.toToken ?? 'USDC');
+    const chain = intent.parsed.chain ?? 'sepolia';
+    const chainConfig = this.getChainConfig(chain);
+    const tokenIn = this.resolveToken(intent.parsed.fromToken, chain);
+    const tokenOut = this.resolveToken(intent.parsed.toToken ?? 'USDC', chain);
     const amount = ethers.parseUnits(String(intent.parsed.amount), tokenIn.decimals).toString();
     const uniswapApiKey = this.config.get<string>('UNISWAP_API_KEY') ?? '';
 
@@ -909,25 +1003,35 @@ export class SessionSignerService {
       'Content-Type': 'application/json',
       Accept: 'application/json',
       'x-universal-router-version': '2.0',
-      'x-erc20eth-enabled': tokenIn.address === NATIVE_ETH ? 'true' : 'false',
+      'x-erc20eth-enabled': tokenIn.symbol === 'ETH' ? 'true' : 'false',
     };
 
-    const quoteResponse = await axios.post<UniswapQuoteResponse>(
-      'https://trade-api.gateway.uniswap.org/v1/quote',
-      {
-        type: 'EXACT_INPUT',
-        amount,
-        tokenInChainId: SEPOLIA_CHAIN_ID,
-        tokenOutChainId: SEPOLIA_CHAIN_ID,
-        tokenIn: tokenIn.address,
-        tokenOut: tokenOut.address,
-        swapper,
-        slippageTolerance: intent.parsed.slippageBps / 100,
-        routingPreference: 'BEST_PRICE',
-        protocols: ['V4'],
-      },
-      { headers, timeout: 20_000 },
-    );
+    let quoteResponse: AxiosResponse<UniswapQuoteResponse>;
+    try {
+      quoteResponse = await axios.post<UniswapQuoteResponse>(
+        'https://trade-api.gateway.uniswap.org/v1/quote',
+        {
+          type: 'EXACT_INPUT',
+          amount,
+          tokenInChainId: chainConfig.chainId,
+          tokenOutChainId: chainConfig.chainId,
+          tokenIn: tokenIn.address,
+          tokenOut: tokenOut.address,
+          swapper,
+          slippageTolerance: intent.parsed.slippageBps / 100,
+          routingPreference: 'BEST_PRICE',
+        },
+        { headers, timeout: 20_000 },
+      );
+    } catch (err) {
+      if (err instanceof AxiosError) {
+        const status = err.response?.status;
+        const body = JSON.stringify(err.response?.data ?? {});
+        const url = err.config?.url;
+        throw new Error(`Uniswap API ${status} at ${url}: ${body}`);
+      }
+      throw err;
+    }
 
     const routing = quoteResponse.data.routing;
     if (!routing || !['CLASSIC', 'WRAP', 'UNWRAP'].includes(routing)) {
@@ -956,11 +1060,22 @@ export class SessionSignerService {
       swapRequest.permitData = quoteResponse.data.permitData;
     }
 
-    const swapResponse = await axios.post<UniswapSwapResponse>(
-      'https://trade-api.gateway.uniswap.org/v1/swap',
-      swapRequest,
-      { headers, timeout: 20_000 },
-    );
+    let swapResponse: AxiosResponse<UniswapSwapResponse>;
+    try {
+      swapResponse = await axios.post<UniswapSwapResponse>(
+        'https://trade-api.gateway.uniswap.org/v1/swap',
+        swapRequest,
+        { headers, timeout: 20_000 },
+      );
+    } catch (err) {
+      if (err instanceof AxiosError) {
+        const status = err.response?.status;
+        const body = JSON.stringify(err.response?.data ?? {});
+        const url = err.config?.url;
+        throw new Error(`Uniswap API ${status} at ${url}: ${body}`);
+      }
+      throw err;
+    }
 
     const swap = swapResponse.data.swap;
     if (!swap?.to || !swap.data || swap.data === '0x') {
@@ -975,15 +1090,87 @@ export class SessionSignerService {
     };
   }
 
-  private resolveToken(symbol: string): { address: string; decimals: number; symbol: string } {
+  private resolveToken(symbol: string, chain: string): { address: string; decimals: number; symbol: string } {
     const normalized = symbol.trim().toUpperCase();
-    const token = TOKEN_REGISTRY[normalized];
+    const token = (this.isMainnetChain(chain) ? MAINNET_TOKENS : SEPOLIA_TOKENS)[normalized];
 
     if (!token) {
-      throw new Error(`Unsupported Sepolia token "${symbol}". Supported tokens: ETH, USDC, WETH`);
+      throw new Error(
+        `Token ${symbol} not supported on ${chain}. Supported: ${Object.keys(
+          this.isMainnetChain(chain) ? MAINNET_TOKENS : SEPOLIA_TOKENS,
+        ).join(', ')}`,
+      );
     }
 
     return token;
+  }
+
+  private getChainConfig(chain: string): {
+    chainId: number;
+    rpcUrl: string;
+    sessionContractAddr: string;
+    viemChain: Chain;
+  } {
+    if (this.isMainnetChain(chain)) {
+      return {
+        chainId: MAINNET_CHAIN_ID,
+        rpcUrl: this.config.get<string>('MAINNET_RPC_URL') ?? '',
+        sessionContractAddr: this.config.get<string>('MAINNET_SESSION_CONTRACT_ADDR') ?? '',
+        viemChain: mainnet,
+      };
+    }
+
+    return {
+      chainId: SEPOLIA_CHAIN_ID,
+      rpcUrl: this.config.get<string>('RPC_URL') ?? '',
+      sessionContractAddr: this.config.get<string>('SESSION_CONTRACT_ADDR') ?? '',
+      viemChain: sepolia,
+    };
+  }
+
+  private isMainnetChain(chain: string): boolean {
+    return ['ethereum', 'mainnet', 'eth'].includes(chain.toLowerCase());
+  }
+
+  private normalizeChain(chain: string): string {
+    return this.isMainnetChain(chain) ? 'mainnet' : 'sepolia';
+  }
+
+  private getSessionContract(chain: string): ethers.Contract | null {
+    const contractAddr = this.getChainConfig(chain).sessionContractAddr;
+    if (!contractAddr || !ethers.isAddress(contractAddr)) {
+      return null;
+    }
+
+    return new ethers.Contract(
+      contractAddr,
+      SESSION_ABI,
+      this.getProviderForChain(chain),
+    );
+  }
+
+  private async ensureAgentWalletBalance(
+    intent: IntentRecord,
+    chainConfig: { chainId: number; rpcUrl: string },
+  ): Promise<void> {
+    if (chainConfig.chainId !== MAINNET_CHAIN_ID || !this.agentWallet) {
+      return;
+    }
+
+    const mainnetProvider = new ethers.JsonRpcProvider(chainConfig.rpcUrl);
+    const balance = await mainnetProvider.getBalance(this.agentWallet.address);
+    const required =
+      intent.parsed.type === 'send'
+        ? ethers.parseEther(intent.parsed.amount) + ethers.parseEther('0.005')
+        : ethers.parseEther('0.005');
+
+    if (balance < required) {
+      throw new Error(
+        `Insufficient mainnet ETH in agent wallet (${this.agentWallet.address}). ` +
+          `Have: ${ethers.formatEther(balance)} ETH. ` +
+          `Need: ${ethers.formatEther(required)} ETH.`,
+      );
+    }
   }
 
   private sanitizePermitTypes(
@@ -1007,6 +1194,20 @@ export class SessionSignerService {
     } catch (error) {
       this.logger.warn(`Agent wallet ENS lookup failed: ${String(error)}`);
     }
+  }
+
+  private async ensureSessionAuthorizationChainSchema(): Promise<void> {
+    await this.sessionRepository.query(`
+      ALTER TABLE session_authorizations
+      ADD COLUMN IF NOT EXISTS chain varchar(32) NOT NULL DEFAULT 'sepolia'
+    `);
+    await this.sessionRepository.query(
+      'DROP INDEX IF EXISTS "IDX_session_authorizations_walletAddress"',
+    );
+    await this.sessionRepository.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS "IDX_session_authorizations_walletAddress_chain"
+      ON session_authorizations ("walletAddress", chain)
+    `);
   }
 
   private async storeEncryptedWallet(
@@ -1073,11 +1274,7 @@ export class SessionSignerService {
   }
 
   private serializeStoredWallet(wallet: WhenCheapWallet): string {
-    return JSON.stringify({
-      iv: wallet.iv,
-      encryptedKey: wallet.encryptedPrivateKey,
-      authTag: wallet.authTag,
-    } satisfies EncryptedWalletPayload);
+    return JSON.stringify(this.extractWalletPayload(wallet));
   }
 
   private async resolveOrCreateWalletUser(walletAddress: string): Promise<UserEntity> {
@@ -1102,6 +1299,99 @@ export class SessionSignerService {
     }
 
     return user;
+  }
+
+  private async migrateLegacyWalletRows(): Promise<void> {
+    type LegacyWalletRow = {
+      id: string;
+      userId: string | null;
+      walletAddress: string;
+      encryptedPrivateKey: string;
+      iv: string | null;
+      authTag: string | null;
+      userIdentifier?: string | null;
+    };
+
+    let legacyRows: LegacyWalletRow[] = [];
+    try {
+      legacyRows = (await this.walletRepository.query(
+        'SELECT id, "userId", "walletAddress", "encryptedPrivateKey", iv, "authTag", "userIdentifier" FROM whencheap_wallets',
+      )) as LegacyWalletRow[];
+    } catch {
+      legacyRows = (await this.walletRepository.query(
+        'SELECT id, "userId", "walletAddress", "encryptedPrivateKey", iv, "authTag" FROM whencheap_wallets',
+      )) as LegacyWalletRow[];
+    }
+
+    let migrated = 0;
+    for (const row of legacyRows) {
+      const needsMigration = !row.userId || !row.iv || !row.authTag;
+      if (!needsMigration) {
+        continue;
+      }
+
+      const identifier = row.userIdentifier?.trim() || row.walletAddress.toLowerCase();
+      const identifierType = this.inferIdentifierType(identifier);
+      let user =
+        (await this.userRepository.findOne({ where: { identifier } })) ??
+        this.userRepository.create({ identifier, identifierType });
+
+      if (!user.id) {
+        user = await this.userRepository.save(user);
+      }
+
+      let encryptedKey = row.encryptedPrivateKey;
+      let iv = row.iv;
+      let authTag = row.authTag;
+
+      if (!iv || !authTag) {
+        const payload = JSON.parse(row.encryptedPrivateKey) as EncryptedWalletPayload;
+        encryptedKey = payload.encryptedKey;
+        iv = payload.iv;
+        authTag = payload.authTag;
+      }
+
+      await this.walletRepository.update(row.id, {
+        userId: user.id,
+        walletAddress: row.walletAddress.toLowerCase(),
+        encryptedPrivateKey: encryptedKey,
+        iv,
+        authTag,
+      });
+      migrated += 1;
+    }
+
+    if (migrated > 0) {
+      this.logger.log(`Migrated ${migrated} legacy wallet row(s) to the new PostgreSQL schema.`);
+    }
+  }
+
+  private inferIdentifierType(identifier: string): UserIdentifierType {
+    if (identifier.includes('@')) {
+      return UserIdentifierType.Email;
+    }
+    if (ethers.isAddress(identifier)) {
+      return UserIdentifierType.Wallet;
+    }
+    return UserIdentifierType.Google;
+  }
+
+  private extractWalletPayload(wallet: WhenCheapWallet): EncryptedWalletPayload {
+    if (wallet.iv && wallet.authTag) {
+      return {
+        iv: wallet.iv,
+        encryptedKey: wallet.encryptedPrivateKey,
+        authTag: wallet.authTag,
+      };
+    }
+
+    try {
+      return JSON.parse(wallet.encryptedPrivateKey) as EncryptedWalletPayload;
+    } catch {
+      throw new Error(
+        `Wallet ${wallet.id} is missing IV/authTag and legacy payload could not be parsed`,
+      );
+    }
   }
 
   private async verifyGoogleCredential(

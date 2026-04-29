@@ -3,18 +3,19 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ReactNode, useState } from 'react';
 import { http } from 'viem';
-import { sepolia } from 'viem/chains';
+import { mainnet, sepolia } from 'viem/chains';
 import { createConfig, WagmiProvider } from 'wagmi';
 import { injected } from 'wagmi/connectors';
 
 const wagmiConfig = createConfig({
-  chains: [sepolia],
+  chains: [mainnet, sepolia],
   connectors: [
     injected({
       shimDisconnect: true,
     }),
   ],
   transports: {
+    [mainnet.id]: http(),
     [sepolia.id]: http()
   },
   multiInjectedProviderDiscovery: true,

@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException, OnModuleInit } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Cron, CronExpression } from '@nestjs/schedule';
@@ -138,8 +138,12 @@ export class IntentsService implements OnModuleInit {
     return intent;
   }
 
-  async storeAuthorization(userAddress: string, authorization: unknown): Promise<void> {
-    await this.sessionSigner.storeAuthorization(userAddress, authorization);
+  async storeAuthorization(
+    userAddress: string,
+    authorization: unknown,
+    chain = 'sepolia',
+  ): Promise<void> {
+    await this.sessionSigner.storeAuthorization(userAddress, authorization, chain);
   }
 
   async registerWallet(dto: RegisterWalletDto) {
@@ -154,8 +158,8 @@ export class IntentsService implements OnModuleInit {
     return this.sessionSigner.authorizeManagedWalletSession(dto);
   }
 
-  revokeManagedWalletSession(userAddress: string) {
-    return this.sessionSigner.revokeManagedWalletSession(userAddress);
+  revokeManagedWalletSession(userAddress: string, chain = 'sepolia') {
+    return this.sessionSigner.revokeManagedWalletSession(userAddress, chain);
   }
 
   async list(): Promise<IntentRecord[]> {
@@ -181,6 +185,40 @@ export class IntentsService implements OnModuleInit {
     }
 
     return this.mapEntityToRecord(persisted);
+  }
+
+  async cancel(id: string): Promise<IntentRecord> {
+    const cached = this.intents.get(id);
+    const persisted = cached
+      ? null
+      : await this.intentRepository.findOne({
+          where: { id },
+          relations: ['auditEvents', 'executions'],
+        });
+
+    const intent = cached ?? (persisted ? this.mapEntityToRecord(persisted) : null);
+    if (!intent) {
+      throw new NotFoundException(`Intent ${id} not found`);
+    }
+
+    const cancellableStatuses = [
+      IntentStatus.PendingIntent,
+      IntentStatus.Submitted,
+      IntentStatus.Confirming,
+      IntentStatus.NeedsReauthorization,
+    ];
+
+    if (!cancellableStatuses.includes(intent.status)) {
+      throw new BadRequestException(`Intent in status ${intent.status} cannot be cancelled`);
+    }
+
+    if (!this.intents.has(id)) {
+      this.intents.set(id, intent);
+    }
+
+    await this.transition(intent, IntentStatus.Cancelled, 'Intent cancelled by user.');
+    this.intents.delete(id);
+    return intent;
   }
 
   async resolveRecipientName(name: string): Promise<string | null> {
@@ -213,6 +251,7 @@ export class IntentsService implements OnModuleInit {
       try {
         ({ costUsd, baseFeeGwei } = await this.gas.estimateTxCostUsd(
           intent.parsed.type as 'send' | 'swap',
+          intent.parsed.chain ?? 'sepolia',
         ));
       } catch {
         await this.addAudit(
@@ -247,8 +286,13 @@ export class IntentsService implements OnModuleInit {
       const feeWei = this.sessionSigner.estimateFeeWei(
         baseFeeGwei,
         intent.parsed.type as 'send' | 'swap',
+        intent.parsed.chain ?? 'sepolia',
       );
-      const sessionOk = await this.sessionSigner.canExecuteSession(intent.wallet, feeWei);
+      const sessionOk = await this.sessionSigner.canExecuteSession(
+        intent.wallet,
+        feeWei,
+        intent.parsed.chain ?? 'sepolia',
+      );
       if (!sessionOk) {
         await this.addAudit(
           intent,
@@ -269,8 +313,47 @@ export class IntentsService implements OnModuleInit {
         'Session valid and within limits. Proceeding to execution.',
       );
 
+      if (this.isMainnetIntent(intent)) {
+        const contractAddr = this.config.get<string>('MAINNET_SESSION_CONTRACT_ADDR') ?? '';
+        await this.addAudit(
+          intent,
+          'MAINNET_EXECUTION',
+          `Executing on Ethereum mainnet. Contract: ${contractAddr}. Real ETH will be spent. Ensure wallet is funded.`,
+          { chain: 'mainnet', contractAddr },
+        );
+      }
+
+      if (intent.parsed.type === 'swap') {
+        await this.addAudit(
+          intent,
+          'SWAP_QUOTE_REQUESTED',
+          'Fetching Uniswap quote and executing returned swap calldata via agent wallet.',
+          {
+            chain: intent.parsed.chain ?? 'sepolia',
+            fromToken: intent.parsed.fromToken,
+            toToken: intent.parsed.toToken ?? 'USDC',
+            amount: intent.parsed.amount,
+          },
+        );
+
+        if (!this.agentFallbackEnabled) {
+          await this.addAudit(
+            intent,
+            'EXECUTION_FAILED',
+            'Swap execution requires agent-wallet routing, but ALLOW_AGENT_FUNDED_FALLBACK is disabled.',
+          );
+          continue;
+        }
+
+        await this.executeDirectly(intent, baseFeeGwei);
+        continue;
+      }
+
       const registeredWallet = await this.sessionSigner.getRegisteredWallet(intent.wallet);
-      const authorization = await this.sessionSigner.getAuthorization(intent.wallet);
+      const authorization = await this.sessionSigner.getAuthorization(
+        intent.wallet,
+        intent.parsed.chain ?? 'sepolia',
+      );
 
       if (registeredWallet) {
         await this.executeWithUserWallet(intent, registeredWallet, authorization, baseFeeGwei);
@@ -330,11 +413,23 @@ export class IntentsService implements OnModuleInit {
       );
       await this.logKeeperHubExecution(intent);
     } catch (err) {
+      const message = String(err);
+      if (intent.parsed.type === 'swap' && message.includes('Uniswap API 404')) {
+        await this.transition(
+          intent,
+          IntentStatus.Stuck,
+          `Uniswap route not available for this pair on ${intent.parsed.chain ?? 'sepolia'}. Try a different token pair.`,
+          { error: message, chain: intent.parsed.chain ?? 'sepolia' },
+        );
+        this.intents.delete(intent.id);
+        return;
+      }
+
       this.logger.warn(`Direct execution failed for intent ${intent.id}: ${String(err)}`);
       await this.addAudit(
         intent,
         'EXECUTION_FAILED',
-        `Broadcast failed: ${String(err)}. Will retry next gas check.`,
+        `Broadcast failed: ${message}. Will retry next gas check.`,
       );
     }
   }
@@ -403,7 +498,7 @@ export class IntentsService implements OnModuleInit {
         intent,
         'USER_WALLET_EXECUTION',
         'Using encrypted WhenCheap wallet to relay a true user-wallet-as-sender EIP-7702 transaction.',
-        { userWallet: intent.wallet },
+        { userWallet: intent.wallet, chain: intent.parsed.chain ?? 'sepolia' },
       );
       const txHash = await this.sessionSigner.broadcastWithUserWallet(intent, encryptedKeyData);
       intent.txHash = txHash;
@@ -494,7 +589,9 @@ export class IntentsService implements OnModuleInit {
 
   private async pollDirectTx(intent: IntentRecord) {
     try {
-      const receipt = await this.sessionSigner.provider.getTransactionReceipt(intent.txHash!);
+      const receipt = await this.sessionSigner
+        .getProviderForChain(intent.parsed.chain ?? 'sepolia')
+        .getTransactionReceipt(intent.txHash!);
       if (!receipt) {
         if (intent.status !== IntentStatus.Confirming) {
           await this.transition(
@@ -522,7 +619,11 @@ export class IntentsService implements OnModuleInit {
 
       if (receipt.status === 1) {
         try {
-          const spendTxHash = await this.sessionSigner.recordSpend(intent.wallet, feePaid);
+          const spendTxHash = await this.sessionSigner.recordSpend(
+            intent.wallet,
+            feePaid,
+            intent.parsed.chain ?? 'sepolia',
+          );
           if (spendTxHash) {
             await this.addAudit(
               intent,
@@ -571,6 +672,22 @@ export class IntentsService implements OnModuleInit {
             },
           );
           return;
+        }
+
+        if (intent.parsed.type === 'swap') {
+          await this.addAudit(
+            intent,
+            'SWAP_EXECUTED',
+            `Swap executed successfully in block ${receipt.blockNumber}.`,
+            {
+              txHash: currentTxHash,
+              blockNumber: receipt.blockNumber,
+              gasPaidWei: feePaid.toString(),
+              fromToken: intent.parsed.fromToken,
+              toToken: intent.parsed.toToken ?? 'USDC',
+              amount: intent.parsed.amount,
+            },
+          );
         }
 
         const finalizedMessage =
@@ -664,22 +781,24 @@ export class IntentsService implements OnModuleInit {
   }
 
   private async logKeeperHubExecution(intent: IntentRecord): Promise<void> {
-    try {
-      const workflowId = await this.keeperHub.createWorkflow(intent);
-      intent.keeperHubWorkflowId = workflowId;
-      await this.addAudit(
-        intent,
-        'KEEPERHUB_AUDIT_LOGGED',
-        `Execution logged to KeeperHub via MCP workflow ${workflowId}.`,
-        { workflowId, txHash: intent.txHash },
-      );
-    } catch (error) {
-      await this.addAudit(
-        intent,
-        'KEEPERHUB_AUDIT_FAILED',
-        `KeeperHub MCP audit logging failed: ${String(error)}`,
-      );
+    const workflowId = await this.keeperHub.createWorkflow(intent);
+    if (!workflowId) {
+      return;
     }
+
+    intent.keeperHubWorkflowId = workflowId;
+    await this.addAudit(
+      intent,
+      'KEEPERHUB_AUDIT_LOGGED',
+      `Execution logged to KeeperHub workflow ${workflowId}.`,
+      { workflowId, txHash: intent.txHash },
+    );
+  }
+
+  private isMainnetIntent(intent: IntentRecord): boolean {
+    return ['ethereum', 'mainnet', 'eth'].includes(
+      (intent.parsed.chain ?? 'sepolia').toLowerCase(),
+    );
   }
 
   private async resolveUserIdByWallet(walletAddress: string): Promise<string | null> {

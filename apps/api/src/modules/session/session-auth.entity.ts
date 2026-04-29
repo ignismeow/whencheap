@@ -10,6 +10,7 @@ import {
 } from 'typeorm';
 import { UserEntity } from '../user/user.entity';
 
+@Index(['walletAddress', 'chain'], { unique: true })
 @Entity('session_authorizations')
 export class SessionAuthorizationEntity {
   @PrimaryGeneratedColumn('uuid')
@@ -22,9 +23,11 @@ export class SessionAuthorizationEntity {
   @JoinColumn({ name: 'userId' })
   user?: UserEntity;
 
-  @Index({ unique: true })
   @Column({ type: 'varchar', length: 64 })
   walletAddress!: string;
+
+  @Column({ type: 'varchar', length: 32, default: 'sepolia' })
+  chain!: string;
 
   @Column({ type: 'text' })
   authorizationJson!: string;

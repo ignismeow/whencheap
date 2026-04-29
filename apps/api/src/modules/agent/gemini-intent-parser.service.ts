@@ -55,7 +55,8 @@ export class GeminiIntentParser {
       'type must be swap or send. For send intents, put the destination in recipient and omit toToken.',
       'For swap intents, omit recipient unless the user explicitly provides one.',
       'Use ISO datetime for deadlineIso.',
-      'Use chain sepolia unless the user explicitly names another chain.',
+      "For swap intents, default chain to 'ethereum' unless the user explicitly says 'sepolia' or 'testnet'.",
+      "For send intents, default chain to 'sepolia'.",
       'maxFeeUsd and slippageBps must be numbers. amount must be a string.',
       'Use slippageBps 50 when slippage is unknown.',
       'Omit optional unknown fields instead of returning null.',
@@ -132,8 +133,9 @@ export class GeminiIntentParser {
     if (parsed.slippageBps === null) parsed.slippageBps = 50;
     if (parsed.maxFeeUsd === null) parsed.maxFeeUsd = 1;
 
-    if (parsed.chain === 'ethereum') {
-      parsed.chain = 'sepolia';
+    if (parsed.chain === null) delete parsed.chain;
+    if (typeof parsed.chain !== 'string' || !parsed.chain.trim()) {
+      parsed.chain = parsed.type === 'swap' ? 'ethereum' : 'sepolia';
     }
 
     return parsed;
@@ -142,6 +144,7 @@ export class GeminiIntentParser {
   private fallbackParse(input: string): ParsedIntent {
     const lower = input.toLowerCase();
     const isSend = /\bsend\b/.test(lower);
+    const explicitChain = this.extractChain(lower);
     const amount = lower.match(/\b(\d+(?:\.\d+)?)\s*(?:sepolia\s+)?(?:eth|weth|usdc|usdt|dai)\b/)?.[1]
       ?? lower.match(/(\d+(?:\.\d+)?)/)?.[1]
       ?? '0';
@@ -162,7 +165,7 @@ export class GeminiIntentParser {
       amount,
       maxFeeUsd,
       deadlineIso: deadline.toISOString(),
-      chain: 'sepolia',
+      chain: explicitChain ?? (isSend ? 'sepolia' : 'ethereum'),
       slippageBps: 50,
       repeatCount: repeatCount > 1 ? repeatCount : undefined,
       notes: isSend && !recipient
@@ -212,5 +215,11 @@ export class GeminiIntentParser {
       ten: 10
     };
     return words[value] ?? Number(value);
+  }
+
+  private extractChain(input: string): string | null {
+    if (/\b(sepolia|testnet)\b/.test(input)) return 'sepolia';
+    if (/\b(ethereum|mainnet| on eth\b| eth chain)\b/.test(input)) return 'ethereum';
+    return null;
   }
 }

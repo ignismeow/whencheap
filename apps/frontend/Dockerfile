@@ -16,12 +16,14 @@ ARG NEXT_PUBLIC_API_URL=http://localhost:3001
 ARG NEXT_PUBLIC_CHAIN_ID=11155111
 ARG NEXT_PUBLIC_WALLETCONNECT_ID=
 ARG NEXT_PUBLIC_SESSION_CONTRACT=
+ARG NEXT_PUBLIC_MAINNET_SESSION_CONTRACT=
 ARG NEXT_PUBLIC_GOOGLE_CLIENT_ID=
 
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 ENV NEXT_PUBLIC_CHAIN_ID=$NEXT_PUBLIC_CHAIN_ID
 ENV NEXT_PUBLIC_WALLETCONNECT_ID=$NEXT_PUBLIC_WALLETCONNECT_ID
 ENV NEXT_PUBLIC_SESSION_CONTRACT=$NEXT_PUBLIC_SESSION_CONTRACT
+ENV NEXT_PUBLIC_MAINNET_SESSION_CONTRACT=$NEXT_PUBLIC_MAINNET_SESSION_CONTRACT
 ENV NEXT_PUBLIC_GOOGLE_CLIENT_ID=$NEXT_PUBLIC_GOOGLE_CLIENT_ID
 
 COPY --from=deps /app/node_modules ./node_modules
@@ -40,6 +42,7 @@ COPY --from=build /app/package-lock.json ./package-lock.json
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/apps/frontend/package.json ./apps/frontend/package.json
 COPY --from=build /app/apps/frontend/.next ./apps/frontend/.next
+COPY --from=build /app/apps/frontend/public ./apps/frontend/public
 
 EXPOSE 3000
 

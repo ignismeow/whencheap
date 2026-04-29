@@ -10,9 +10,14 @@ import {
 } from 'lucide-react';
 import { FormEvent, KeyboardEvent, ReactNode, RefObject, useEffect, useMemo, useRef, useState } from 'react';
 import { formatEther } from 'viem';
+import { mainnet, sepolia } from 'viem/chains';
 import { useReadContract } from 'wagmi';
 import useSWR from 'swr';
-import { sessionContractAddress, whenCheapSessionAbi } from '../lib/session-contract';
+import {
+  mainnetSessionContractAddress,
+  sessionContractAddress,
+  whenCheapSessionAbi,
+} from '../lib/session-contract';
 
 type AuditEvent = {
   id: string;
@@ -87,13 +92,17 @@ const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 const googleClientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ?? '';
 const fetcher = (url: string) => fetch(url).then((res) => res.json());
 const authStorageKey = 'whencheap-google-identity';
+const chainStorageKey = 'whencheap-selected-chain';
 
 export default function Home() {
   const [input, setInput] = useState('Send 0.001 ETH to 0xfC2b1688B9776ae0cA6dbf8Fc335a69a6e97578D when gas is under $1 in next 30 minutes'
 );
+  const [selectedChain, setSelectedChain] = useState<'sepolia' | 'mainnet'>('sepolia');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+  const [cancellingIntentId, setCancellingIntentId] = useState<string | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
   const [managedIdentity, setManagedIdentity] = useState<ManagedIdentity | null>(null);
   const [isSessionCardOpen, setIsSessionCardOpen] = useState(false);
@@ -109,9 +118,13 @@ export default function Home() {
   });
 
   const intents = data ?? [];
+  const filteredIntents = useMemo(
+    () => intents.filter((intent) => normalizeIntentChain(intent.parsed.chain) === selectedChain),
+    [intents, selectedChain],
+  );
   const selected = useMemo(
-    () => intents.find((intent) => intent.id === selectedId) ?? intents[0] ?? null,
-    [intents, selectedId]
+    () => filteredIntents.find((intent) => intent.id === selectedId) ?? filteredIntents[0] ?? null,
+    [filteredIntents, selectedId]
   );
   const effectiveAddress = managedIdentity?.address;
 
@@ -127,6 +140,20 @@ export default function Home() {
       window.localStorage.removeItem(authStorageKey);
     }
   }, []);
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(chainStorageKey);
+      if (stored === 'sepolia' || stored === 'mainnet') {
+        setSelectedChain(stored);
+      }
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(chainStorageKey, selectedChain);
+    setSelectedId(null);
+  }, [selectedChain]);
 
   useEffect(() => {
     const candidate = extractEnsCandidate(input);
@@ -272,10 +299,11 @@ export default function Home() {
     setError(null);
 
     try {
+      const normalizedInput = enforceChainSelection(input, selectedChain);
       const response = await fetch(`${apiUrl}/intents`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ wallet: effectiveAddress, input })
+        body: JSON.stringify({ wallet: effectiveAddress, input: normalizedInput })
       });
 
       if (!response.ok) {
@@ -300,6 +328,29 @@ export default function Home() {
     }
   }
 
+  async function cancelIntent(id: string) {
+    try {
+      setCancellingIntentId(id);
+      setCancelError(null);
+
+      const response = await fetch(`${apiUrl}/intents/${id}/cancel`, {
+        method: 'POST'
+      });
+
+      const rawBody = await response.text();
+      const payload = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
+      if (!response.ok) {
+        throw new Error(typeof payload.message === 'string' ? payload.message : rawBody || 'Intent cancellation failed');
+      }
+
+      await mutate();
+    } catch (err) {
+      setCancelError(err instanceof Error ? err.message : 'Intent cancellation failed');
+    } finally {
+      setCancellingIntentId(null);
+    }
+  }
+
   if (!managedIdentity) {
     return (
       <main className="console-shell">
@@ -317,6 +368,10 @@ export default function Home() {
       <HeaderBar
         address={effectiveAddress}
         email={managedIdentity.email}
+        selectedChain={selectedChain}
+        onToggleChain={() =>
+          setSelectedChain((current) => (current === 'sepolia' ? 'mainnet' : 'sepolia'))
+        }
         onOpenSessionCard={() => setIsSessionCardOpen(true)}
       />
 
@@ -340,6 +395,14 @@ export default function Home() {
                     Press Enter to submit. Use Shift+Enter for a new line.
                   </span>
                 </div>
+
+                {showsMainnetSwapWarning(input) ? (
+                  <p className="text-[11px] normal-case tracking-normal text-[var(--color-warning)]">
+                    {selectedChain === 'mainnet'
+                      ? 'Mainnet mode active. Real ETH will be used.'
+                      : 'Swap intents without an explicit chain default to Ethereum mainnet.'}
+                  </p>
+                ) : null}
 
                 {ensCandidate ? (
                   <div className="console-subpanel">
@@ -420,15 +483,24 @@ export default function Home() {
         <section className="console-main">
           <div className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)_220px] gap-4">
             <div className="grid min-h-0 gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(340px,0.85fr)]">
-              {selected ? <CommandCenter intent={selected} /> : <CommandCenterEmpty />}
+              {selected ? (
+                <CommandCenter
+                  intent={selected}
+                  onCancel={() => void cancelIntent(selected.id)}
+                  isCancelling={cancellingIntentId === selected.id}
+                  cancelError={cancelError}
+                />
+              ) : <CommandCenterEmpty />}
               {selected ? <AuditTrail intent={selected} /> : <AuditTrailEmpty />}
             </div>
             <RecentCommandsPanel
-              intents={intents}
+              intents={filteredIntents}
               selectedId={selected?.id ?? null}
               onSelect={setSelectedId}
               onRefresh={() => void mutate()}
               isLoading={isLoading}
+              onCancel={(id) => void cancelIntent(id)}
+              cancellingIntentId={cancellingIntentId}
             />
           </div>
         </section>
@@ -439,6 +511,8 @@ export default function Home() {
           <SessionCard
             address={effectiveAddress}
             email={managedIdentity.email}
+            sessionChain={selectedChain}
+            onSessionChainChange={setSelectedChain}
             onLogout={signOutManagedIdentity}
             onClose={() => setIsSessionCardOpen(false)}
           />
@@ -517,29 +591,45 @@ function AuthGate({
 function HeaderBar({
   address,
   email,
+  selectedChain,
+  onToggleChain,
   onOpenSessionCard
 }: {
   address?: `0x${string}`;
   email?: string;
+  selectedChain: 'sepolia' | 'mainnet';
+  onToggleChain: () => void;
   onOpenSessionCard: () => void;
 }) {
   return (
     <header className="console-header">
       <div className="mx-auto flex h-[64px] w-full max-w-[1600px] items-center justify-between px-4 sm:px-6 lg:px-8">
         <div className="min-w-0">
-          <p className="text-base font-semibold uppercase tracking-[0.18em] text-[var(--color-text)]">
-            WhenCheap
-          </p>
+          <div className="flex items-center gap-3">
+            <img
+              src="/logo.svg"
+              alt="WhenCheap logo"
+              className="h-6 w-6 shrink-0"
+            />
+            <p className="text-base font-semibold uppercase tracking-[0.18em] text-[var(--color-text)]">
+              WhenCheap
+            </p>
+          </div>
           <p className="mt-1 text-[11px] uppercase tracking-[0.18em] text-[var(--color-muted)]">
-            Google-verified managed execution
+            
           </p>
         </div>
 
         <div className="flex items-center gap-2">
-          <div className="console-chip">
+          <button
+            type="button"
+            onClick={onToggleChain}
+            className="console-chip hover:bg-[var(--color-accent)] hover:text-black focus-visible:bg-[var(--color-accent)] focus-visible:text-black focus-visible:outline-none"
+            title={`Switch to ${selectedChain === 'sepolia' ? 'mainnet' : 'sepolia'}`}
+          >
             <span className="h-2 w-2 bg-[var(--color-accent)]" />
-            <span>Sepolia</span>
-          </div>
+            <span>{selectedChain === 'mainnet' ? 'Mainnet' : 'Sepolia'}</span>
+          </button>
           {email ? (
             <button
               type="button"
@@ -600,11 +690,15 @@ function SessionCardModal({
 function SessionCard({
   address,
   email,
+  sessionChain,
+  onSessionChainChange,
   onLogout,
   onClose
 }: {
   address?: `0x${string}`;
   email: string;
+  sessionChain: 'sepolia' | 'mainnet';
+  onSessionChainChange: (chain: 'sepolia' | 'mainnet') => void;
   onLogout: () => void;
   onClose: () => void;
 }) {
@@ -616,13 +710,17 @@ function SessionCard({
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [copiedAddress, setCopiedAddress] = useState(false);
   const [activeAction, setActiveAction] = useState<'authorize' | 'revoke' | 'disconnect' | null>(null);
+  const sessionContractForChain =
+    sessionChain === 'mainnet' ? mainnetSessionContractAddress : sessionContractAddress;
+  const sessionChainId = sessionChain === 'mainnet' ? mainnet.id : sepolia.id;
   const { data: sessionData, refetch } = useReadContract({
-    address: sessionContractAddress,
+    address: sessionContractForChain,
     abi: whenCheapSessionAbi,
     functionName: 'sessions',
     args: address ? [address] : undefined,
+    chainId: sessionChainId,
     query: {
-      enabled: Boolean(sessionContractAddress && address)
+      enabled: Boolean(sessionContractForChain && address)
     }
   });
 
@@ -648,7 +746,8 @@ function SessionCard({
           userAddress: address,
           maxFeePerTxEth,
           maxTotalSpendEth,
-          expiryHours
+          expiryHours,
+          chain: sessionChain,
         })
       });
 
@@ -680,7 +779,7 @@ function SessionCard({
       const response = await fetch(`${apiUrl}/intents/wallet/revoke`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userAddress: address })
+        body: JSON.stringify({ userAddress: address, chain: sessionChain })
       });
 
       const rawBody = await response.text();
@@ -726,6 +825,11 @@ function SessionCard({
 
   const expiresAtMs = session && session.expiresAt > BigInt(0) ? Number(session.expiresAt) * 1000 : null;
   const sessionActive = Boolean(expiresAtMs && expiresAtMs > Date.now());
+  const budgetRemainingWei = session
+    ? session.maxTotalSpendWei > session.spentWei
+      ? session.maxTotalSpendWei - session.spentWei
+      : 0n
+    : 0n;
 
   return (
     <ConsolePanel
@@ -741,10 +845,8 @@ function SessionCard({
       <div className="space-y-4">
         <div className="grid gap-3 text-[11px] uppercase tracking-[0.16em] md:grid-cols-2">
           <div className="console-subpanel">
-            <span className="text-[10px] text-[var(--color-label)]">Status</span>
-            <div className="mt-2">
-              <StatusBadge status={sessionActive ? 'CONFIRMED' : 'PENDING'} compact />
-            </div>
+            <span className="text-[10px] text-[var(--color-label)]">Active</span>
+            <p className="mt-2 text-[var(--color-text)]">{sessionActive ? 'Yes' : 'No'}</p>
           </div>
           <div className="console-subpanel">
             <span className="text-[10px] text-[var(--color-label)]">Google identity</span>
@@ -768,6 +870,41 @@ function SessionCard({
         </div>
 
         <div className="console-scroll max-h-[70vh] space-y-4 pr-1">
+          <div className="grid gap-[1px] border border-[var(--color-border)] bg-[var(--color-border)]">
+            <InfoRow label="ACTIVE" value={sessionActive ? 'Yes' : 'No'} />
+            <InfoRow label="CHAIN" value={sessionChain === 'mainnet' ? 'Mainnet' : 'Sepolia'} />
+            <InfoRow label="BUDGET REMAINING" value={`${formatEther(budgetRemainingWei)} ETH`} />
+            <InfoRow label="SPENT" value={session ? `${formatEther(session.spentWei)} ETH` : '0 ETH'} />
+            <InfoRow label="EXPIRES" value={expiresAtMs ? new Date(expiresAtMs).toLocaleString() : 'Not set'} />
+          </div>
+
+          <div className="space-y-2">
+            <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+              Session chain
+            </p>
+            <div className="flex gap-2">
+              {(['sepolia', 'mainnet'] as const).map((chain) => (
+                <button
+                  key={chain}
+                  type="button"
+                  onClick={() => onSessionChainChange(chain)}
+                  className={`border px-3 py-2 text-[10px] uppercase tracking-[0.18em] ${
+                    sessionChain === chain
+                      ? 'border-[var(--color-accent)] bg-[var(--color-accent)] text-black'
+                      : 'border-[var(--color-border)] text-[var(--color-muted)]'
+                  }`}
+                >
+                  {chain === 'mainnet' ? 'Mainnet' : 'Sepolia'}
+                </button>
+              ))}
+            </div>
+            {sessionChain === 'mainnet' ? (
+              <p className="text-[11px] normal-case tracking-normal text-[var(--color-warning)]">
+                Authorizing on mainnet. Real ETH required for gas.
+              </p>
+            ) : null}
+          </div>
+
           <div className="grid gap-3">
             <label className="space-y-1 text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
               <span>Per-tx limit</span>
@@ -798,13 +935,6 @@ function SessionCard({
             </label>
           </div>
 
-          <div className="grid gap-[1px] border border-[var(--color-border)] bg-[var(--color-border)]">
-            <InfoRow label="PER TX" value={session ? `${formatEther(session.maxFeePerTxWei)} ETH` : '0 ETH'} />
-            <InfoRow label="BUDGET" value={session ? `${formatEther(session.maxTotalSpendWei)} ETH` : '0 ETH'} />
-            <InfoRow label="SPENT" value={session ? `${formatEther(session.spentWei)} ETH` : '0 ETH'} />
-            <InfoRow label="EXPIRES" value={expiresAtMs ? new Date(expiresAtMs).toLocaleString() : 'Not set'} />
-          </div>
-
           <div className="border border-[var(--color-border)] p-3">
             <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
               Managed wallet policy
@@ -821,7 +951,7 @@ function SessionCard({
             className="console-button console-button-primary w-full"
           >
             <ShieldCheck size={15} />
-            {activeAction === 'authorize' ? 'Authorizing...' : 'Authorize'}
+            {activeAction === 'authorize' ? 'Creating...' : 'Create New Session'}
           </button>
 
           <div className="flex flex-wrap gap-3 text-[11px] uppercase tracking-[0.14em]">
@@ -832,7 +962,7 @@ function SessionCard({
               className="console-text-button text-[var(--color-danger)]"
             >
               <XCircle size={14} />
-              {activeAction === 'revoke' ? 'Revoking...' : 'Revoke'}
+              {activeAction === 'revoke' ? 'Revoking...' : 'Revoke Session'}
             </button>
             <button
               type="button"
@@ -854,7 +984,7 @@ function SessionCard({
                 <>
                   {' '}
                   <a
-                    href={`https://sepolia.etherscan.io/tx/${sessionTxHash}`}
+                    href={explorerTxUrl(sessionChain, sessionTxHash)}
                     target="_blank"
                     rel="noreferrer"
                     className="text-[var(--color-accent)] underline"
@@ -877,17 +1007,61 @@ function SessionCard({
   );
 }
 
-function CommandCenter({ intent }: { intent: IntentRecord }) {
+function normalizeIntentChain(chain: string) {
+  return isMainnetChain(chain) ? 'mainnet' : 'sepolia';
+}
+
+function enforceChainSelection(input: string, chain: 'sepolia' | 'mainnet') {
+  const withoutExplicitChain = input
+    .replace(/\bon\s+sepolia\b/gi, '')
+    .replace(/\bon\s+mainnet\b/gi, '')
+    .replace(/\bon\s+ethereum\b/gi, '')
+    .replace(/\bon\s+eth\b/gi, '')
+    .replace(/\bsepolia\b/gi, '')
+    .replace(/\bmainnet\b/gi, '')
+    .replace(/\bethereum\b/gi, '')
+    .replace(/\beth\b(?=\s+chain\b)/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return `${withoutExplicitChain} on ${chain === 'mainnet' ? 'mainnet' : 'sepolia'}`;
+}
+
+function CommandCenter({
+  intent,
+  onCancel,
+  isCancelling,
+  cancelError
+}: {
+  intent: IntentRecord;
+  onCancel: () => void;
+  isCancelling: boolean;
+  cancelError: string | null;
+}) {
   const details = deriveExecutionDetails(intent);
   const summaryRecipient = intent.parsed.resolvedRecipient
     ? `${intent.parsed.recipient ?? 'ENS'} -> ${intent.parsed.resolvedRecipient}`
     : intent.parsed.recipient ?? intent.parsed.toToken ?? 'Not set';
+  const canCancel = isCancellableIntentStatus(intent.status);
 
   return (
     <ConsolePanel title="Command Center" eyebrow="EXECUTION STATE" className="min-h-0">
       <div className="flex h-full min-h-0 flex-col gap-4">
         <div className="flex items-center justify-between gap-3">
-          <StatusBadge status={intent.status} />
+          <div className="flex items-center gap-3">
+            <StatusBadge status={intent.status} />
+            <ChainBadge chain={intent.parsed.chain} />
+            {canCancel ? (
+              <button
+                type="button"
+                onClick={onCancel}
+                disabled={isCancelling}
+                className="border border-[var(--color-danger)] px-2 py-1 text-[10px] uppercase tracking-[0.18em] text-[var(--color-danger)] disabled:opacity-40"
+              >
+                {isCancelling ? 'Cancelling...' : 'Cancel'}
+              </button>
+            ) : null}
+          </div>
           <div className="text-right text-[10px] uppercase tracking-[0.18em] text-[var(--color-muted)]">
             <div>Intent {intent.id.slice(0, 8)}</div>
             <div className="mt-1">{new Date(intent.createdAt).toLocaleString()}</div>
@@ -899,7 +1073,7 @@ function CommandCenter({ intent }: { intent: IntentRecord }) {
           <SummaryField label="Amount" value={`${intent.parsed.amount} ${intent.parsed.fromToken}`} />
           <SummaryField label="Recipient" value={summaryRecipient} />
           <SummaryField label="Max Fee" value={`$${intent.parsed.maxFeeUsd}`} />
-          <SummaryField label="Chain" value={intent.parsed.chain} />
+          <SummaryField label="Chain" value={normalizeChainLabel(intent.parsed.chain)} />
           <SummaryField label="Deadline" value={new Date(intent.parsed.deadlineIso).toLocaleString()} />
           <SummaryField label="Slippage" value={`${intent.parsed.slippageBps / 100}%`} />
           <SummaryField label="Wallet" value={truncateAddress(intent.wallet)} />
@@ -916,7 +1090,7 @@ function CommandCenter({ intent }: { intent: IntentRecord }) {
           <div className="console-subpanel">
             <span className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-label)]">Explorer</span>
             <a
-              href={`https://sepolia.etherscan.io/tx/${details.txHash}`}
+              href={explorerTxUrl(intent.parsed.chain, details.txHash)}
               target="_blank"
               rel="noreferrer"
               className="mt-2 inline-flex text-xs uppercase tracking-[0.14em] text-[var(--color-accent)] underline"
@@ -927,20 +1101,27 @@ function CommandCenter({ intent }: { intent: IntentRecord }) {
         ) : null}
 
         {intent.parsed.notes ? (
-          <div className="border border-[var(--color-warning)] px-3 py-3 text-[11px] uppercase tracking-[0.14em] text-[var(--color-warning)]">
+          <div className="border border-dashed border-[var(--color-warning)] px-4 py-3 text-[11px] uppercase tracking-[0.14em] text-[var(--color-warning)]">
             {intent.parsed.notes}
+          </div>
+        ) : null}
+
+        {cancelError && canCancel ? (
+          <div className="console-alert console-alert-danger">
+            <span className="console-alert-label">Error</span>
+            <p>{cancelError}</p>
           </div>
         ) : null}
 
         <div className="console-subpanel flex-1">
           <span className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-label)]">Execution feed</span>
-          <div className="console-scroll mt-3 h-[180px] space-y-2 pr-1">
+          <div className="console-scroll mt-3 h-[180px] space-y-4 pr-1">
             {intent.audit.slice(0, 8).map((event) => (
-              <div key={event.id} className="border-l border-[var(--color-border)] pl-3">
-                <div className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-label)]">
+              <div key={event.id} className={`border-l-2 pl-3 ${auditBorderClass(event.type)}`}>
+                <div className="text-[10px] font-medium uppercase tracking-[0.16em] text-[var(--color-label)]">
                   {event.type}
                 </div>
-                <div className="mt-1 text-xs uppercase tracking-[0.12em] text-[var(--color-text)]">
+                <div className="mt-1 text-[13px] font-bold uppercase tracking-[0.08em] text-[var(--color-text)]">
                   {event.message}
                 </div>
               </div>
@@ -955,11 +1136,11 @@ function CommandCenter({ intent }: { intent: IntentRecord }) {
 function AuditTrail({ intent }: { intent: IntentRecord }) {
   return (
     <ConsolePanel title="Audit Trail" eyebrow="LIVE TERMINAL" className="min-h-0">
-      <div className="console-scroll h-full min-h-[560px] space-y-2 pr-1">
+      <div className="console-scroll h-full min-h-[560px] space-y-4 pr-1">
         {intent.audit.map((event, index) => (
           <div key={event.id} className={`terminal-line ${auditToneClass(event.type)}`} style={{ animationDelay: `${Math.min(index, 8) * 40}ms` }}>
             <div className="terminal-meta">
-              <span>{formatAuditTime(event.at)}</span>
+              <span className="opacity-50">{formatAuditTime(event.at)}</span>
               <span>{event.type}</span>
             </div>
             <p className="mt-1 text-xs uppercase tracking-[0.12em] text-[var(--color-text)]">{event.message}</p>
@@ -1010,13 +1191,17 @@ function RecentCommandsPanel({
   selectedId,
   onSelect,
   onRefresh,
-  isLoading
+  isLoading,
+  onCancel,
+  cancellingIntentId
 }: {
   intents: IntentRecord[];
   selectedId: string | null;
   onSelect: (id: string) => void;
   onRefresh: () => void;
   isLoading: boolean;
+  onCancel: (id: string) => void;
+  cancellingIntentId: string | null;
 }) {
   return (
     <ConsolePanel
@@ -1045,24 +1230,39 @@ function RecentCommandsPanel({
           </p>
         ) : (
           intents.map((intent) => (
-            <button
+            <div
               key={intent.id}
-              type="button"
-              onClick={() => onSelect(intent.id)}
               className={`console-list-item ${selectedId === intent.id ? 'console-list-item-active' : ''}`}
             >
               <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
+                <button
+                  type="button"
+                  onClick={() => onSelect(intent.id)}
+                  className="min-w-0 flex-1 text-left"
+                >
                   <p className="truncate text-xs uppercase tracking-[0.14em] text-[var(--color-text)]">
                     {intent.rawInput}
                   </p>
                   <p className="mt-2 text-[10px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
                     {new Date(intent.createdAt).toLocaleString()}
                   </p>
+                </button>
+                <div className="flex items-center gap-2">
+                  <ChainBadge chain={intent.parsed.chain} compact />
+                  {isCancellableIntentStatus(intent.status) ? (
+                    <button
+                      type="button"
+                      onClick={() => onCancel(intent.id)}
+                      disabled={cancellingIntentId === intent.id}
+                      className="border border-[var(--color-danger)] px-2 py-1 text-[10px] uppercase tracking-[0.18em] text-[var(--color-danger)] disabled:opacity-40"
+                    >
+                      {cancellingIntentId === intent.id ? 'Cancelling...' : 'Cancel'}
+                    </button>
+                  ) : null}
+                  <StatusBadge status={intent.status} compact />
                 </div>
-                <StatusBadge status={intent.status} compact />
               </div>
-            </button>
+            </div>
           ))
         )}
       </div>
@@ -1122,9 +1322,9 @@ function InfoRow({
 
 function SummaryField({ label, value }: { label: string; value: string }) {
   return (
-    <div className="bg-[var(--color-surface)] px-3 py-3">
-      <dt className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">{label}</dt>
-      <dd className="mt-2 break-words text-xs uppercase tracking-[0.12em] text-[var(--color-text)]">
+    <div className="bg-[var(--color-surface)] p-4">
+      <dt className="text-[10px] font-medium uppercase tracking-[0.18em] text-[var(--color-label)]">{label}</dt>
+      <dd className="mt-2 break-words text-[13px] font-bold uppercase tracking-[0.08em] text-[var(--color-text)]">
         {value}
       </dd>
     </div>
@@ -1144,6 +1344,21 @@ function StatusBadge({ status, compact = false }: { status: string; compact?: bo
   );
 }
 
+function ChainBadge({ chain, compact = false }: { chain: string; compact?: boolean }) {
+  const mainnet = isMainnetChain(chain);
+  return (
+    <span
+      className={`inline-flex items-center border px-2 py-1 font-medium uppercase tracking-[0.18em] ${
+        mainnet
+          ? 'border-[var(--color-warning)] bg-[rgba(255,145,0,0.08)] text-[var(--color-warning)]'
+          : 'border-[var(--color-border)] bg-[rgba(255,255,255,0.03)] text-[#b5b5b5]'
+      } ${compact ? 'text-[10px]' : 'text-[11px]'}`}
+    >
+      {mainnet ? 'MAINNET' : 'SEPOLIA'}
+    </span>
+  );
+}
+
 function extractEnsCandidate(input: string): string | null {
   const match = input.match(/\b[a-z0-9-]+\.eth\b/i);
   return match?.[0] ?? null;
@@ -1158,42 +1373,67 @@ function shortHash(hash: string) {
   return hash.length > 14 ? `${hash.slice(0, 8)}...${hash.slice(-6)}` : hash;
 }
 
+function explorerTxUrl(chain: string, hash: string) {
+  return isMainnetChain(chain)
+    ? `https://etherscan.io/tx/${hash}`
+    : `https://sepolia.etherscan.io/tx/${hash}`;
+}
+
+function normalizeChainLabel(chain: string) {
+  return isMainnetChain(chain) ? 'ethereum' : 'sepolia';
+}
+
 function normalizeStatusLabel(status: string) {
   const upper = status.toUpperCase();
   if (upper === 'PENDING_INTENT') return 'PENDING';
   if (upper === 'DEADLINE_EXCEEDED') return 'EXPIRED';
+  if (upper === 'NEEDS_REAUTHORIZATION') return 'NEEDS REAUTH';
   if (upper === 'FINALIZED') return 'CONFIRMED';
   return upper.replaceAll('_', ' ');
 }
 
 function statusTone(status: string) {
   const upper = status.toUpperCase();
-  if (upper.includes('FINAL') || upper.includes('CONFIRM')) {
+  if (upper === 'FINALIZED') {
     return {
-      bg: 'bg-[rgba(255,69,0,0.08)]',
-      text: 'text-[var(--color-accent)]',
-      border: 'border-[var(--color-accent)]'
+      bg: 'bg-[rgba(77,255,163,0.08)]',
+      text: 'text-[#4dffa3]',
+      border: 'border-[#4dffa3]'
     };
   }
-  if (upper.includes('FAILED')) {
+  if (upper === 'SUBMITTED' || upper === 'CONFIRMING') {
     return {
-      bg: 'bg-[rgba(255,59,48,0.08)]',
-      text: 'text-[var(--color-danger)]',
-      border: 'border-[var(--color-danger)]'
+      bg: 'bg-[rgba(77,163,255,0.08)]',
+      text: 'text-[var(--color-info)]',
+      border: 'border-[var(--color-info)]'
     };
   }
-  if (upper.includes('STUCK')) {
+  if (upper === 'GAS_CHECK_FAILED' || upper === 'NEEDS_REAUTHORIZATION') {
     return {
       bg: 'bg-[rgba(255,145,0,0.08)]',
       text: 'text-[var(--color-warning)]',
       border: 'border-[var(--color-warning)]'
     };
   }
-  if (upper.includes('EXPIRE') || upper.includes('DEADLINE')) {
+  if (upper === 'STUCK' || upper === 'DEADLINE_EXCEEDED') {
+    return {
+      bg: 'bg-[rgba(255,59,48,0.08)]',
+      text: 'text-[var(--color-danger)]',
+      border: 'border-[var(--color-danger)]'
+    };
+  }
+  if (upper === 'CANCELLED') {
     return {
       bg: 'bg-[rgba(255,255,255,0.03)]',
       text: 'text-[var(--color-muted)]',
-      border: 'border-[var(--color-muted)]'
+      border: 'border-[var(--color-border)]'
+    };
+  }
+  if (upper === 'PENDING_INTENT') {
+    return {
+      bg: 'bg-[rgba(255,255,255,0.03)]',
+      text: 'text-[var(--color-muted)]',
+      border: 'border-[var(--color-border)]'
     };
   }
   return {
@@ -1201,6 +1441,24 @@ function statusTone(status: string) {
     text: 'text-[var(--color-muted)]',
     border: 'border-[var(--color-border)]'
   };
+}
+
+function isMainnetChain(chain: string) {
+  return ['ethereum', 'mainnet', 'eth'].includes(chain.toLowerCase());
+}
+
+function showsMainnetSwapWarning(input: string) {
+  return /\bswap\b/i.test(input);
+}
+
+function isCancellableIntentStatus(status: string) {
+  const upper = status.toUpperCase();
+  return [
+    'PENDING_INTENT',
+    'SUBMITTED',
+    'CONFIRMING',
+    'NEEDS_REAUTHORIZATION'
+  ].includes(upper);
 }
 
 function auditToneClass(type: string) {
@@ -1216,6 +1474,20 @@ function auditToneClass(type: string) {
     return 'terminal-warning';
   }
   return 'terminal-neutral';
+}
+
+function auditBorderClass(type: string) {
+  const upper = type.toUpperCase();
+  if (upper.includes('PASSED') || upper.includes('CONFIRMED') || upper.includes('FINALIZED')) {
+    return 'border-[var(--color-accent)]';
+  }
+  if (upper.includes('FAILED') || upper.includes('STUCK') || upper.includes('INVALID')) {
+    return 'border-[var(--color-danger)]';
+  }
+  if (upper.includes('WARNING') || upper.includes('SKIPPED')) {
+    return 'border-[var(--color-warning)]';
+  }
+  return 'border-[var(--color-border)]';
 }
 
 function deriveExecutionDetails(intent: IntentRecord): ExecutionDetails {

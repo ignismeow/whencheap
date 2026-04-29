@@ -9,28 +9,38 @@ const ETH_PRICE_TTL_MS = 30_000;
 @Injectable()
 export class GasOracleService {
   private readonly logger = new Logger(GasOracleService.name);
-  private readonly provider: ethers.JsonRpcProvider;
   private cachedEthUsd = 0;
   private cacheExpiry = 0;
 
-  constructor(private readonly config: ConfigService) {
-    const rpcUrl = this.config.get<string>('RPC_URL') ?? 'https://eth-sepolia.g.alchemy.com/v2/demo';
-    this.provider = new ethers.JsonRpcProvider(rpcUrl);
-  }
+  constructor(private readonly config: ConfigService) {}
 
-  async estimateTxCostUsd(type: 'send' | 'swap'): Promise<{ costUsd: number; baseFeeGwei: number; ethUsd: number }> {
-    const [baseFeeGwei, ethUsd] = await Promise.all([this.fetchBaseFeeGwei(), this.fetchEthUsd()]);
+  async estimateTxCostUsd(
+    type: 'send' | 'swap',
+    chain = 'sepolia',
+  ): Promise<{ costUsd: number; baseFeeGwei: number; ethUsd: number }> {
+    const [baseFeeGwei, ethUsd] = await Promise.all([
+      this.fetchBaseFeeGwei(chain),
+      this.fetchEthUsd(),
+    ]);
     const gasUnits = GAS_UNITS[type] ?? GAS_UNITS.swap;
     const costUsd = (baseFeeGwei * gasUnits * ethUsd) / 1e9;
     return { costUsd, baseFeeGwei, ethUsd };
   }
 
-  private async fetchBaseFeeGwei(): Promise<number> {
-    const history = await this.provider.send('eth_feeHistory', ['0x4', 'latest', [25]]) as {
+  private async fetchBaseFeeGwei(chain: string): Promise<number> {
+    const history = await this.getProvider(chain).send('eth_feeHistory', ['0x4', 'latest', [25]]) as {
       baseFeePerGas: string[];
     };
     const nextBaseFeeWei = parseInt(history.baseFeePerGas.at(-1) ?? '0x0', 16);
     return nextBaseFeeWei / 1e9;
+  }
+
+  private getProvider(chain: string): ethers.JsonRpcProvider {
+    const isMainnet = ['ethereum', 'mainnet', 'eth'].includes(chain.toLowerCase());
+    const rpcUrl = isMainnet
+      ? this.config.get<string>('MAINNET_RPC_URL') ?? 'https://eth-mainnet.g.alchemy.com/v2/demo'
+      : this.config.get<string>('RPC_URL') ?? 'https://eth-sepolia.g.alchemy.com/v2/demo';
+    return new ethers.JsonRpcProvider(rpcUrl);
   }
 
   private async fetchEthUsd(): Promise<number> {

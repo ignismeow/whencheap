@@ -1,4 +1,4 @@
-import { IsEthereumAddress, IsNotEmpty, IsString, Matches } from 'class-validator';
+import { IsEthereumAddress, IsIn, IsNotEmpty, IsOptional, IsString, Matches } from 'class-validator';
 
 export class ManagedSessionDto {
   @IsEthereumAddress()
@@ -18,4 +18,9 @@ export class ManagedSessionDto {
   @IsNotEmpty()
   @Matches(/^\d+$/)
   expiryHours!: string;
+
+  @IsOptional()
+  @IsString()
+  @IsIn(['sepolia', 'mainnet', 'ethereum', 'eth'])
+  chain?: string;
 }

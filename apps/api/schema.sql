@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS session_authorizations (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   "userId" uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   "walletAddress" varchar(64) NOT NULL,
+  chain varchar(32) NOT NULL DEFAULT 'sepolia',
   "authorizationJson" text NOT NULL,
   "isActive" boolean NOT NULL DEFAULT true,
   "expiresAt" timestamptz NULL,
@@ -41,8 +42,8 @@ CREATE TABLE IF NOT EXISTS session_authorizations (
   "updatedAt" timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS "IDX_session_authorizations_walletAddress"
-  ON session_authorizations ("walletAddress");
+CREATE UNIQUE INDEX IF NOT EXISTS "IDX_session_authorizations_walletAddress_chain"
+  ON session_authorizations ("walletAddress", chain);
 
 CREATE TABLE IF NOT EXISTS intents (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
