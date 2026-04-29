@@ -3,17 +3,18 @@ services:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
+    network_mode: host
     env_file:
       - apps/api/.env
     environment:
       HOST: 0.0.0.0
-      DATABASE_URL: postgresql://whencheap:whencheap@postgres:5432/whencheap
-      REDIS_URL: redis://redis:6379
-    ports:
-      - "3001:3001"
+      NODE_OPTIONS: --dns-result-order=ipv4first
+      DATABASE_URL: postgresql://whencheap:whencheap@localhost:5432/whencheap
+      REDIS_URL: redis://localhost:6379
     depends_on:
       - postgres
       - redis
+    restart: unless-stopped
 
   frontend:
     build:

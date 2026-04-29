@@ -10,6 +10,7 @@ import { ExecutionEntity } from './intents/execution.entity';
 import { IntentEntity } from './intents/intent.entity';
 import { SessionAuthorizationEntity } from './session/session-auth.entity';
 import { WhenCheapWallet } from './session/wallet.entity';
+import { StatsModule } from './stats.module';
 import { UserModule } from './user/user.module';
 import { UserEntity } from './user/user.entity';
 
@@ -38,6 +39,7 @@ import { UserEntity } from './user/user.entity';
     ScheduleModule.forRoot(),
     AgentModule,
     IntentsModule,
+    StatsModule,
     UserModule,
   ],
   controllers: [HealthController]

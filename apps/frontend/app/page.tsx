@@ -8,8 +8,9 @@ import {
   ShieldCheck,
   XCircle
 } from 'lucide-react';
-import { FormEvent, KeyboardEvent, ReactNode, RefObject, useEffect, useMemo, useRef, useState } from 'react';
-import { formatEther } from 'viem';
+import { useRouter } from 'next/navigation';
+import { FormEvent, KeyboardEvent, ReactNode, useEffect, useMemo, useState } from 'react';
+import { formatEther, parseEther } from 'viem';
 import { mainnet, sepolia } from 'viem/chains';
 import { useReadContract } from 'wagmi';
 import useSWR from 'swr';
@@ -58,11 +59,42 @@ type ExecutionDetails = {
   gasPaidWei?: string;
 };
 
+type FeeDetails = {
+  feeWei: string;
+  feeBps: number;
+  feeTxHash?: string | null;
+};
+
+type DraftIntentEstimate = {
+  type: 'send' | 'swap';
+  amount: string;
+  fromToken: string;
+  chain: 'sepolia' | 'mainnet';
+  amountWei: bigint;
+  gasEstimateWei: bigint;
+  feeWei: bigint;
+  totalWei: bigint;
+};
+
 type ManagedIdentity = {
   email: string;
   address: `0x${string}`;
   created?: boolean;
 };
+
+type SessionStatus = {
+  active: boolean;
+  maxFeePerTxEth: string;
+  maxTotalSpendEth: string;
+  spentEth: string;
+  remainingEth: string;
+  expiresAt: string | null;
+  expiresInMinutes: number;
+  canExecute: boolean;
+  estimatedFeeEth: string;
+};
+
+type SessionHealthLevel = 'green' | 'yellow' | 'red' | 'loading';
 
 type GoogleCredentialResponse = {
   credential: string;
@@ -77,6 +109,7 @@ declare global {
             client_id: string;
             callback: (response: GoogleCredentialResponse) => void;
           }) => void;
+          prompt: () => void;
           renderButton: (
             element: HTMLElement,
             options: Record<string, string | number | boolean>,
@@ -89,12 +122,25 @@ declare global {
 }
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
-const googleClientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ?? '';
 const fetcher = (url: string) => fetch(url).then((res) => res.json());
+const sessionStatusFetcher = async (url: string) => {
+  const response = await fetch(url);
+  const payload = (await response.json()) as SessionStatus & { message?: string };
+
+  if (!response.ok) {
+    throw new Error(payload.message ?? 'Failed to load session status');
+  }
+
+  return payload;
+};
 const authStorageKey = 'whencheap-google-identity';
 const chainStorageKey = 'whencheap-selected-chain';
+const EXECUTION_FEE_BPS = 30n;
+const GAS_UNITS = { send: 21_000n, swap: 150_000n } as const;
+const alchemyKey = process.env.NEXT_PUBLIC_ALCHEMY_KEY ?? '';
 
 export default function Home() {
+  const router = useRouter();
   const [input, setInput] = useState('Send 0.001 ETH to 0xfC2b1688B9776ae0cA6dbf8Fc335a69a6e97578D when gas is under $1 in next 30 minutes'
 );
   const [selectedChain, setSelectedChain] = useState<'sepolia' | 'mainnet'>('sepolia');
@@ -103,15 +149,13 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [cancellingIntentId, setCancellingIntentId] = useState<string | null>(null);
-  const [authError, setAuthError] = useState<string | null>(null);
   const [managedIdentity, setManagedIdentity] = useState<ManagedIdentity | null>(null);
   const [isSessionCardOpen, setIsSessionCardOpen] = useState(false);
-  const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [ensCandidate, setEnsCandidate] = useState<string | null>(null);
   const [resolvedEnsAddress, setResolvedEnsAddress] = useState<string | null>(null);
   const [ensResolutionError, setEnsResolutionError] = useState<string | null>(null);
   const [isResolvingEns, setIsResolvingEns] = useState(false);
-  const googleButtonRef = useRef<HTMLDivElement | null>(null);
+  const [liveGasPriceWei, setLiveGasPriceWei] = useState<bigint | null>(null);
 
   const { data, mutate, isLoading } = useSWR<IntentRecord[]>(`${apiUrl}/intents`, fetcher, {
     refreshInterval: 5000
@@ -127,6 +171,26 @@ export default function Home() {
     [filteredIntents, selectedId]
   );
   const effectiveAddress = managedIdentity?.address;
+  const draftIntentEstimate = useMemo(
+    () => deriveDraftIntentEstimate(input, selectedChain, liveGasPriceWei),
+    [input, selectedChain, liveGasPriceWei],
+  );
+  const sessionStatusUrl = effectiveAddress
+    ? `${apiUrl}/intents/session/status/${effectiveAddress}?chain=${selectedChain}&type=${draftIntentEstimate?.type ?? 'send'}`
+    : null;
+  const { data: sessionStatus, mutate: mutateSessionStatus } = useSWR<SessionStatus>(
+    sessionStatusUrl,
+    sessionStatusFetcher,
+    {
+      refreshInterval: 30000,
+      keepPreviousData: true,
+      revalidateOnFocus: false,
+    },
+  );
+  const sessionHealth = useMemo(
+    () => deriveSessionHealth(sessionStatus),
+    [sessionStatus],
+  );
 
   useEffect(() => {
     try {
@@ -194,92 +258,45 @@ export default function Home() {
   }, [input]);
 
   useEffect(() => {
-    if (!googleClientId || managedIdentity) {
+    const rpcUrl = getRpcUrlForChain(selectedChain);
+    if (!rpcUrl) {
+      setLiveGasPriceWei(null);
       return;
     }
 
-    const initialize = () => {
-      if (!window.google || !googleButtonRef.current) {
-        return;
-      }
+    let active = true;
 
-      window.google.accounts.id.initialize({
-        client_id: googleClientId,
-        callback: (response) => {
-          void authenticateWithGoogle(response.credential);
+    const fetchGasPrice = async () => {
+      try {
+        const response = await fetch(rpcUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'eth_gasPrice',
+            params: [],
+          }),
+        });
+        const payload = (await response.json()) as { result?: string };
+        if (active && payload.result) {
+          setLiveGasPriceWei(BigInt(payload.result));
         }
-      });
-
-      googleButtonRef.current.innerHTML = '';
-      window.google.accounts.id.renderButton(googleButtonRef.current, {
-        theme: 'filled_black',
-        size: 'large',
-        width: 320,
-        text: 'continue_with',
-        shape: 'rectangular',
-        logo_alignment: 'left'
-      });
+      } catch {
+        if (active) {
+          setLiveGasPriceWei(null);
+        }
+      }
     };
 
-    if (window.google) {
-      initialize();
-      return;
-    }
+    void fetchGasPrice();
+    const interval = window.setInterval(() => void fetchGasPrice(), 30000);
 
-    const existingScript = document.querySelector<HTMLScriptElement>(
-      'script[data-whencheap-google-auth="true"]'
-    );
-    if (existingScript) {
-      existingScript.addEventListener('load', initialize, { once: true });
-      return;
-    }
-
-    const script = document.createElement('script');
-    script.src = 'https://accounts.google.com/gsi/client';
-    script.async = true;
-    script.defer = true;
-    script.dataset.whencheapGoogleAuth = 'true';
-    script.addEventListener('load', initialize, { once: true });
-    script.addEventListener(
-      'error',
-      () => setAuthError('Could not load Google authentication.'),
-      { once: true },
-    );
-    document.head.appendChild(script);
-  }, [managedIdentity]);
-
-  async function authenticateWithGoogle(credential: string) {
-    try {
-      setIsAuthenticating(true);
-      setAuthError(null);
-
-      const response = await fetch(`${apiUrl}/intents/google-auth`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ credential })
-      });
-
-      const rawBody = await response.text();
-      const payload = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
-      if (!response.ok || payload.ok !== true) {
-        throw new Error(
-          typeof payload.message === 'string' ? payload.message : rawBody || 'Google authentication failed',
-        );
-      }
-
-      const identity: ManagedIdentity = {
-        email: String(payload.email),
-        address: String(payload.address) as `0x${string}`,
-        created: Boolean(payload.created)
-      };
-      setManagedIdentity(identity);
-      window.localStorage.setItem(authStorageKey, JSON.stringify(identity));
-    } catch (err) {
-      setAuthError(err instanceof Error ? err.message : 'Google authentication failed');
-    } finally {
-      setIsAuthenticating(false);
-    }
-  }
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [selectedChain]);
 
   function signOutManagedIdentity() {
     setManagedIdentity(null);
@@ -354,11 +371,7 @@ export default function Home() {
   if (!managedIdentity) {
     return (
       <main className="console-shell">
-        <AuthGate
-          authError={authError}
-          isAuthenticating={isAuthenticating}
-          googleButtonRef={googleButtonRef}
-        />
+        <LandingHero onLaunch={() => router.push('/login')} />
       </main>
     );
   }
@@ -369,6 +382,7 @@ export default function Home() {
         address={effectiveAddress}
         email={managedIdentity.email}
         selectedChain={selectedChain}
+        sessionHealth={sessionHealth}
         onToggleChain={() =>
           setSelectedChain((current) => (current === 'sepolia' ? 'mainnet' : 'sepolia'))
         }
@@ -377,7 +391,7 @@ export default function Home() {
 
       <div className="console-root">
         <aside className="console-sidebar">
-          <ConsolePanel title="Intent Input" eyebrow="TRANSLATE NATURAL LANGUAGE" className="console-intent-panel">
+          <ConsolePanel title="Intent Input" eyebrow="Translate Natural Language" className="console-intent-panel">
             <form onSubmit={createIntent} className="space-y-4">
               <textarea
                 value={input}
@@ -420,14 +434,19 @@ export default function Home() {
                 {error ? <p className="text-[var(--color-danger)] normal-case tracking-normal">{error}</p> : null}
               </div>
 
-              <button
-                type="submit"
-                disabled={isSubmitting}
-                className="console-button console-button-primary w-full"
-              >
-                <Send size={15} />
-                {isSubmitting ? 'Creating Command...' : 'Create Intent'}
-              </button>
+              <div className="space-y-2">
+                <button
+                  type="submit"
+                  disabled={isSubmitting}
+                  className="console-button console-button-primary w-full"
+                >
+                  <Send size={15} />
+                  {isSubmitting ? 'Creating Command...' : 'Create Intent'}
+                </button>
+                <p className="text-[10px] normal-case tracking-normal text-[var(--color-muted)]">
+                  0.3% execution fee applies on confirmed transactions.
+                </p>
+              </div>
             </form>
           </ConsolePanel>
 
@@ -512,6 +531,10 @@ export default function Home() {
             address={effectiveAddress}
             email={managedIdentity.email}
             sessionChain={selectedChain}
+            draftIntentEstimate={draftIntentEstimate}
+            sessionStatus={sessionStatus ?? null}
+            sessionHealth={sessionHealth}
+            refreshSessionStatus={() => mutateSessionStatus()}
             onSessionChainChange={setSelectedChain}
             onLogout={signOutManagedIdentity}
             onClose={() => setIsSessionCardOpen(false)}
@@ -522,69 +545,48 @@ export default function Home() {
   );
 }
 
-function AuthGate({
-  authError,
-  isAuthenticating,
-  googleButtonRef
-}: {
-  authError: string | null;
-  isAuthenticating: boolean;
-  googleButtonRef: RefObject<HTMLDivElement | null>;
-}) {
+function LandingHero({ onLaunch }: { onLaunch: () => void }) {
   return (
-    <div className="flex min-h-screen items-center justify-center px-4 py-10">
-      <div className="w-full max-w-[760px] border border-[var(--color-border)] bg-[var(--color-surface)] p-8">
-        <div className="space-y-3 border-b border-[var(--color-border)] pb-6">
-          <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
-            Verified Access Required
-          </p>
-          <h1 className="text-xl font-medium uppercase tracking-[0.18em] text-[var(--color-text)]">
-            Link Google to allocate a managed WhenCheap wallet
-          </h1>
-          <p className="max-w-2xl text-sm uppercase tracking-[0.12em] text-[var(--color-muted)]">
-            Each verified Gmail gets a unique wallet generated on the server and bound to that email.
-            A different Google account receives a different wallet.
-          </p>
+    <section className="hero-gateway">
+      <div className="hero-grid" />
+      <div className="hero-scanline" />
+      <header className="hero-header">
+        <div className="flex items-center gap-3">
+          <img src="/logo.svg" alt="WhenCheap logo" className="h-7 w-7 shrink-0" />
+          <span className="text-sm font-semibold uppercase tracking-[0.18em] text-[var(--color-text)]">
+            WhenCheap
+          </span>
         </div>
+        {/* <span className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+          v1.0.4-beta
+        </span> */}
+      </header>
 
-        <div className="mt-6 grid gap-4 md:grid-cols-2">
-          <div className="space-y-3 border border-[var(--color-border)] p-4">
-            <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
-              Wallet policy
-            </p>
-            <ul className="space-y-2 text-xs uppercase tracking-[0.12em] text-[var(--color-text)]">
-              <li>Unique wallet per verified Google identity.</li>
-              <li>Private key encrypted server-side with AES-256-GCM.</li>
-              <li>Use only a dedicated Gmail and dedicated funded wallet.</li>
-            </ul>
-          </div>
+      <div className="hero-core">
+        <div className="hero-pulse" />
+      </div>
 
-          <div className="space-y-4 border border-[var(--color-border)] p-4">
-            <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
-              Google verification
-            </p>
-            {googleClientId ? (
-              <div className="space-y-3">
-                <div ref={googleButtonRef} className="min-h-[44px]" />
-                {isAuthenticating ? (
-                  <p className="text-xs uppercase tracking-[0.14em] text-[var(--color-muted)]">
-                    Verifying account and allocating wallet...
-                  </p>
-                ) : null}
-              </div>
-            ) : (
-              <p className="text-xs uppercase tracking-[0.14em] text-[var(--color-danger)]">
-                NEXT_PUBLIC_GOOGLE_CLIENT_ID is not configured.
-              </p>
-            )}
+      <div className="hero-content">
+        
+        <h1 className="hero-title">
+          Defi Intent-based automation
+        </h1>
+        <p className="max-w-2xl text-sm text-[var(--color-muted)]">
+          Reliable execution. Managed gas. No seed phrases required.
+        </p>
+       
 
-            {authError ? (
-              <p className="text-xs uppercase tracking-[0.14em] text-[var(--color-danger)]">{authError}</p>
-            ) : null}
-          </div>
+        <div className="mt-8 flex flex-col items-center gap-4">
+          <button
+            type="button"
+            onClick={onLaunch}
+            className="hero-launch-button"
+          >
+            [ Launch App ]
+          </button>
         </div>
       </div>
-    </div>
+    </section>
   );
 }
 
@@ -592,12 +594,14 @@ function HeaderBar({
   address,
   email,
   selectedChain,
+  sessionHealth,
   onToggleChain,
   onOpenSessionCard
 }: {
   address?: `0x${string}`;
   email?: string;
   selectedChain: 'sepolia' | 'mainnet';
+  sessionHealth: { level: SessionHealthLevel; label: string };
   onToggleChain: () => void;
   onOpenSessionCard: () => void;
 }) {
@@ -614,10 +618,7 @@ function HeaderBar({
             <p className="text-base font-semibold uppercase tracking-[0.18em] text-[var(--color-text)]">
               WhenCheap
             </p>
-          </div>
-          <p className="mt-1 text-[11px] uppercase tracking-[0.18em] text-[var(--color-muted)]">
-            
-          </p>
+          </div>         
         </div>
 
         <div className="flex items-center gap-2">
@@ -636,6 +637,7 @@ function HeaderBar({
               onClick={onOpenSessionCard}
               className="console-chip hidden lg:flex hover:bg-[var(--color-accent)] hover:text-black focus-visible:bg-[var(--color-accent)] focus-visible:text-black focus-visible:outline-none"
             >
+              <span className={`h-2 w-2 ${healthDotClassName(sessionHealth.level)}`} />
               <span>{email}</span>
             </button>
           ) : null}
@@ -645,6 +647,7 @@ function HeaderBar({
               onClick={onOpenSessionCard}
               className="console-chip hidden sm:flex hover:bg-[var(--color-accent)] hover:text-black focus-visible:bg-[var(--color-accent)] focus-visible:text-black focus-visible:outline-none"
             >
+              <span className={`h-2 w-2 ${healthDotClassName(sessionHealth.level)}`} />
               <span>{truncateAddress(address)}</span>
             </button>
           ) : null}
@@ -691,6 +694,10 @@ function SessionCard({
   address,
   email,
   sessionChain,
+  draftIntentEstimate,
+  sessionStatus,
+  sessionHealth,
+  refreshSessionStatus,
   onSessionChainChange,
   onLogout,
   onClose
@@ -698,6 +705,10 @@ function SessionCard({
   address?: `0x${string}`;
   email: string;
   sessionChain: 'sepolia' | 'mainnet';
+  draftIntentEstimate: DraftIntentEstimate | null;
+  sessionStatus: SessionStatus | null;
+  sessionHealth: { level: SessionHealthLevel; label: string };
+  refreshSessionStatus: () => Promise<SessionStatus | undefined>;
   onSessionChainChange: (chain: 'sepolia' | 'mainnet') => void;
   onLogout: () => void;
   onClose: () => void;
@@ -713,14 +724,32 @@ function SessionCard({
   const sessionContractForChain =
     sessionChain === 'mainnet' ? mainnetSessionContractAddress : sessionContractAddress;
   const sessionChainId = sessionChain === 'mainnet' ? mainnet.id : sepolia.id;
-  const { data: sessionData, refetch } = useReadContract({
+  const { data: feeBpsData } = useReadContract({
     address: sessionContractForChain,
     abi: whenCheapSessionAbi,
-    functionName: 'sessions',
-    args: address ? [address] : undefined,
+    functionName: 'feeBps',
     chainId: sessionChainId,
     query: {
-      enabled: Boolean(sessionContractForChain && address)
+      enabled: Boolean(sessionContractForChain)
+    }
+  });
+  const { data: treasuryData } = useReadContract({
+    address: sessionContractForChain,
+    abi: whenCheapSessionAbi,
+    functionName: 'treasury',
+    chainId: sessionChainId,
+    query: {
+      enabled: Boolean(sessionContractForChain)
+    }
+  });
+  const { data: feeForAmountData } = useReadContract({
+    address: sessionContractForChain,
+    abi: whenCheapSessionAbi,
+    functionName: 'feeForAmount',
+    args: draftIntentEstimate ? [draftIntentEstimate.amountWei] : undefined,
+    chainId: sessionChainId,
+    query: {
+      enabled: Boolean(sessionContractForChain && draftIntentEstimate)
     }
   });
 
@@ -759,7 +788,7 @@ function SessionCard({
 
       setSessionMessage('Session authorized.');
       setSessionTxHash(String(payload.txHash ?? ''));
-      await refetch();
+      await refreshSessionStatus();
     } catch (err) {
       setSessionError(err instanceof Error ? err.message : 'Session authorization failed');
     } finally {
@@ -790,7 +819,7 @@ function SessionCard({
 
       setSessionMessage('Session revoked.');
       setSessionTxHash(String(payload.txHash ?? ''));
-      await refetch();
+      await refreshSessionStatus();
     } catch (err) {
       setSessionError(err instanceof Error ? err.message : 'Failed to revoke session');
     } finally {
@@ -814,21 +843,13 @@ function SessionCard({
     setCopiedAddress(true);
   }
 
-  const session = Array.isArray(sessionData)
-    ? {
-        maxFeePerTxWei: sessionData[0],
-        maxTotalSpendWei: sessionData[1],
-        spentWei: sessionData[2],
-        expiresAt: sessionData[3]
-      }
-    : null;
-
-  const expiresAtMs = session && session.expiresAt > BigInt(0) ? Number(session.expiresAt) * 1000 : null;
-  const sessionActive = Boolean(expiresAtMs && expiresAtMs > Date.now());
-  const budgetRemainingWei = session
-    ? session.maxTotalSpendWei > session.spentWei
-      ? session.maxTotalSpendWei - session.spentWei
-      : 0n
+  const onChainFeeBps = typeof feeBpsData === 'bigint' ? Number(feeBpsData) : Number(EXECUTION_FEE_BPS);
+  const onChainFeeWei =
+    typeof feeForAmountData === 'bigint'
+      ? feeForAmountData
+      : draftIntentEstimate?.feeWei ?? 0n;
+  const draftTotalWei = draftIntentEstimate
+    ? draftIntentEstimate.amountWei + draftIntentEstimate.gasEstimateWei + onChainFeeWei
     : 0n;
 
   return (
@@ -845,8 +866,11 @@ function SessionCard({
       <div className="space-y-4">
         <div className="grid gap-3 text-[11px] uppercase tracking-[0.16em] md:grid-cols-2">
           <div className="console-subpanel">
-            <span className="text-[10px] text-[var(--color-label)]">Active</span>
-            <p className="mt-2 text-[var(--color-text)]">{sessionActive ? 'Yes' : 'No'}</p>
+            <span className="text-[10px] text-[var(--color-label)]">Session health</span>
+            <div className="mt-2 flex items-center gap-2 text-[var(--color-text)]">
+              <span className={`h-2.5 w-2.5 ${healthDotClassName(sessionHealth.level)}`} />
+              <span>{sessionHealth.label}</span>
+            </div>
           </div>
           <div className="console-subpanel">
             <span className="text-[10px] text-[var(--color-label)]">Google identity</span>
@@ -871,12 +895,71 @@ function SessionCard({
 
         <div className="console-scroll max-h-[70vh] space-y-4 pr-1">
           <div className="grid gap-[1px] border border-[var(--color-border)] bg-[var(--color-border)]">
-            <InfoRow label="ACTIVE" value={sessionActive ? 'Yes' : 'No'} />
+            <InfoRow
+              label="ACTIVE"
+              value={
+                <span
+                  className={
+                    !sessionStatus
+                      ? 'text-zinc-400'
+                      : sessionStatus.active
+                        ? 'text-emerald-400'
+                        : 'text-red-500'
+                  }
+                >
+                  {!sessionStatus ? 'CHECKING...' : sessionStatus.active ? 'YES' : 'NO'}
+                </span>
+              }
+            />
             <InfoRow label="CHAIN" value={sessionChain === 'mainnet' ? 'Mainnet' : 'Sepolia'} />
-            <InfoRow label="BUDGET REMAINING" value={`${formatEther(budgetRemainingWei)} ETH`} />
-            <InfoRow label="SPENT" value={session ? `${formatEther(session.spentWei)} ETH` : '0 ETH'} />
-            <InfoRow label="EXPIRES" value={expiresAtMs ? new Date(expiresAtMs).toLocaleString() : 'Not set'} />
+            <InfoRow label="BUDGET REMAINING" value={`${sessionStatus?.remainingEth ?? '0'} ETH`} />
+            <InfoRow label="SPENT" value={`${sessionStatus?.spentEth ?? '0'} ETH`} />
+            <InfoRow
+              label="EXPIRES"
+              value={
+                !sessionStatus
+                  ? 'Checking...'
+                  : sessionStatus.active && sessionStatus.expiresAt
+                  ? `in ${sessionStatus.expiresInMinutes} minutes (${new Date(sessionStatus.expiresAt).toLocaleString()})`
+                  : 'Not Set'
+              }
+            />
+            <InfoRow label="MAX FEE/TX" value={`${sessionStatus?.maxFeePerTxEth ?? '0'} ETH`} />
+            <InfoRow
+              label="CAN EXECUTE"
+              value={
+                <span
+                  className={
+                    !sessionStatus
+                      ? 'text-zinc-400'
+                      : sessionStatus.canExecute
+                        ? 'text-emerald-400'
+                        : 'text-red-500'
+                  }
+                >
+                  {!sessionStatus ? 'CHECKING...' : sessionStatus.canExecute ? 'YES' : 'NO'}
+                </span>
+              }
+            />
           </div>
+
+          {sessionHealth.level === 'yellow' && sessionStatus ? (
+            <div className="console-alert border-[var(--color-warning)] text-[var(--color-warning)]">
+              <span className="console-alert-label">Warning</span>
+              <p>
+                Current estimated fee is above 80% of the per-tx session limit. Raise the limit if you want more headroom during gas spikes.
+              </p>
+            </div>
+          ) : null}
+
+          {sessionHealth.level === 'red' ? (
+            <div className="console-alert border-[var(--color-danger)] text-[var(--color-danger)]">
+              <span className="console-alert-label">Status</span>
+              <p>
+                Session is expired, unavailable, or cannot execute with the current estimated fee.
+              </p>
+            </div>
+          ) : null}
 
           <div className="space-y-2">
             <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
@@ -937,10 +1020,42 @@ function SessionCard({
 
           <div className="border border-[var(--color-border)] p-3">
             <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+              Minimum balance required
+            </p>
+            {draftIntentEstimate ? (
+              <>
+                <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
+                  For {draftIntentEstimate.amount} {draftIntentEstimate.fromToken} {draftIntentEstimate.type} intent:
+                </p>
+                <div className="mt-3 grid gap-[1px] bg-[var(--color-border)]">
+                  <InfoRow label="Amount" value={`${formatEthFixed(draftIntentEstimate.amountWei)} ETH`} />
+                  <InfoRow label="Gas est" value={`${formatEthFixed(draftIntentEstimate.gasEstimateWei)} ETH`} />
+                  <InfoRow
+                    label={`Fee (${(onChainFeeBps / 100).toFixed(1)}%)`}
+                    value={`${formatEthFixed(onChainFeeWei)} ETH`}
+                  />
+                  <InfoRow label="Total" value={`${formatEthFixed(draftTotalWei)} ETH`} />
+                </div>
+              </>
+            ) : (
+              <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
+                Enter an ETH send or swap intent to calculate the minimum wallet funding requirement.
+              </p>
+            )}
+          </div>
+
+          <div className="border border-[var(--color-border)] p-3">
+            <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
               Managed wallet policy
             </p>
             <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
               This wallet was generated for your verified Gmail. Session authorization and revocation are executed from the server using the encrypted managed key.
+            </p>
+            <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
+              Platform fee: {(onChainFeeBps / 100).toFixed(1)}% (enforced on-chain)
+            </p>
+            <p className="mt-2 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
+              Treasury: {typeof treasuryData === 'string' ? truncateAddress(treasuryData) : 'Loading...'}
             </p>
           </div>
 
@@ -1039,13 +1154,14 @@ function CommandCenter({
   cancelError: string | null;
 }) {
   const details = deriveExecutionDetails(intent);
+  const feeDetails = deriveFeeDetails(intent);
   const summaryRecipient = intent.parsed.resolvedRecipient
     ? `${intent.parsed.recipient ?? 'ENS'} -> ${intent.parsed.resolvedRecipient}`
     : intent.parsed.recipient ?? intent.parsed.toToken ?? 'Not set';
   const canCancel = isCancellableIntentStatus(intent.status);
 
   return (
-    <ConsolePanel title="Command Center" eyebrow="EXECUTION STATE" className="min-h-0">
+    <ConsolePanel title="Command Center" eyebrow="Execution State" className="min-h-0">
       <div className="flex h-full min-h-0 flex-col gap-4">
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -1083,6 +1199,12 @@ function CommandCenter({
             label="Gas Paid"
             value={details.gasPaidWei ? `${formatEther(BigInt(details.gasPaidWei))} ETH` : 'Pending'}
           />
+          {intent.status === 'FINALIZED' && feeDetails ? (
+            <SummaryField
+              label="Fee Collected"
+              value={`${formatEther(BigInt(feeDetails.feeWei))} ETH (${feeDetails.feeBps / 100}%)`}
+            />
+          ) : null}
           <SummaryField label="Input" value={intent.rawInput} />
         </div>
 
@@ -1113,7 +1235,7 @@ function CommandCenter({
           </div>
         ) : null}
 
-        <div className="console-subpanel flex-1">
+        {/* <div className="console-subpanel flex-1">
           <span className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-label)]">Execution feed</span>
           <div className="console-scroll mt-3 h-[180px] space-y-4 pr-1">
             {intent.audit.slice(0, 8).map((event) => (
@@ -1127,7 +1249,7 @@ function CommandCenter({
               </div>
             ))}
           </div>
-        </div>
+        </div> */}
       </div>
     </ConsolePanel>
   );
@@ -1135,7 +1257,7 @@ function CommandCenter({
 
 function AuditTrail({ intent }: { intent: IntentRecord }) {
   return (
-    <ConsolePanel title="Audit Trail" eyebrow="LIVE TERMINAL" className="min-h-0">
+    <ConsolePanel title="Audit Trail" eyebrow="Live Terminal" className="min-h-0">
       <div className="console-scroll h-full min-h-[560px] space-y-4 pr-1">
         {intent.audit.map((event, index) => (
           <div key={event.id} className={`terminal-line ${auditToneClass(event.type)}`} style={{ animationDelay: `${Math.min(index, 8) * 40}ms` }}>
@@ -1153,7 +1275,7 @@ function AuditTrail({ intent }: { intent: IntentRecord }) {
 
 function CommandCenterEmpty() {
   return (
-    <ConsolePanel title="Command Center" eyebrow="EXECUTION STATE" className="min-h-0">
+    <ConsolePanel title="Command Center" eyebrow="Execution State" className="min-h-0">
       <div className="flex h-full min-h-[640px] items-center justify-center px-6 py-12 text-center">
         <div className="space-y-3">
           <div className="text-4xl text-[var(--color-accent)]">⚡</div>
@@ -1171,7 +1293,7 @@ function CommandCenterEmpty() {
 
 function AuditTrailEmpty() {
   return (
-    <ConsolePanel title="Audit Trail" eyebrow="LIVE TERMINAL" className="min-h-0">
+    <ConsolePanel title="Audit Trail" eyebrow="Live Terminal" className="min-h-0">
       <div className="flex h-full min-h-[640px] items-center justify-center px-6 py-12 text-center">
         <div className="space-y-3">
           <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
@@ -1206,7 +1328,7 @@ function RecentCommandsPanel({
   return (
     <ConsolePanel
       title="Recent Commands"
-      eyebrow="QUEUE"
+      eyebrow="Queue"
       action={
         <button
           type="button"
@@ -1288,9 +1410,9 @@ function ConsolePanel({
       <div className="mb-4 flex items-start justify-between gap-3 border-b border-[var(--color-border)] pb-3">
         <div>
           {eyebrow ? (
-            <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">{eyebrow}</p>
+            <p className="text-[10px] capitalize tracking-[0.18em] text-[var(--color-label)]">{eyebrow}</p>
           ) : null}
-          <h2 className="mt-1 text-sm font-medium uppercase tracking-[0.18em] text-[var(--color-text)]">
+          <h2 className="mt-1 text-sm font-medium capitalize tracking-[0.18em] text-[var(--color-text)]">
             {title}
           </h2>
         </div>
@@ -1310,10 +1432,10 @@ function InfoRow({
 }) {
   return (
     <div className="grid grid-cols-[120px_minmax(0,1fr)] gap-[1px] bg-[var(--color-border)]">
-      <span className="bg-[var(--color-surface)] px-3 py-2 text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+      <span className="bg-[var(--color-surface)] px-3 py-2 text-[10px] capitalize tracking-[0.18em] text-[var(--color-label)]">
         {label}
       </span>
-      <span className="bg-[var(--color-surface)] px-3 py-2 text-right text-xs uppercase tracking-[0.12em] text-[var(--color-text)]">
+      <span className="bg-[var(--color-surface)] px-3 py-2 text-right text-xs capitalize tracking-[0.12em] text-[var(--color-text)]">
         {value}
       </span>
     </div>
@@ -1323,8 +1445,8 @@ function InfoRow({
 function SummaryField({ label, value }: { label: string; value: string }) {
   return (
     <div className="bg-[var(--color-surface)] p-4">
-      <dt className="text-[10px] font-medium uppercase tracking-[0.18em] text-[var(--color-label)]">{label}</dt>
-      <dd className="mt-2 break-words text-[13px] font-bold uppercase tracking-[0.08em] text-[var(--color-text)]">
+      <dt className="text-[10px] font-medium capitalize tracking-[0.18em] text-[var(--color-label)]">{label}</dt>
+      <dd className="mt-2 break-words text-[13px] font-bold capitalize tracking-[0.08em] text-[var(--color-text)]">
         {value}
       </dd>
     </div>
@@ -1335,7 +1457,7 @@ function StatusBadge({ status, compact = false }: { status: string; compact?: bo
   const { bg, text, border } = statusTone(status);
   return (
     <span
-      className={`inline-flex items-center border px-2 py-1 font-medium uppercase tracking-[0.18em] ${bg} ${text} ${border} ${
+      className={`inline-flex items-center border px-2 py-1 font-medium capitalize tracking-[0.18em] ${bg} ${text} ${border} ${
         compact ? 'text-[10px]' : 'text-[11px]'
       }`}
     >
@@ -1344,11 +1466,56 @@ function StatusBadge({ status, compact = false }: { status: string; compact?: bo
   );
 }
 
+function deriveSessionHealth(
+  sessionStatus?: SessionStatus | null,
+): { level: SessionHealthLevel; label: string } {
+  if (!sessionStatus) {
+    return { level: 'loading', label: 'Checking...' };
+  }
+
+  if (!sessionStatus.active) {
+    return { level: 'red', label: 'Red' };
+  }
+
+  const estimatedFee = Number(sessionStatus.estimatedFeeEth);
+  const maxFeePerTx = Number(sessionStatus.maxFeePerTxEth);
+
+  if (!sessionStatus.canExecute) {
+    return { level: 'yellow', label: 'Warning' };
+  }
+
+  if (maxFeePerTx > 0 && estimatedFee / maxFeePerTx > 0.8) {
+    return { level: 'yellow', label: 'Warning' };
+  }
+
+  return { level: 'green', label: 'Green' };
+}
+
+function healthDotClassName(level: SessionHealthLevel) {
+  if (level === 'loading') {
+    return 'rounded-full bg-zinc-500 shadow-[0_0_10px_rgba(113,113,122,0.45)]';
+  }
+
+  if (level === 'green') {
+    return 'rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.6)]';
+  }
+
+  if (level === 'yellow') {
+    return 'rounded-full bg-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.6)]';
+  }
+
+  return 'rounded-full bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.65)]';
+}
+
+function formatEthFixed(value: bigint): string {
+  return Number.parseFloat(formatEther(value)).toFixed(6);
+}
+
 function ChainBadge({ chain, compact = false }: { chain: string; compact?: boolean }) {
   const mainnet = isMainnetChain(chain);
   return (
     <span
-      className={`inline-flex items-center border px-2 py-1 font-medium uppercase tracking-[0.18em] ${
+      className={`inline-flex items-center border px-2 py-1 font-medium capitalize tracking-[0.18em] ${
         mainnet
           ? 'border-[var(--color-warning)] bg-[rgba(255,145,0,0.08)] text-[var(--color-warning)]'
           : 'border-[var(--color-border)] bg-[rgba(255,255,255,0.03)] text-[#b5b5b5]'
@@ -1464,7 +1631,12 @@ function isCancellableIntentStatus(status: string) {
 function auditToneClass(type: string) {
   const upper = type.toUpperCase();
   if (upper.includes('EIP7702')) return 'terminal-info';
-  if (upper.includes('PASSED') || upper.includes('CONFIRMED') || upper.includes('FINALIZED')) {
+  if (
+    upper.includes('PASSED') ||
+    upper.includes('CONFIRMED') ||
+    upper.includes('FINALIZED') ||
+    upper.includes('COLLECTED')
+  ) {
     return 'terminal-success';
   }
   if (upper.includes('FAILED') || upper.includes('STUCK')) {
@@ -1511,6 +1683,67 @@ function deriveExecutionDetails(intent: IntentRecord): ExecutionDetails {
   }
 
   return { txHash, blockNumber, gasPaidWei };
+}
+
+function deriveFeeDetails(intent: IntentRecord): FeeDetails | null {
+  const event = intent.audit.find((item) => item.type === 'FEE_COLLECTED');
+  if (!event?.metadata) return null;
+
+  const feeWei = event.metadata.feeWei;
+  const feeBps = event.metadata.feeBps;
+  const feeTxHash = event.metadata.feeTxHash;
+
+  if (typeof feeWei !== 'string' || typeof feeBps !== 'number') {
+    return null;
+  }
+
+  return {
+    feeWei,
+    feeBps,
+    feeTxHash: typeof feeTxHash === 'string' ? feeTxHash : null,
+  };
+}
+
+function deriveDraftIntentEstimate(
+  input: string,
+  selectedChain: 'sepolia' | 'mainnet',
+  liveGasPriceWei: bigint | null,
+): DraftIntentEstimate | null {
+  const type = /\bswap\b/i.test(input) ? 'swap' : /\bsend\b/i.test(input) ? 'send' : null;
+  const amountMatch = input.match(/(?:send|swap)\s+([0-9]*\.?[0-9]+)/i);
+  const tokenMatch = input.match(/(?:send|swap)\s+[0-9]*\.?[0-9]+\s+([a-zA-Z]+)/i);
+  const amount = amountMatch?.[1] ?? '0.001';
+  const fromToken = tokenMatch?.[1]?.toUpperCase() ?? 'ETH';
+
+  if (!type) return null;
+
+  try {
+    const amountWei = fromToken === 'ETH' || fromToken === 'WETH' ? parseEther(amount) : 0n;
+    const gasPriceWei = liveGasPriceWei ?? 0n;
+    const gasEstimateWei = (gasPriceWei * 12n * GAS_UNITS[type]) / 10n;
+    const feeWei = (amountWei * EXECUTION_FEE_BPS) / 10000n;
+    const totalWei = amountWei + gasEstimateWei + feeWei;
+
+    return {
+      type,
+      amount,
+      fromToken,
+      chain: selectedChain,
+      amountWei,
+      gasEstimateWei,
+      feeWei,
+      totalWei,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getRpcUrlForChain(chain: 'sepolia' | 'mainnet') {
+  if (!alchemyKey) return null;
+  return chain === 'mainnet'
+    ? `https://eth-mainnet.g.alchemy.com/v2/${alchemyKey}`
+    : `https://eth-sepolia.g.alchemy.com/v2/${alchemyKey}`;
 }
 
 function formatAuditTime(at: string) {

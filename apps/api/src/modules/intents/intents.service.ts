@@ -4,6 +4,8 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { randomUUID } from 'crypto';
 import { In, Repository } from 'typeorm';
+import { formatEther } from 'viem';
+import { isAddress } from 'ethers';
 import { OllamaIntentParserService } from '../agent/ollama-intent-parser.service';
 import { ParsedIntent } from '../agent/parsed-intent.schema';
 import { GasOracleService } from '../gas/gas-oracle.service';
@@ -229,6 +231,75 @@ export class IntentsService implements OnModuleInit {
     return this.sessionSigner.testEip7702UserWalletExecution(dto);
   }
 
+  async getSessionStatus(
+    wallet: string,
+    chain = 'sepolia',
+    type: 'send' | 'swap' = 'send',
+  ): Promise<{
+    active: boolean;
+    maxFeePerTxEth: string;
+    maxTotalSpendEth: string;
+    spentEth: string;
+    remainingEth: string;
+    expiresAt: string | null;
+    expiresInMinutes: number;
+    canExecute: boolean;
+    estimatedFeeEth: string;
+  }> {
+    if (!isAddress(wallet)) {
+      throw new BadRequestException('wallet must be a valid EVM address');
+    }
+
+    const session = await this.sessionSigner.getSessionPermission(wallet, chain);
+    if (!session) {
+      return {
+        active: false,
+        maxFeePerTxEth: '0',
+        maxTotalSpendEth: '0',
+        spentEth: '0',
+        remainingEth: '0',
+        expiresAt: null,
+        expiresInMinutes: 0,
+        canExecute: false,
+        estimatedFeeEth: '0',
+      };
+    }
+
+    let estimatedFeeWei = 0n;
+    try {
+      const { baseFeeGwei } = await this.gas.estimateTxCostUsd(type, chain);
+      estimatedFeeWei = this.sessionSigner.estimateFeeWei(baseFeeGwei, type, chain);
+    } catch {
+      estimatedFeeWei = 0n;
+    }
+
+    const canExecute = await this.sessionSigner.canExecuteSession(wallet, estimatedFeeWei, chain);
+
+    const expiresAtMs =
+      session.expiresAt > 0n ? Number(session.expiresAt) * 1000 : 0;
+    const remainingWei =
+      session.maxTotalSpendWei > session.spentWei
+        ? session.maxTotalSpendWei - session.spentWei
+        : 0n;
+    const active = expiresAtMs > Date.now();
+    const expiresInMinutes =
+      expiresAtMs > Date.now()
+        ? Math.ceil((expiresAtMs - Date.now()) / 60_000)
+        : 0;
+
+    return {
+      active,
+      maxFeePerTxEth: formatEther(session.maxFeePerTxWei),
+      maxTotalSpendEth: formatEther(session.maxTotalSpendWei),
+      spentEth: formatEther(session.spentWei),
+      remainingEth: formatEther(remainingWei),
+      expiresAt: active ? new Date(expiresAtMs).toISOString() : null,
+      expiresInMinutes,
+      canExecute,
+      estimatedFeeEth: formatEther(estimatedFeeWei),
+    };
+  }
+
   @Cron(CronExpression.EVERY_30_SECONDS)
   async evaluatePendingIntents() {
     const pending = [...this.intents.values()].filter(
@@ -278,8 +349,11 @@ export class IntentsService implements OnModuleInit {
       await this.addAudit(
         intent,
         'GAS_CHECK_PASSED',
-        `Base fee: ${baseFeeGwei.toFixed(3)} gwei. ` +
-          `Est. cost: $${costUsd.toFixed(4)}. Under $${limit} limit.`,
+        intent.parsed.type === 'swap'
+          ? `Base fee: ${baseFeeGwei.toFixed(3)} gwei. ` +
+            `Est. swap cost: $${costUsd.toFixed(4)} (150k gas units). Under $${limit} limit.`
+          : `Base fee: ${baseFeeGwei.toFixed(3)} gwei. ` +
+            `Est. cost: $${costUsd.toFixed(4)}. Under $${limit} limit.`,
         { baseFeeGwei, costUsd, limitUsd: limit },
       );
 
@@ -323,39 +397,55 @@ export class IntentsService implements OnModuleInit {
         );
       }
 
-      if (intent.parsed.type === 'swap') {
-        await this.addAudit(
-          intent,
-          'SWAP_QUOTE_REQUESTED',
-          'Fetching Uniswap quote and executing returned swap calldata via agent wallet.',
-          {
-            chain: intent.parsed.chain ?? 'sepolia',
-            fromToken: intent.parsed.fromToken,
-            toToken: intent.parsed.toToken ?? 'USDC',
-            amount: intent.parsed.amount,
-          },
-        );
-
-        if (!this.agentFallbackEnabled) {
-          await this.addAudit(
-            intent,
-            'EXECUTION_FAILED',
-            'Swap execution requires agent-wallet routing, but ALLOW_AGENT_FUNDED_FALLBACK is disabled.',
-          );
-          continue;
-        }
-
-        await this.executeDirectly(intent, baseFeeGwei);
-        continue;
-      }
-
       const registeredWallet = await this.sessionSigner.getRegisteredWallet(intent.wallet);
       const authorization = await this.sessionSigner.getAuthorization(
         intent.wallet,
         intent.parsed.chain ?? 'sepolia',
       );
 
+      if (intent.parsed.type === 'swap') {
+        if (!registeredWallet) {
+          await this.addAudit(
+            intent,
+            'NEEDS_AUTHORIZATION',
+            'Swap execution requires a registered managed wallet so WhenCheap can relay the EIP-7702 transaction from the user wallet.',
+          );
+          continue;
+        }
+
+        try {
+          await this.sessionSigner.ensureManagedWalletHasRequiredBalance(
+            intent.wallet,
+            intent.parsed.amount,
+            baseFeeGwei,
+            'swap',
+            intent.parsed.chain ?? 'sepolia',
+          );
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          await this.addAudit(intent, 'INSUFFICIENT_BALANCE', message);
+          continue;
+        }
+
+        await this.executeSwap(intent, baseFeeGwei);
+        continue;
+      }
+
       if (registeredWallet) {
+        try {
+          await this.sessionSigner.ensureManagedWalletHasRequiredBalance(
+            intent.wallet,
+            intent.parsed.amount,
+            baseFeeGwei,
+            intent.parsed.type as 'send' | 'swap',
+            intent.parsed.chain ?? 'sepolia',
+          );
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          await this.addAudit(intent, 'INSUFFICIENT_BALANCE', message);
+          continue;
+        }
+
         await this.executeWithUserWallet(intent, registeredWallet, authorization, baseFeeGwei);
       } else if (authorization && this.sessionSigner.isOnChainSessionMarker(authorization)) {
         await this.addAudit(
@@ -430,6 +520,58 @@ export class IntentsService implements OnModuleInit {
         intent,
         'EXECUTION_FAILED',
         `Broadcast failed: ${message}. Will retry next gas check.`,
+      );
+    }
+  }
+
+  private async executeSwap(intent: IntentRecord, baseFeeGwei: number) {
+    try {
+      await this.addAudit(
+        intent,
+        'SWAP_EXECUTING',
+        `Executing swap: ${intent.parsed.amount} ${intent.parsed.fromToken} -> ${intent.parsed.toToken ?? 'USDC'} ` +
+          `via Uniswap on ${intent.parsed.chain ?? 'sepolia'}.`,
+        {
+          chain: intent.parsed.chain ?? 'sepolia',
+          baseFeeGwei,
+          fromToken: intent.parsed.fromToken,
+          toToken: intent.parsed.toToken ?? 'USDC',
+          amount: intent.parsed.amount,
+          senderModel: 'eip7702-managed-wallet',
+        },
+      );
+
+      const txHash = await this.sessionSigner.executeSwap(intent);
+      intent.txHash = txHash;
+      await this.transition(
+        intent,
+        IntentStatus.Submitted,
+        `Swap broadcast. Hash: ${txHash}`,
+        {
+          txHash,
+          senderModel: 'eip7702-managed-wallet',
+          userWallet: intent.wallet,
+        },
+      );
+      await this.logKeeperHubExecution(intent);
+    } catch (err) {
+      const message = String(err);
+      if (message.includes('Uniswap API 404')) {
+        await this.transition(
+          intent,
+          IntentStatus.Stuck,
+          `Uniswap route not available for this pair on ${intent.parsed.chain ?? 'sepolia'}. Try a different token pair.`,
+          { error: message, chain: intent.parsed.chain ?? 'sepolia' },
+        );
+        this.intents.delete(intent.id);
+        return;
+      }
+
+      this.logger.warn(`Swap execution failed for intent ${intent.id}: ${message}`);
+      await this.addAudit(
+        intent,
+        'EXECUTION_FAILED',
+        `Swap failed: ${message}. Will retry next gas check.`,
       );
     }
   }
@@ -637,6 +779,23 @@ export class IntentsService implements OnModuleInit {
             intent,
             'SESSION_SPEND_RECORD_FAILED',
             `Could not record session spend: ${String(err)}`,
+          );
+        }
+
+        const feeEvents = this.sessionSigner.decodeFeeCollectionFromReceipt(receipt);
+        for (const feeEvent of feeEvents) {
+          await this.addAudit(
+            intent,
+            'FEE_COLLECTED',
+            `Execution fee (${feeEvent.feeType}): ${formatEther(BigInt(feeEvent.feeWei))} ETH. ` +
+              `Recipient: ${feeEvent.recipient.slice(0, 10)}... Net: ${formatEther(BigInt(feeEvent.netAmount))} ETH`,
+            {
+              feeWei: feeEvent.feeWei,
+              recipient: feeEvent.recipient,
+              totalValueWei: feeEvent.totalValue,
+              netAmountWei: feeEvent.netAmount,
+              feeType: feeEvent.feeType,
+            },
           );
         }
 

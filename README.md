@@ -53,3 +53,18 @@ Copy env examples before running:
 cp apps/api/.env.example apps/api/.env
 cp apps/frontend/.env.local.example apps/frontend/.env.local
 ```
+
+## Execution Fee
+
+WhenCheap supports a configurable execution fee charged on confirmed transactions.
+
+Examples at `0.3%`:
+
+- Intent: Send `0.001 ETH`
+- Fee: `0.000003 ETH` (`$0.007` at `$2300/ETH`)
+
+- Intent: Send `0.1 ETH`
+- Fee: `0.0003 ETH` (`$0.69` at `$2300/ETH`)
+
+- Intent: Send `1 ETH`
+- Fee: `0.003 ETH` (`$6.90` at `$2300/ETH`)

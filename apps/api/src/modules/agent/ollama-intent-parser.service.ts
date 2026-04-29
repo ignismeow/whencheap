@@ -82,7 +82,7 @@ export class OllamaIntentParserService {
       throw new Error('0G response did not include a JSON message');
     }
 
-    return parsedIntentSchema.parse(this.parseJsonContent(content));
+    return parsedIntentSchema.parse(this.parseJsonContent(content, input));
   }
 
   private async parseWithOllama(input: string, wallet: string): Promise<ParsedIntent> {
@@ -109,7 +109,7 @@ export class OllamaIntentParserService {
       throw new Error('Ollama response did not include JSON output');
     }
 
-    return parsedIntentSchema.parse(this.parseJsonContent(content));
+    return parsedIntentSchema.parse(this.parseJsonContent(content, input));
   }
 
   private buildPrompt(input: string, wallet: string): string {
@@ -136,24 +136,31 @@ export class OllamaIntentParserService {
     ].join('\n');
   }
 
-  private parseJsonContent(content: string): unknown {
+  private parseJsonContent(content: string, input: string): unknown {
     try {
-      return this.normalizeParsedJson(JSON.parse(this.stripThinking(content)));
+      return this.normalizeParsedJson(JSON.parse(this.stripThinking(content)), input);
     } catch {
       const match = this.stripThinking(content).match(/\{[\s\S]*\}/);
       if (!match) {
         throw new Error('Model response did not contain JSON');
       }
-      return this.normalizeParsedJson(JSON.parse(match[0]));
+      return this.normalizeParsedJson(JSON.parse(match[0]), input);
     }
   }
 
-  private normalizeParsedJson(value: unknown): unknown {
+  private normalizeParsedJson(value: unknown, input: string): unknown {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return value;
     }
 
     const parsed = { ...value } as Record<string, unknown>;
+    const lower = input.toLowerCase();
+    const explicitChain = this.extractChain(lower);
+    const explicitDeadline = this.extractExplicitDeadline(lower);
+    const explicitRecipient = input.match(/0x[a-fA-F0-9]{40}|\b[a-z0-9-]+\.eth\b/i)?.[0];
+    const isExplicitSend = /\bsend\b/i.test(input);
+    const isExplicitSwap = /\bswap\b|\bexchange\b|\btrade\b/i.test(input);
+
     for (const key of ['recipient', 'resolvedRecipient', 'toToken', 'repeatCount', 'notes']) {
       if (parsed[key] === null) {
         delete parsed[key];
@@ -165,6 +172,41 @@ export class OllamaIntentParserService {
     if (typeof parsed.chain !== 'string' || !parsed.chain.trim()) {
       parsed.chain = parsed.type === 'swap' ? 'ethereum' : 'sepolia';
     }
+
+    if (isExplicitSend && !isExplicitSwap) {
+      parsed.type = 'send';
+      if (explicitRecipient) {
+        parsed.recipient = explicitRecipient;
+      }
+      delete parsed.toToken;
+    } else if (isExplicitSwap) {
+      parsed.type = 'swap';
+    }
+
+    if (explicitChain) {
+      parsed.chain = explicitChain;
+    }
+
+    if (typeof parsed.deadlineIso === 'string' && parsed.deadlineIso.startsWith('PT')) {
+      const durationMatch = parsed.deadlineIso.match(/^PT(\d+)(M|H)$/i);
+      if (durationMatch) {
+        const amount = Number(durationMatch[1]);
+        const minutes = durationMatch[2].toUpperCase() === 'H' ? amount * 60 : amount;
+        parsed.deadlineIso = new Date(Date.now() + minutes * 60 * 1000).toISOString();
+      }
+    }
+
+    if (explicitDeadline) {
+      const parsedDeadlineMs =
+        typeof parsed.deadlineIso === 'string' ? new Date(parsed.deadlineIso).getTime() : Number.NaN;
+      const explicitDeadlineMs = explicitDeadline.getTime();
+      const skewMs = Math.abs(parsedDeadlineMs - explicitDeadlineMs);
+
+      if (!Number.isFinite(parsedDeadlineMs) || skewMs > 2 * 60 * 1000) {
+        parsed.deadlineIso = explicitDeadline.toISOString();
+      }
+    }
+
     return parsed;
   }
 
@@ -174,7 +216,15 @@ export class OllamaIntentParserService {
 
   private fallbackParse(input: string): ParsedIntent {
     const lower = input.toLowerCase();
-    const isSend = /\bsend\b/.test(lower);
+    let type: 'send' | 'swap';
+    if (/\bsend\b/i.test(input)) {
+      type = 'send';
+    } else if (/\bswap\b|\bexchange\b|\btrade\b/i.test(input)) {
+      type = 'swap';
+    } else {
+      type = 'swap';
+    }
+    const isSend = type === 'send';
     const explicitChain = this.extractChain(lower);
     const amount = lower.match(/\b(\d+(?:\.\d+)?)\s*(?:sepolia\s+)?(?:eth|weth|usdc|usdt|dai)\b/)?.[1]
       ?? lower.match(/(\d+(?:\.\d+)?)/)?.[1]
@@ -187,7 +237,6 @@ export class OllamaIntentParserService {
     const explicitToken = lower.match(/\b(?:sepolia\s+)?(eth|weth|usdc|usdt|dai)\b/)?.[1];
     const fromToken = tokenPair?.[1]?.toUpperCase() ?? explicitToken?.toUpperCase() ?? 'ETH';
     const toToken = tokenPair?.[2]?.toUpperCase() ?? 'USDC';
-    const type = isSend ? 'send' : 'swap';
     const chain = explicitChain ?? (type === 'swap' ? 'ethereum' : 'sepolia');
 
     return parsedIntentSchema.parse({
@@ -208,17 +257,34 @@ export class OllamaIntentParserService {
   }
 
   private extractDeadline(input: string): Date {
-    const minuteMatch = input.match(/\b(?:next|in|within)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+minutes?\b/);
-    if (minuteMatch) {
-      return new Date(Date.now() + this.numberWordToNumber(minuteMatch[1]) * 60 * 1000);
-    }
-
-    const hourMatch = input.match(/\b(?:next|in|within)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+hours?\b/);
-    if (hourMatch) {
-      return new Date(Date.now() + this.numberWordToNumber(hourMatch[1]) * 60 * 60 * 1000);
+    const explicitDeadline = this.extractExplicitDeadline(input);
+    if (explicitDeadline) {
+      return explicitDeadline;
     }
 
     return new Date(Date.now() + 6 * 60 * 60 * 1000);
+  }
+
+  private extractExplicitDeadline(input: string): Date | null {
+    const durationMatch =
+      input.match(
+        /in\s+(?:the\s+)?next\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*(minute|minutes|min|hour|hours|hr)/i,
+      ) ??
+      input.match(
+        /in\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*(minute|minutes|min|hour|hours|hr)/i,
+      ) ??
+      input.match(
+        /within\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*(minute|minutes|min|hour|hours|hr)/i,
+      );
+
+    if (durationMatch) {
+      const amount = this.numberWordToNumber(durationMatch[1]);
+      const unit = durationMatch[2].toLowerCase();
+      const minutes = unit.startsWith('h') ? amount * 60 : amount;
+      return new Date(Date.now() + minutes * 60 * 1000);
+    }
+
+    return null;
   }
 
   private extractRepeatCount(input: string): number {

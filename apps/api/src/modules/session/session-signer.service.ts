@@ -5,7 +5,16 @@ import axios, { AxiosError, AxiosResponse } from 'axios';
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
 import { ethers } from 'ethers';
 import { Repository } from 'typeorm';
-import { Chain, createWalletClient, encodeFunctionData, http, parseAbi, parseEther } from 'viem';
+import {
+  Chain,
+  createWalletClient,
+  decodeEventLog,
+  encodeFunctionData,
+  formatEther,
+  http,
+  parseAbi,
+  parseEther,
+} from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { mainnet, sepolia } from 'viem/chains';
 import { IntentRecord } from '../intents/intent.types';
@@ -19,14 +28,27 @@ import { WhenCheapWallet } from './wallet.entity';
 
 const SESSION_ABI = [
   'function canExecute(address wallet, uint256 feeWei) view returns (bool)',
+  'function sessions(address wallet) view returns (uint256 maxFeePerTxWei, uint256 maxTotalSpendWei, uint256 spentWei, uint256 expiresAt)',
   'function recordSpend(address wallet, uint256 feeWei)',
   'function authorize(uint256 maxFeePerTxWei, uint256 maxTotalSpendWei, uint256 durationSeconds)',
   'function revokeSession()',
   'function execute(address to, uint256 value, bytes data)',
   'function agentAddress() view returns (address)',
+  'function treasury() view returns (address)',
+  'function feeBps() view returns (uint16)',
+  'function agentFeeSplit() view returns (uint16)',
+  'function feeForAmount(uint256 value) view returns (uint256)',
+  'function netAfterFee(uint256 value) view returns (uint256)',
+  'function agentFeeForAmount(uint256 value) view returns (uint256)',
+  'function treasuryFeeForAmount(uint256 value) view returns (uint256)',
 ];
 
-const SESSION_VIEM_ABI = parseAbi(SESSION_ABI);
+const SESSION_EVENT_ABI = [
+  'event FeeCollected(address indexed recipient, uint256 feeWei, uint256 totalValue, string feeType)',
+  'event FeeCollectionFailed(address indexed recipient, uint256 feeWei)',
+] as const;
+
+const SESSION_VIEM_ABI = parseAbi([...SESSION_ABI, ...SESSION_EVENT_ABI]);
 const WHEN_CHEAP_SESSION_EXECUTE_ABI = [
   {
     type: 'function',
@@ -43,11 +65,40 @@ const WHEN_CHEAP_SESSION_EXECUTE_ABI = [
 const ERC20_ABI = [
   'function balanceOf(address owner) view returns (uint256)',
 ];
+const WETH_ABI = [
+  'function deposit() payable',
+] as const;
+const SWAP_ROUTER_ABI = [
+  {
+    type: 'function',
+    name: 'exactInputSingle',
+    stateMutability: 'payable',
+    inputs: [
+      {
+        name: 'params',
+        type: 'tuple',
+        components: [
+          { name: 'tokenIn', type: 'address' },
+          { name: 'tokenOut', type: 'address' },
+          { name: 'fee', type: 'uint24' },
+          { name: 'recipient', type: 'address' },
+          { name: 'deadline', type: 'uint256' },
+          { name: 'amountIn', type: 'uint256' },
+          { name: 'amountOutMinimum', type: 'uint256' },
+          { name: 'sqrtPriceLimitX96', type: 'uint160' },
+        ],
+      },
+    ],
+    outputs: [{ name: 'amountOut', type: 'uint256' }],
+  },
+] as const;
 
 const GAS_UNITS = { send: 21_000, swap: 150_000 } as const;
 const SEPOLIA_CHAIN_ID = 11155111;
 const UNISWAP_NATIVE_ETH = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
 const MAINNET_CHAIN_ID = 1;
+const SWAP_ROUTER_SEPOLIA = '0x8B844f885672f333Bc0042cB669255f93a4C1E6b';
+const SEPOLIA_UNISWAP_V3_POOL_FEE = 3000;
 const MAINNET_TOKENS: Record<string, { address: string; decimals: number; symbol: string }> = {
   ETH: { address: UNISWAP_NATIVE_ETH, decimals: 18, symbol: 'ETH' },
   WETH: {
@@ -491,6 +542,38 @@ export class SessionSignerService implements OnModuleInit {
     }
   }
 
+  async getSessionPermission(
+    wallet: string,
+    chain = 'sepolia',
+  ): Promise<{
+    maxFeePerTxWei: bigint;
+    maxTotalSpendWei: bigint;
+    spentWei: bigint;
+    expiresAt: bigint;
+  } | null> {
+    const sessionContract = this.getSessionContract(chain);
+    if (!sessionContract) return null;
+
+    try {
+      const session = await sessionContract.sessions(wallet) as readonly [
+        bigint,
+        bigint,
+        bigint,
+        bigint,
+      ];
+
+      return {
+        maxFeePerTxWei: session[0],
+        maxTotalSpendWei: session[1],
+        spentWei: session[2],
+        expiresAt: session[3],
+      };
+    } catch (err) {
+      this.logger.warn(`sessions() check failed for ${wallet} on ${chain}: ${String(err)}`);
+      return null;
+    }
+  }
+
   /**
    * Broadcasts a transaction directly from the agent wallet.
    *
@@ -544,16 +627,6 @@ export class SessionSignerService implements OnModuleInit {
       await this.ensureAgentWalletBalance(intent, chainConfig);
     }
 
-    const authorizeHash = await userClient.writeContract({
-      address: sessionContractAddress,
-      abi: SESSION_VIEM_ABI,
-      functionName: 'authorize',
-      args: [parseEther('0.001'), parseEther('0.01'), 86400n],
-      chain: chainConfig.viemChain,
-      account: userAccount,
-    });
-    await provider.waitForTransaction(authorizeHash, 1);
-
     const freshNonce = await provider.getTransactionCount(userAccount.address, 'latest');
     const signedAuth = await (
       userClient as unknown as {
@@ -575,12 +648,18 @@ export class SessionSignerService implements OnModuleInit {
     });
 
     const execution = await this.buildExecutionTransaction(intent, userAccount.address);
+    const outerTxValue =
+      execution.sessionValueWei !== undefined
+        ? execution.sessionValueWei
+        : intent.parsed.type === 'swap'
+        ? await this.grossUpForSessionFee(execution.value, intent.parsed.chain ?? 'sepolia')
+        : parseEther(String(intent.parsed.amount));
     const executeCalldata = encodeFunctionData({
       abi: WHEN_CHEAP_SESSION_EXECUTE_ABI,
       functionName: 'execute',
       args: [
         execution.to as `0x${string}`,
-        execution.value,
+        outerTxValue,
         execution.data as `0x${string}`,
       ],
     });
@@ -599,9 +678,26 @@ export class SessionSignerService implements OnModuleInit {
       authorizationList: [signedAuth],
       to: userAccount.address,
       data: executeCalldata,
-      value: parseEther(String(intent.parsed.amount)),
-      gas: 200_000n,
+      value: outerTxValue,
+      gas: intent.parsed.type === 'swap' ? 500_000n : 200_000n,
     });
+  }
+
+  async executeSwap(intent: IntentRecord): Promise<string> {
+    const wallet = await this.getWalletByAddress(intent.wallet);
+    if (!wallet) {
+      throw new Error(
+        `No encrypted wallet found for ${intent.wallet}. User must register a WhenCheap wallet first.`,
+      );
+    }
+
+    this.logger.log(
+      `Executing managed-wallet swap for ${intent.wallet}: ` +
+        `${intent.parsed.amount} ${intent.parsed.fromToken} -> ${intent.parsed.toToken ?? 'USDC'} ` +
+        `on ${intent.parsed.chain ?? 'sepolia'}`,
+    );
+
+    return this.broadcastWithUserWallet(intent, this.serializeStoredWallet(wallet));
   }
 
   private async broadcastAgentWalletExecution(
@@ -813,6 +909,106 @@ export class SessionSignerService implements OnModuleInit {
     return tx.hash as string;
   }
 
+  async ensureManagedWalletHasRequiredBalance(
+    userWalletAddress: string,
+    intentAmount: string,
+    baseFeeGwei: number,
+    type: 'send' | 'swap',
+    chain = 'sepolia',
+  ): Promise<void> {
+    const wallet = await this.getWalletByAddress(userWalletAddress);
+    if (!wallet) {
+      return;
+    }
+
+    const amountWei = parseEther(intentAmount);
+    const gasBufferWei = this.estimateFeeWei(baseFeeGwei, type, chain);
+    const valueToSendWei =
+      type === 'swap'
+        ? await this.grossUpForSessionFee(amountWei, chain)
+        : amountWei;
+    const feeWei =
+      type === 'swap'
+        ? valueToSendWei - amountWei
+        : await this.getPlatformFeeWei(amountWei, chain);
+    const requiredWei = valueToSendWei + gasBufferWei;
+    const availableWei = await this.getProviderForChain(chain).getBalance(userWalletAddress);
+
+    if (availableWei < requiredWei) {
+      throw new BadRequestException(
+        `Insufficient balance in managed wallet. Required: ${formatEther(requiredWei)} ETH, ` +
+          `Available: ${formatEther(availableWei)} ETH`,
+      );
+    }
+  }
+
+  async getPlatformFeeWei(valueWei: bigint, chain = 'sepolia'): Promise<bigint> {
+    const sessionContract = this.getSessionContract(chain);
+    if (!sessionContract) {
+      return 0n;
+    }
+
+    try {
+      return (await sessionContract.feeForAmount(valueWei)) as bigint;
+    } catch (err) {
+      this.logger.warn(`feeForAmount check failed on ${chain}: ${String(err)}`);
+      return 0n;
+    }
+  }
+
+  decodeFeeCollectionFromReceipt(receipt: ethers.TransactionReceipt): Array<{
+    recipient: string;
+    feeWei: string;
+    totalValue: string;
+    netAmount: string;
+    feeType: string;
+  }> {
+    const feeEvents: Array<{
+      recipient: string;
+      feeWei: string;
+      totalValue: string;
+      netAmount: string;
+      feeType: string;
+    }> = [];
+
+    for (const log of receipt.logs) {
+      try {
+        const decoded = decodeEventLog({
+          abi: SESSION_VIEM_ABI,
+          data: log.data as `0x${string}`,
+          topics: log.topics as [`0x${string}`, ...`0x${string}`[]],
+        });
+
+        if (decoded.eventName !== 'FeeCollected') {
+          continue;
+        }
+
+        const args = decoded.args as unknown as {
+          recipient: string;
+          feeWei: bigint;
+          totalValue: bigint;
+          feeType: string;
+        };
+        const recipient = args.recipient;
+        const feeWei = args.feeWei;
+        const totalValue = args.totalValue;
+        const feeType = args.feeType;
+
+        feeEvents.push({
+          recipient,
+          feeWei: feeWei.toString(),
+          totalValue: totalValue.toString(),
+          netAmount: (totalValue - feeWei).toString(),
+          feeType,
+        });
+      } catch {
+        continue;
+      }
+    }
+
+    return feeEvents;
+  }
+
   estimateFeeWei(
     baseFeeGwei: number,
     type: 'send' | 'swap' = 'send',
@@ -961,7 +1157,13 @@ export class SessionSignerService implements OnModuleInit {
   private async buildExecutionTransaction(
     intent: IntentRecord,
     swapper: string,
-  ): Promise<{ to: `0x${string}`; data: `0x${string}`; value: bigint; gasLimit?: bigint }> {
+  ): Promise<{
+    to: `0x${string}`;
+    data: `0x${string}`;
+    value: bigint;
+    gasLimit?: bigint;
+    sessionValueWei?: bigint;
+  }> {
     if (intent.parsed.type === 'send') {
       const recipient = this.getRecipient(intent);
       return {
@@ -986,7 +1188,13 @@ export class SessionSignerService implements OnModuleInit {
   private async buildSwapTransaction(
     intent: IntentRecord,
     swapper: string,
-  ): Promise<{ to: `0x${string}`; data: `0x${string}`; value: bigint; gasLimit?: bigint }> {
+  ): Promise<{
+    to: `0x${string}`;
+    data: `0x${string}`;
+    value: bigint;
+    gasLimit?: bigint;
+    sessionValueWei?: bigint;
+  }> {
     const chain = intent.parsed.chain ?? 'sepolia';
     const chainConfig = this.getChainConfig(chain);
     const tokenIn = this.resolveToken(intent.parsed.fromToken, chain);
@@ -1024,6 +1232,10 @@ export class SessionSignerService implements OnModuleInit {
         { headers, timeout: 20_000 },
       );
     } catch (err) {
+      if (this.shouldUseDirectSepoliaSwapFallback(err, chain)) {
+        return this.buildDirectSepoliaSwapTransaction(intent);
+      }
+
       if (err instanceof AxiosError) {
         const status = err.response?.status;
         const body = JSON.stringify(err.response?.data ?? {});
@@ -1068,6 +1280,10 @@ export class SessionSignerService implements OnModuleInit {
         { headers, timeout: 20_000 },
       );
     } catch (err) {
+      if (this.shouldUseDirectSepoliaSwapFallback(err, chain)) {
+        return this.buildDirectSepoliaSwapTransaction(intent);
+      }
+
       if (err instanceof AxiosError) {
         const status = err.response?.status;
         const body = JSON.stringify(err.response?.data ?? {});
@@ -1082,12 +1298,126 @@ export class SessionSignerService implements OnModuleInit {
       throw new Error('Uniswap /swap response did not include executable calldata');
     }
 
+    const quotedOutputAmount = (
+      quoteResponse.data.quote as { output?: { amount?: string }; routeString?: string } | undefined
+    )?.output?.amount;
+    const routeString = (
+      quoteResponse.data.quote as { output?: { amount?: string }; routeString?: string } | undefined
+    )?.routeString;
+
+    this.logger.log(
+      `Uniswap swap prepared for ${intent.wallet}: ` +
+        `${intent.parsed.amount} ${tokenIn.symbol} -> ${quotedOutputAmount ?? '?'} ${tokenOut.symbol}. ` +
+        `Router: ${swap.to}. Route: ${routeString ?? quoteResponse.data.routing ?? 'unknown'}`,
+    );
+
     return {
       to: swap.to as `0x${string}`,
       data: swap.data as `0x${string}`,
       value: BigInt(swap.value ?? '0'),
       gasLimit: swap.gasLimit ? BigInt(swap.gasLimit) : BigInt(GAS_UNITS.swap),
     };
+  }
+
+  private shouldUseDirectSepoliaSwapFallback(error: unknown, chain: string): boolean {
+    if (this.normalizeChain(chain) !== 'sepolia') {
+      return false;
+    }
+
+    if (!(error instanceof AxiosError)) {
+      return false;
+    }
+
+    const status = error.response?.status;
+    const body = JSON.stringify(error.response?.data ?? {});
+    return status === 404 || body.includes('NO_ROUTE');
+  }
+
+  private buildDirectSepoliaSwapTransaction(
+    intent: IntentRecord,
+  ): {
+    to: `0x${string}`;
+    data: `0x${string}`;
+    value: bigint;
+    gasLimit?: bigint;
+    sessionValueWei?: bigint;
+  } {
+    const chain = intent.parsed.chain ?? 'sepolia';
+    const swapAmount = parseEther(String(intent.parsed.amount));
+    const fromToken = intent.parsed.fromToken.trim().toUpperCase();
+    const toToken = (intent.parsed.toToken ?? 'USDC').trim().toUpperCase();
+
+    if (this.normalizeChain(chain) !== 'sepolia') {
+      throw new Error('Direct SwapRouter02 fallback is only supported on Sepolia.');
+    }
+
+    if (fromToken !== 'ETH') {
+      throw new Error(
+        `Swap from ${intent.parsed.fromToken} to ${intent.parsed.toToken ?? 'USDC'} not supported on Sepolia. ` +
+          'Use ETH->USDC or ETH->WETH, or switch to mainnet.',
+      );
+    }
+
+    if (toToken === 'USDC') {
+      this.logger.warn(
+        `Trade API failed on Sepolia, using direct SwapRouter02 fallback for ${intent.wallet}.`,
+      );
+
+      const totalFee = (swapAmount * BigInt(30)) / 10_000n;
+      const totalValue = swapAmount + totalFee;
+      const deadline = BigInt(Math.floor(Date.now() / 1000) + 1800);
+
+      const swapCalldata = encodeFunctionData({
+        abi: SWAP_ROUTER_ABI,
+        functionName: 'exactInputSingle',
+        args: [
+          {
+            tokenIn: SEPOLIA_TOKENS.WETH.address as `0x${string}`,
+            tokenOut: SEPOLIA_TOKENS.USDC.address as `0x${string}`,
+            fee: SEPOLIA_UNISWAP_V3_POOL_FEE,
+            recipient: intent.wallet as `0x${string}`,
+            deadline,
+            amountIn: swapAmount,
+            amountOutMinimum: 0n,
+            sqrtPriceLimitX96: 0n,
+          },
+        ],
+      });
+
+      return {
+        to: SWAP_ROUTER_SEPOLIA as `0x${string}`,
+        data: swapCalldata,
+        value: swapAmount,
+        gasLimit: 300_000n,
+        sessionValueWei: totalValue,
+      };
+    }
+
+    if (toToken === 'WETH') {
+      this.logger.warn(
+        `Trade API failed on Sepolia, using direct WETH wrap fallback for ${intent.wallet}.`,
+      );
+
+      const totalFee = (swapAmount * BigInt(30)) / 10_000n;
+      const totalValue = swapAmount + totalFee;
+
+      return {
+        to: SEPOLIA_TOKENS.WETH.address as `0x${string}`,
+        data: encodeFunctionData({
+          abi: WETH_ABI,
+          functionName: 'deposit',
+          args: [],
+        }),
+        value: swapAmount,
+        gasLimit: 100_000n,
+        sessionValueWei: totalValue,
+      };
+    }
+
+    throw new Error(
+      `Swap from ${intent.parsed.fromToken} to ${intent.parsed.toToken ?? 'USDC'} not supported on Sepolia. ` +
+        'Use ETH->USDC or ETH->WETH, or switch to mainnet.',
+    );
   }
 
   private resolveToken(symbol: string, chain: string): { address: string; decimals: number; symbol: string } {
@@ -1103,6 +1433,32 @@ export class SessionSignerService implements OnModuleInit {
     }
 
     return token;
+  }
+
+  private async grossUpForSessionFee(netValueWei: bigint, chain = 'sepolia'): Promise<bigint> {
+    const sessionContract = this.getSessionContract(chain);
+    if (!sessionContract || netValueWei === 0n) {
+      return netValueWei;
+    }
+
+    try {
+      const feeBps = BigInt((await sessionContract.feeBps()) as number);
+      if (feeBps === 0n) {
+        return netValueWei;
+      }
+
+      const denominator = 10_000n - feeBps;
+      let gross = (netValueWei * 10_000n + denominator - 1n) / denominator;
+
+      while (gross - ((gross * feeBps) / 10_000n) < netValueWei) {
+        gross += 1n;
+      }
+
+      return gross;
+    } catch (err) {
+      this.logger.warn(`Could not gross up fee for ${chain}: ${String(err)}`);
+      return netValueWei;
+    }
   }
 
   private getChainConfig(chain: string): {
@@ -1405,6 +1761,7 @@ export class SessionSignerService implements OnModuleInit {
     let response: AxiosResponse<Record<string, unknown>>;
     try {
       response = await axios.get('https://oauth2.googleapis.com/tokeninfo', {
+        family: 4,
         params: { id_token: credential },
         timeout: 15_000,
       });

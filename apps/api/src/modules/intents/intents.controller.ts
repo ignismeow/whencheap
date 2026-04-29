@@ -71,6 +71,16 @@ export class IntentsController {
     return this.intents.testEip7702(dto);
   }
 
+  @Get('session/status/:wallet')
+  async getSessionStatus(
+    @Param('wallet') wallet: string,
+    @Query('chain') chain?: string,
+    @Query('type') type?: string,
+  ) {
+    const normalizedType = type === 'swap' ? 'swap' : 'send';
+    return await this.intents.getSessionStatus(wallet, chain ?? 'sepolia', normalizedType);
+  }
+
   @Post(':id/cancel')
   cancel(@Param('id') id: string) {
     return this.intents.cancel(id);

@@ -82,6 +82,178 @@ textarea::placeholder {
   background-size: 32px 32px, 32px 32px, auto;
 }
 
+.hero-gateway {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--bg-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+}
+
+.hero-header {
+  position: absolute;
+  inset: 22px 28px auto 28px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.hero-grid {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(90deg, rgba(255, 69, 0, 0.12) 1px, transparent 1px),
+    linear-gradient(rgba(255, 69, 0, 0.12) 1px, transparent 1px);
+  background-size: 44px 44px;
+  transform: perspective(900px) rotateX(76deg) scale(2.4) translateY(18%);
+  transform-origin: center center;
+  opacity: 0.65;
+  mask-image: radial-gradient(circle at center, rgba(0, 0, 0, 1) 0%, rgba(0, 0, 0, 0) 72%);
+  -webkit-mask-image: radial-gradient(circle at center, rgba(0, 0, 0, 1) 0%, rgba(0, 0, 0, 0) 72%);
+  animation: grid-flicker 6s linear infinite;
+}
+
+.hero-scanline {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 22%;
+  background: linear-gradient(90deg, transparent 0%, rgba(255, 69, 0, 0.08) 50%, transparent 100%);
+  opacity: 0.1;
+  mix-blend-mode: screen;
+  animation: hero-scan 5s linear infinite;
+}
+
+.hero-core {
+  position: absolute;
+  inset: 50% auto auto 50%;
+  transform: translate(-50%, -50%);
+  width: min(48vw, 520px);
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.hero-core::before,
+.hero-core::after {
+  content: '';
+  position: absolute;
+  border: 1px solid rgba(255, 69, 0, 0.45);
+  inset: 18%;
+  transform: rotate(45deg);
+}
+
+.hero-core::after {
+  inset: 6%;
+  border-color: rgba(255, 69, 0, 0.18);
+  animation: pulse-rotate 10s linear infinite;
+}
+
+.hero-pulse {
+  width: 34%;
+  aspect-ratio: 1;
+  border: 1px solid rgba(255, 69, 0, 0.95);
+  box-shadow:
+    0 0 18px rgba(255, 69, 0, 0.2),
+    inset 0 0 22px rgba(255, 69, 0, 0.16);
+  transform: rotate(45deg);
+  animation: pulse-flicker 2.8s steps(6, end) infinite;
+}
+
+.hero-content {
+  position: relative;
+  z-index: 2;
+  width: 100%;
+  max-width: 900px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.hero-title {
+  position: relative;
+  margin: 0;
+  font-size: clamp(2.8rem, 7vw, 6rem);
+  line-height: 0.95;
+  text-transform: uppercase;
+  color: var(--color-text);
+  letter-spacing: -0.05em;
+}
+
+.hero-title::before,
+.hero-title::after {
+  content: 'Defi Intent-based automation';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+}
+
+.hero-title::before {
+  color: rgba(255, 69, 0, 0.8);
+  transform: translate(2px, 0);
+  animation: glitch-line 4s infinite;
+}
+
+.hero-title::after {
+  color: rgba(255, 59, 48, 0.7);
+  transform: translate(-2px, 0);
+  animation: glitch-line 4s infinite reverse;
+}
+
+.hero-launch-button {
+  position: relative;
+  border: 1px solid var(--accent-primary);
+  background: transparent;
+  color: var(--color-text);
+  padding: 14px 22px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  font-size: 12px;
+}
+
+.hero-launch-button::before,
+.hero-launch-button::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border: 1px solid transparent;
+  pointer-events: none;
+  opacity: 0;
+}
+
+.hero-launch-button::before {
+  border-color: rgba(255, 69, 0, 0.65);
+  transform: translate(2px, -1px);
+  animation: button-glitch 3s infinite;
+}
+
+.hero-launch-button::after {
+  border-color: rgba(255, 59, 48, 0.45);
+  transform: translate(-2px, 1px);
+  animation: button-glitch 3s infinite reverse;
+}
+
+.hero-launch-button:hover:not(:disabled),
+.hero-launch-button:focus-visible:not(:disabled) {
+  background: var(--accent-primary);
+  color: #000;
+  outline: none;
+}
+
+.hero-launch-button:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
 .console-header {
   position: fixed;
   inset: 0 0 auto 0;
@@ -410,6 +582,81 @@ h6 {
   }
 }
 
+@keyframes hero-scan {
+  from {
+    transform: translateX(-30%);
+  }
+  to {
+    transform: translateX(530%);
+  }
+}
+
+@keyframes grid-flicker {
+  0%, 100% {
+    opacity: 0.62;
+  }
+  48% {
+    opacity: 0.68;
+  }
+  50% {
+    opacity: 0.56;
+  }
+  52% {
+    opacity: 0.7;
+  }
+}
+
+@keyframes pulse-flicker {
+  0%, 100% {
+    opacity: 1;
+  }
+  45% {
+    opacity: 0.82;
+  }
+  50% {
+    opacity: 0.56;
+  }
+  55% {
+    opacity: 0.9;
+  }
+}
+
+@keyframes pulse-rotate {
+  from {
+    transform: rotate(45deg);
+  }
+  to {
+    transform: rotate(405deg);
+  }
+}
+
+@keyframes glitch-line {
+  0%, 92%, 100% {
+    opacity: 0;
+    clip-path: inset(0 0 100% 0);
+  }
+  93% {
+    opacity: 1;
+    clip-path: inset(18% 0 54% 0);
+  }
+  95% {
+    opacity: 0.5;
+    clip-path: inset(64% 0 10% 0);
+  }
+}
+
+@keyframes button-glitch {
+  0%, 92%, 100% {
+    opacity: 0;
+  }
+  93% {
+    opacity: 0.9;
+  }
+  95% {
+    opacity: 0.3;
+  }
+}
+
 @media (max-width: 1279px) {
   body {
     overflow: auto;
@@ -428,6 +675,14 @@ h6 {
 
   .console-main {
     overflow: visible;
+  }
+
+  .hero-header {
+    inset: 18px 18px auto 18px;
+  }
+
+  .hero-core {
+    width: min(72vw, 380px);
   }
 }
 
