@@ -1,0 +1,6 @@
+[submodule "contracts/lib/openzeppelin-community-contracts"]
+	path = contracts/lib/openzeppelin-community-contracts
+	url = https://github.com/OpenZeppelin/openzeppelin-community-contracts
+[submodule "contracts/lib/openzeppelin-contracts"]
+	path = contracts/lib/openzeppelin-contracts
+	url = https://github.com/OpenZeppelin/openzeppelin-contracts
