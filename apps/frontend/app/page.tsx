@@ -845,11 +845,13 @@ function SessionCard({
 
   const onChainFeeBps = typeof feeBpsData === 'bigint' ? Number(feeBpsData) : Number(EXECUTION_FEE_BPS);
   const onChainFeeWei =
-    typeof feeForAmountData === 'bigint'
-      ? feeForAmountData
-      : draftIntentEstimate?.feeWei ?? 0n;
+    draftIntentEstimate?.type === 'swap'
+      ? (draftIntentEstimate?.feeWei ?? 0n)
+      : typeof feeForAmountData === 'bigint'
+        ? feeForAmountData
+        : draftIntentEstimate?.feeWei ?? 0n;
   const draftTotalWei = draftIntentEstimate
-    ? draftIntentEstimate.amountWei + draftIntentEstimate.gasEstimateWei + onChainFeeWei
+    ? draftIntentEstimate.amountWei + onChainFeeWei + draftIntentEstimate.gasEstimateWei
     : 0n;
 
   return (
@@ -1028,14 +1030,25 @@ function SessionCard({
                   For {draftIntentEstimate.amount} {draftIntentEstimate.fromToken} {draftIntentEstimate.type} intent:
                 </p>
                 <div className="mt-3 grid gap-[1px] bg-[var(--color-border)]">
-                  <InfoRow label="Amount" value={`${formatEthFixed(draftIntentEstimate.amountWei)} ETH`} />
+                  <InfoRow
+                    label={draftIntentEstimate.type === 'swap' ? 'Swap amount' : 'Amount'}
+                    value={`${formatEthFixed(draftIntentEstimate.amountWei)} ETH`}
+                  />
                   <InfoRow label="Gas est" value={`${formatEthFixed(draftIntentEstimate.gasEstimateWei)} ETH`} />
                   <InfoRow
-                    label={`Fee (${(onChainFeeBps / 100).toFixed(1)}%)`}
+                    label={`Platform fee (${(onChainFeeBps / 100).toFixed(1)}%)`}
                     value={`${formatEthFixed(onChainFeeWei)} ETH`}
                   />
-                  <InfoRow label="Total" value={`${formatEthFixed(draftTotalWei)} ETH`} />
+                  <InfoRow
+                    label={draftIntentEstimate.type === 'swap' ? 'Total charged' : 'Total'}
+                    value={`${formatEthFixed(draftTotalWei)} ETH`}
+                  />
                 </div>
+                {draftIntentEstimate.type === 'swap' ? (
+                  <p className="mt-3 text-[11px] normal-case tracking-normal text-[var(--color-muted)]">
+                    You will receive the output for exactly {draftIntentEstimate.amount} {draftIntentEstimate.fromToken} swapped, plus gas is charged separately.
+                  </p>
+                ) : null}
               </>
             ) : (
               <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">

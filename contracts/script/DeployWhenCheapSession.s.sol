@@ -10,8 +10,15 @@ contract DeployWhenCheapSession is Script {
         address treasury = vm.envAddress("TREASURY_ADDRESS");
         uint16 feeBps = uint16(vm.envUint("FEE_BPS"));
         uint16 agentFeeSplit = uint16(vm.envUint("AGENT_FEE_SPLIT"));
+        address universalRouter = vm.envAddress("UNIVERSAL_ROUTER");
         vm.startBroadcast();
-        deployed = new WhenCheapSession(agentAddress, treasury, feeBps, agentFeeSplit);
+        deployed = new WhenCheapSession(
+            agentAddress,
+            treasury,
+            feeBps,
+            agentFeeSplit,
+            universalRouter
+        );
         vm.stopBroadcast();
     }
 }

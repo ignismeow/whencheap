@@ -4,6 +4,49 @@ pragma solidity ^0.8.24;
 import "forge-std/Test.sol";
 import "../src/WhenCheapSession.sol";
 
+contract MockUniversalRouter {
+    bytes public lastCommands;
+    bytes[] public lastInputs;
+    uint256 public lastDeadline;
+    uint256 public lastValue;
+
+    function execute(
+        bytes calldata commands,
+        bytes[] calldata inputs,
+        uint256 deadline
+    ) external payable {
+        lastCommands = commands;
+        delete lastInputs;
+        for (uint256 i = 0; i < inputs.length; i++) {
+            lastInputs.push(inputs[i]);
+        }
+        lastDeadline = deadline;
+        lastValue = msg.value;
+    }
+}
+
+contract MockERC20 {
+    mapping(address => uint256) public balanceOf;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function transferFrom(address from, address to, uint256 amount)
+        external
+        returns (bool)
+    {
+        require(balanceOf[from] >= amount, "insufficient");
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function approve(address, uint256) external pure returns (bool) {
+        return true;
+    }
+}
+
 contract BatchReceiver {
     uint256 public count;
 
@@ -21,6 +64,8 @@ contract BatchReverter {
 contract WhenCheapSessionTest is Test {
     WhenCheapSession private session;
     WhenCheapSession private zeroFeeSession;
+    MockUniversalRouter private universalRouter;
+    MockERC20 private token;
     BatchReceiver private receiver;
     BatchReverter private reverter;
 
@@ -30,8 +75,22 @@ contract WhenCheapSessionTest is Test {
     address private recipient = address(0xBEEF);
 
     function setUp() public {
-        session = new WhenCheapSession(agent, treasury, 30, 50);
-        zeroFeeSession = new WhenCheapSession(agent, treasury, 0, 50);
+        universalRouter = new MockUniversalRouter();
+        token = new MockERC20();
+        session = new WhenCheapSession(
+            agent,
+            treasury,
+            30,
+            50,
+            address(universalRouter)
+        );
+        zeroFeeSession = new WhenCheapSession(
+            agent,
+            treasury,
+            0,
+            50,
+            address(universalRouter)
+        );
         receiver = new BatchReceiver();
         reverter = new BatchReverter();
     }
@@ -67,19 +126,17 @@ contract WhenCheapSessionTest is Test {
 
     function testConstructorRevertsWhenFeeTooHigh() public {
         vm.expectRevert(WhenCheapSession.InvalidFee.selector);
-        new WhenCheapSession(agent, treasury, 1001, 50);
+        new WhenCheapSession(agent, treasury, 1001, 50, address(universalRouter));
     }
 
     function testConstructorRevertsWhenAgentSplitTooHigh() public {
         vm.expectRevert(WhenCheapSession.InvalidFee.selector);
-        new WhenCheapSession(agent, treasury, 30, 101);
+        new WhenCheapSession(agent, treasury, 30, 101, address(universalRouter));
     }
 
     function testCanExecuteReturnsFalseAfterExpiry() public {
         _authorizeDefaultSession();
-
         vm.warp(block.timestamp + 2 hours);
-
         assertFalse(session.canExecute(wallet, 0.5 ether));
     }
 
@@ -129,6 +186,14 @@ contract WhenCheapSessionTest is Test {
 
     function testFeeForAmountReturnsExpectedValue() public view {
         assertEq(session.feeForAmount(1 ether), 0.003 ether);
+    }
+
+    function testSwapFeeForAmountReturnsExpectedValue() public view {
+        assertEq(session.swapFeeForAmount(1 ether), 0.003 ether);
+    }
+
+    function testNetSwapAmountReturnsExpectedValue() public view {
+        assertEq(session.netSwapAmount(1 ether), 0.997 ether);
     }
 
     function testAgentFeeForAmountReturnsExpectedValue() public view {
@@ -219,6 +284,84 @@ contract WhenCheapSessionTest is Test {
 
         assertEq(receiver.count(), 0);
         assertEq(treasury.balance - treasuryBefore, 0);
+    }
+
+    function testSwapExecutesUniversalRouterAndCollectsFee() public {
+        vm.deal(agent, 2 ether);
+
+        bytes[] memory inputs = new bytes[](2);
+        inputs[0] = hex"1111";
+        inputs[1] = hex"2222";
+        uint256 deadline = block.timestamp + 30 minutes;
+
+        uint256 treasuryBefore = treasury.balance;
+        uint256 agentBefore = agent.balance;
+
+        vm.expectEmit(true, true, false, true);
+        emit WhenCheapSession.SwapExecuted(
+            address(session),
+            address(universalRouter),
+            1 ether,
+            0.003 ether,
+            0.997 ether
+        );
+
+        vm.prank(agent);
+        session.swap{value: 1 ether}(hex"0b00", inputs, deadline, 1 ether);
+
+        assertEq(universalRouter.lastValue(), 0.997 ether);
+        assertEq(universalRouter.lastDeadline(), deadline);
+        assertEq(universalRouter.lastCommands(), hex"0b00");
+        assertEq(keccak256(universalRouter.lastInputs(0)), keccak256(inputs[0]));
+        assertEq(keccak256(universalRouter.lastInputs(1)), keccak256(inputs[1]));
+        assertEq(treasury.balance - treasuryBefore, 0.0015 ether);
+        assertEq(agent.balance, agentBefore - 1 ether + 0.0015 ether);
+    }
+
+    function testSwapRevertsDeadlinePassed() public {
+        vm.deal(agent, 1 ether);
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = hex"1234";
+
+        vm.expectRevert(WhenCheapSession.DeadlinePassed.selector);
+        vm.prank(agent);
+        session.swap{value: 1 ether}(hex"0b00", inputs, block.timestamp - 1, 1 ether);
+    }
+
+    function testSwapRevertsOnlyAgent() public {
+        vm.deal(wallet, 1 ether);
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = hex"1234";
+
+        vm.expectRevert(WhenCheapSession.OnlyAgent.selector);
+        vm.prank(wallet);
+        session.swap{value: 1 ether}(hex"0b00", inputs, block.timestamp + 1, 1 ether);
+    }
+
+    function testSwapRevertsInsufficientValue() public {
+        vm.deal(agent, 1 ether);
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = hex"1234";
+
+        vm.expectRevert(WhenCheapSession.InsufficientValue.selector);
+        vm.prank(agent);
+        session.swap{value: 0.5 ether}(hex"0b00", inputs, block.timestamp + 1, 1 ether);
+    }
+
+    function testSwapTokenTransfersTokenToRouter() public {
+        token.mint(address(session), 5 ether);
+
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = hex"abcd";
+        uint256 deadline = block.timestamp + 30 minutes;
+
+        vm.prank(agent);
+        session.swapToken(address(token), 1 ether, hex"00", inputs, deadline);
+
+        assertEq(token.balanceOf(address(universalRouter)), 1 ether);
+        assertEq(universalRouter.lastDeadline(), deadline);
+        assertEq(universalRouter.lastValue(), 0);
+        assertEq(universalRouter.lastCommands(), hex"00");
     }
 
     function testRecordSpendCorrectlyDebitsSession() public {

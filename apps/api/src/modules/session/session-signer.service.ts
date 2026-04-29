@@ -39,6 +39,10 @@ const SESSION_ABI = [
   'function agentFeeSplit() view returns (uint16)',
   'function feeForAmount(uint256 value) view returns (uint256)',
   'function netAfterFee(uint256 value) view returns (uint256)',
+  'function swap(bytes commands, bytes[] inputs, uint256 deadline, uint256 swapAmount)',
+  'function swapToken(address tokenIn, uint256 amountIn, bytes commands, bytes[] inputs, uint256 deadline)',
+  'function swapFeeForAmount(uint256 amount) view returns (uint256)',
+  'function netSwapAmount(uint256 amount) view returns (uint256)',
   'function agentFeeForAmount(uint256 value) view returns (uint256)',
   'function treasuryFeeForAmount(uint256 value) view returns (uint256)',
 ];
@@ -62,34 +66,37 @@ const WHEN_CHEAP_SESSION_EXECUTE_ABI = [
     outputs: [],
   },
 ] as const;
+const WHEN_CHEAP_SESSION_SWAP_ABI = [
+  {
+    type: 'function',
+    name: 'swap',
+    stateMutability: 'payable',
+    inputs: [
+      { name: 'commands', type: 'bytes' },
+      { name: 'inputs', type: 'bytes[]' },
+      { name: 'deadline', type: 'uint256' },
+      { name: 'swapAmount', type: 'uint256' },
+    ],
+    outputs: [],
+  },
+] as const;
 const ERC20_ABI = [
   'function balanceOf(address owner) view returns (uint256)',
 ];
-const WETH_ABI = [
-  'function deposit() payable',
-] as const;
-const SWAP_ROUTER_ABI = [
+const UNIVERSAL_ROUTER_ABI = [
   {
     type: 'function',
-    name: 'exactInputSingle',
+    name: 'execute',
     stateMutability: 'payable',
     inputs: [
+      { name: 'commands', type: 'bytes' },
+      { name: 'inputs', type: 'bytes[]' },
       {
-        name: 'params',
-        type: 'tuple',
-        components: [
-          { name: 'tokenIn', type: 'address' },
-          { name: 'tokenOut', type: 'address' },
-          { name: 'fee', type: 'uint24' },
-          { name: 'recipient', type: 'address' },
-          { name: 'deadline', type: 'uint256' },
-          { name: 'amountIn', type: 'uint256' },
-          { name: 'amountOutMinimum', type: 'uint256' },
-          { name: 'sqrtPriceLimitX96', type: 'uint160' },
-        ],
+        name: 'deadline',
+        type: 'uint256',
       },
     ],
-    outputs: [{ name: 'amountOut', type: 'uint256' }],
+    outputs: [],
   },
 ] as const;
 
@@ -97,8 +104,31 @@ const GAS_UNITS = { send: 21_000, swap: 150_000 } as const;
 const SEPOLIA_CHAIN_ID = 11155111;
 const UNISWAP_NATIVE_ETH = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
 const MAINNET_CHAIN_ID = 1;
-const SWAP_ROUTER_SEPOLIA = '0x8B844f885672f333Bc0042cB669255f93a4C1E6b';
-const SEPOLIA_UNISWAP_V3_POOL_FEE = 3000;
+const UNIVERSAL_ROUTER_SEPOLIA = '0x8B844f885672f333Bc0042cB669255f93a4C1E6b';
+const UNIVERSAL_ROUTER_MAINNET = '0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD';
+const UNISWAP_V3_FACTORY_SEPOLIA = '0x0227628f3F023bb0B980b67D528571c95c6DaC1c';
+const UNISWAP_V3_FACTORY_MAINNET = '0x1F98431c8aD98523631AE4a59f267346ea31F984';
+const UNIVERSAL_ROUTER_EXECUTE_SELECTOR = '0x3593564c';
+const UNIVERSAL_ROUTER_WRAP_ETH_COMMAND = '0x0b';
+const UNIVERSAL_ROUTER_V3_SWAP_EXACT_IN_COMMAND = '0x00';
+const UNIVERSAL_ROUTER_ROUTER_AS_RECIPIENT = '0x0000000000000000000000000000000000000002';
+const SEPOLIA_V3_FEE_TIER_PRIORITY = [500, 3000, 100, 10000] as const;
+const SEPOLIA_V3_FALLBACK_FEE = 100;
+const UNISWAP_V3_FACTORY_ABI = [
+  'function getPool(address tokenA, address tokenB, uint24 fee) view returns (address)',
+];
+const UNISWAP_V3_POOL_ABI = [
+  'function liquidity() view returns (uint128)',
+  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
+];
+const SEPOLIA_SWAP_TEMPLATE =
+  '3593564c' +
+  '000000000000000000000000000000000000000000000000000000000000006000000000000000000000000000000000000000000000000000000000000000a00000000000000000000000000000000000000000000000000000000069f20c9600000000000000000000000000000000000000000000000000000000000000020b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000a000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000002' +
+  '00000000000000000000000000000000000000000000000000038d7ea4c68000' +
+  '00000000000000000000000000000000000000000000000000000000000001400000000000000000000000009dd40426fe0dbaf3d28b4fe7f499231e6ffd3873' +
+  '00000000000000000000000000000000000000000000000000038d7ea4c68000' +
+  '0000000000000000000000000000000000000000000000000000000000000000' +
+  '00000000000000000000000000000000000000000000000000000000000000c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000120000000000000000000000000000000000000000000000000000000000000002bfff9976782d46cc05630d1f6ebab18b2324d6b140000641c7d4b196cb0c7b01d743fbc6116a902379c72380000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000756e697800000000000c';
 const MAINNET_TOKENS: Record<string, { address: string; decimals: number; symbol: string }> = {
   ETH: { address: UNISWAP_NATIVE_ETH, decimals: 18, symbol: 'ETH' },
   WETH: {
@@ -647,12 +677,31 @@ export class SessionSignerService implements OnModuleInit {
       transport: http(rpcUrl),
     });
 
+    if (intent.parsed.type === 'swap') {
+      const swapExecution = await this.buildDirectSepoliaSwapTransaction(intent);
+      return await (
+        agentClient as unknown as {
+          sendTransaction: (request: {
+            authorizationList: unknown[];
+            to: `0x${string}`;
+            data: `0x${string}`;
+            value: bigint;
+            gas: bigint;
+          }) => Promise<`0x${string}`>;
+        }
+      ).sendTransaction({
+        authorizationList: [signedAuth],
+        to: swapExecution.to,
+        data: swapExecution.data,
+        value: swapExecution.value,
+        gas: swapExecution.gasLimit ?? 400_000n,
+      });
+    }
+
     const execution = await this.buildExecutionTransaction(intent, userAccount.address);
     const outerTxValue =
       execution.sessionValueWei !== undefined
         ? execution.sessionValueWei
-        : intent.parsed.type === 'swap'
-        ? await this.grossUpForSessionFee(execution.value, intent.parsed.chain ?? 'sepolia')
         : parseEther(String(intent.parsed.amount));
     const executeCalldata = encodeFunctionData({
       abi: WHEN_CHEAP_SESSION_EXECUTE_ABI,
@@ -679,7 +728,7 @@ export class SessionSignerService implements OnModuleInit {
       to: userAccount.address,
       data: executeCalldata,
       value: outerTxValue,
-      gas: intent.parsed.type === 'swap' ? 500_000n : 200_000n,
+      gas: 200_000n,
     });
   }
 
@@ -923,15 +972,11 @@ export class SessionSignerService implements OnModuleInit {
 
     const amountWei = parseEther(intentAmount);
     const gasBufferWei = this.estimateFeeWei(baseFeeGwei, type, chain);
-    const valueToSendWei =
-      type === 'swap'
-        ? await this.grossUpForSessionFee(amountWei, chain)
-        : amountWei;
     const feeWei =
       type === 'swap'
-        ? valueToSendWei - amountWei
-        : await this.getPlatformFeeWei(amountWei, chain);
-    const requiredWei = valueToSendWei + gasBufferWei;
+        ? await this.getPlatformFeeWei(amountWei, chain)
+        : 0n;
+    const requiredWei = amountWei + feeWei + gasBufferWei;
     const availableWei = await this.getProviderForChain(chain).getBalance(userWalletAddress);
 
     if (availableWei < requiredWei) {
@@ -954,6 +999,101 @@ export class SessionSignerService implements OnModuleInit {
       this.logger.warn(`feeForAmount check failed on ${chain}: ${String(err)}`);
       return 0n;
     }
+  }
+
+  async getNetSwapAmountWei(
+    valueWei: bigint,
+    chain = 'sepolia',
+  ): Promise<bigint> {
+    const sessionContract = this.getSessionContract(chain);
+    if (!sessionContract) {
+      return valueWei;
+    }
+
+    try {
+      return (await sessionContract.netSwapAmount(valueWei)) as bigint;
+    } catch (err) {
+      this.logger.warn(`netSwapAmount check failed on ${chain}: ${String(err)}`);
+      return valueWei;
+    }
+  }
+
+  async collectSwapPlatformFee(
+    walletAddress: string,
+    swapAmountWei: bigint,
+    chain = 'sepolia',
+  ): Promise<Array<{
+    recipient: string;
+    feeWei: string;
+    txHash: string;
+    feeType: 'agent' | 'treasury';
+  }>> {
+    const wallet = await this.getWalletByAddress(walletAddress);
+    if (!wallet) {
+      throw new Error(`No encrypted wallet found for ${walletAddress}`);
+    }
+
+    const sessionContract = this.getSessionContract(chain);
+    if (!sessionContract) {
+      throw new Error(`Session contract not configured for ${chain}`);
+    }
+
+    const decryptedKey = this.decryptPrivateKey(this.serializeStoredWallet(wallet));
+    const userAccount = privateKeyToAccount(decryptedKey);
+    const chainConfig = this.getChainConfig(chain);
+    const userClient = createWalletClient({
+      account: userAccount,
+      chain: chainConfig.viemChain,
+      transport: http(chainConfig.rpcUrl),
+    });
+
+    const [agentRecipient, treasuryRecipient, agentFeeWei, treasuryFeeWei] = await Promise.all([
+      sessionContract.agentAddress() as Promise<string>,
+      sessionContract.treasury() as Promise<string>,
+      sessionContract.agentFeeForAmount(swapAmountWei) as Promise<bigint>,
+      sessionContract.treasuryFeeForAmount(swapAmountWei) as Promise<bigint>,
+    ]);
+
+    const transfers: Array<{
+      recipient: string;
+      feeWei: string;
+      txHash: string;
+      feeType: 'agent' | 'treasury';
+    }> = [];
+
+    if (agentFeeWei > 0n) {
+      const txHash = await userClient.sendTransaction({
+        to: agentRecipient as `0x${string}`,
+        value: agentFeeWei,
+        gas: 21_000n,
+        chain: chainConfig.viemChain,
+        account: userAccount,
+      });
+      transfers.push({
+        recipient: agentRecipient,
+        feeWei: agentFeeWei.toString(),
+        txHash,
+        feeType: 'agent',
+      });
+    }
+
+    if (treasuryFeeWei > 0n) {
+      const txHash = await userClient.sendTransaction({
+        to: treasuryRecipient as `0x${string}`,
+        value: treasuryFeeWei,
+        gas: 21_000n,
+        chain: chainConfig.viemChain,
+        account: userAccount,
+      });
+      transfers.push({
+        recipient: treasuryRecipient,
+        feeWei: treasuryFeeWei.toString(),
+        txHash,
+        feeType: 'treasury',
+      });
+    }
+
+    return transfers;
   }
 
   decodeFeeCollectionFromReceipt(receipt: ethers.TransactionReceipt): Array<{
@@ -1233,7 +1373,7 @@ export class SessionSignerService implements OnModuleInit {
       );
     } catch (err) {
       if (this.shouldUseDirectSepoliaSwapFallback(err, chain)) {
-        return this.buildDirectSepoliaSwapTransaction(intent);
+        return await this.buildDirectSepoliaSwapTransaction(intent);
       }
 
       if (err instanceof AxiosError) {
@@ -1281,7 +1421,7 @@ export class SessionSignerService implements OnModuleInit {
       );
     } catch (err) {
       if (this.shouldUseDirectSepoliaSwapFallback(err, chain)) {
-        return this.buildDirectSepoliaSwapTransaction(intent);
+        return await this.buildDirectSepoliaSwapTransaction(intent);
       }
 
       if (err instanceof AxiosError) {
@@ -1333,22 +1473,23 @@ export class SessionSignerService implements OnModuleInit {
     return status === 404 || body.includes('NO_ROUTE');
   }
 
-  private buildDirectSepoliaSwapTransaction(
+  private async buildDirectSepoliaSwapTransaction(
     intent: IntentRecord,
-  ): {
+  ): Promise<{
     to: `0x${string}`;
     data: `0x${string}`;
     value: bigint;
     gasLimit?: bigint;
     sessionValueWei?: bigint;
-  } {
+  }> {
     const chain = intent.parsed.chain ?? 'sepolia';
     const swapAmount = parseEther(String(intent.parsed.amount));
     const fromToken = intent.parsed.fromToken.trim().toUpperCase();
     const toToken = (intent.parsed.toToken ?? 'USDC').trim().toUpperCase();
+    const sessionContractAddress = this.requireSessionContractAddress(chain);
 
     if (this.normalizeChain(chain) !== 'sepolia') {
-      throw new Error('Direct SwapRouter02 fallback is only supported on Sepolia.');
+      throw new Error('Direct Universal Router fallback is only supported on Sepolia.');
     }
 
     if (fromToken !== 'ETH') {
@@ -1358,59 +1499,65 @@ export class SessionSignerService implements OnModuleInit {
       );
     }
 
+    const deadline = BigInt(Math.floor(Date.now() / 1000) + 1800);
+    const netSwap = await this.getNetSwapAmountWei(swapAmount, chain);
+
     if (toToken === 'USDC') {
       this.logger.warn(
-        `Trade API failed on Sepolia, using direct SwapRouter02 fallback for ${intent.wallet}.`,
+        `Trade API failed on Sepolia, using direct Universal Router fallback for ${intent.wallet}.`,
       );
 
-      const totalFee = (swapAmount * BigInt(30)) / 10_000n;
-      const totalValue = swapAmount + totalFee;
-      const deadline = BigInt(Math.floor(Date.now() / 1000) + 1800);
+      const universalRouterCalldata = this.buildDirectSepoliaSwapCalldata(
+        intent.wallet,
+        netSwap,
+        deadline,
+      );
 
-      const swapCalldata = encodeFunctionData({
-        abi: SWAP_ROUTER_ABI,
-        functionName: 'exactInputSingle',
-        args: [
-          {
-            tokenIn: SEPOLIA_TOKENS.WETH.address as `0x${string}`,
-            tokenOut: SEPOLIA_TOKENS.USDC.address as `0x${string}`,
-            fee: SEPOLIA_UNISWAP_V3_POOL_FEE,
-            recipient: intent.wallet as `0x${string}`,
-            deadline,
-            amountIn: swapAmount,
-            amountOutMinimum: 0n,
-            sqrtPriceLimitX96: 0n,
-          },
-        ],
-      });
+      if ((this.config.get<string>('NODE_ENV') ?? 'development') !== 'production') {
+        const selector = universalRouterCalldata.slice(0, 10);
+        if (selector !== UNIVERSAL_ROUTER_EXECUTE_SELECTOR) {
+          throw new Error(`Wrong function selector: ${selector}`);
+        }
+      }
+
+      this.logger.log(
+        `Swap path: WETH -[fee 100 template]-> USDC. ` +
+          `swapIn: ${ethers.formatEther(swapAmount)} ETH. ` +
+          `feeCollectedLater: ${ethers.formatEther(swapAmount - netSwap)} ETH. ` +
+          `deadline: ${deadline.toString()}`,
+      );
 
       return {
-        to: SWAP_ROUTER_SEPOLIA as `0x${string}`,
-        data: swapCalldata,
-        value: swapAmount,
-        gasLimit: 300_000n,
-        sessionValueWei: totalValue,
+        to: UNIVERSAL_ROUTER_SEPOLIA as `0x${string}`,
+        data: universalRouterCalldata,
+        value: netSwap,
+        gasLimit: 400_000n,
       };
     }
 
     if (toToken === 'WETH') {
       this.logger.warn(
-        `Trade API failed on Sepolia, using direct WETH wrap fallback for ${intent.wallet}.`,
+        `Trade API failed on Sepolia, using session-backed Universal Router wrap fallback for ${intent.wallet}.`,
       );
 
-      const totalFee = (swapAmount * BigInt(30)) / 10_000n;
-      const totalValue = swapAmount + totalFee;
+      const { commands, inputs } = this.buildUniversalRouterSwap(
+        [0x0b],
+        netSwap,
+        intent.wallet,
+        netSwap,
+        0n,
+      );
+      const swapCalldata = encodeFunctionData({
+        abi: WHEN_CHEAP_SESSION_SWAP_ABI,
+        functionName: 'swap',
+        args: [commands, inputs, deadline, swapAmount],
+      });
 
       return {
-        to: SEPOLIA_TOKENS.WETH.address as `0x${string}`,
-        data: encodeFunctionData({
-          abi: WETH_ABI,
-          functionName: 'deposit',
-          args: [],
-        }),
+        to: sessionContractAddress,
+        data: swapCalldata,
         value: swapAmount,
-        gasLimit: 100_000n,
-        sessionValueWei: totalValue,
+        gasLimit: 350_000n,
       };
     }
 
@@ -1418,6 +1565,186 @@ export class SessionSignerService implements OnModuleInit {
       `Swap from ${intent.parsed.fromToken} to ${intent.parsed.toToken ?? 'USDC'} not supported on Sepolia. ` +
         'Use ETH->USDC or ETH->WETH, or switch to mainnet.',
     );
+  }
+
+  private buildV3Path(tokenIn: string, tokenOut: string, fee: number): Uint8Array {
+    const path = new Uint8Array(43);
+    this.logger.log(`Building path with fee=${fee} hex=${fee.toString(16).padStart(6, '0')}`);
+    path.set(ethers.getBytes(tokenIn as `0x${string}`), 0);
+    path[20] = (fee >> 16) & 0xff;
+    path[21] = (fee >> 8) & 0xff;
+    path[22] = fee & 0xff;
+    this.logger.log(
+      `Path bytes 20-22: ${path[20].toString(16).padStart(2, '0')}` +
+        `${path[21].toString(16).padStart(2, '0')}` +
+        `${path[22].toString(16).padStart(2, '0')}`,
+    );
+    path.set(ethers.getBytes(tokenOut as `0x${string}`), 23);
+    return path;
+  }
+
+  private buildDirectSepoliaSwapCalldata(
+    recipient: string,
+    amountIn: bigint,
+    deadline: bigint,
+  ): `0x${string}` {
+    const deadlineHex = deadline.toString(16).padStart(8, '0');
+    const amountHex = amountIn.toString(16).padStart(64, '0');
+    const recipientHex = recipient.toLowerCase().replace(/^0x/, '');
+    const calldata = `0x${SEPOLIA_SWAP_TEMPLATE
+      .replace('69f20c96', deadlineHex)
+      .replaceAll('00000000000000000000000000000000000000000000000000038d7ea4c68000', amountHex)
+      .replace('9dd40426fe0dbaf3d28b4fe7f499231e6ffd3873', recipientHex)}` as `0x${string}`;
+
+    if (calldata.length !== 1436 + 2) {
+      throw new Error(`Template length wrong: ${calldata.length}`);
+    }
+
+    this.logger.log(
+      `Built template Sepolia swap calldata for ${recipient}. amountIn=${amountIn.toString()} deadline=${deadline.toString()}`,
+    );
+
+    return calldata;
+  }
+
+  private buildMultiHopV3Path(tokens: string[], fees: number[]): Uint8Array {
+    if (tokens.length !== fees.length + 1) {
+      throw new Error('Invalid Uniswap V3 multi-hop path configuration');
+    }
+
+    const size = 20 + fees.length * 23;
+    const path = new Uint8Array(size);
+    path.set(ethers.getBytes(tokens[0] as `0x${string}`), 0);
+    let offset = 20;
+
+    for (let i = 0; i < fees.length; i += 1) {
+      path[offset] = (fees[i] >> 16) & 0xff;
+      path[offset + 1] = (fees[i] >> 8) & 0xff;
+      path[offset + 2] = fees[i] & 0xff;
+      path.set(ethers.getBytes(tokens[i + 1] as `0x${string}`), offset + 3);
+      offset += 23;
+    }
+
+    return path;
+  }
+
+  private buildUniversalRouterSwap(
+    commands: number[],
+    wrapAmount: bigint,
+    recipient: string,
+    amountIn: bigint,
+    amountOutMin: bigint,
+    path?: Uint8Array,
+  ): { commands: `0x${string}`; inputs: `0x${string}`[] } {
+    const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+    const inputsList: `0x${string}`[] = [];
+
+    for (const cmd of commands) {
+      if (cmd === 0x0b) {
+        const wrapRecipient =
+          path && commands.includes(0x00)
+            ? UNIVERSAL_ROUTER_ROUTER_AS_RECIPIENT
+            : recipient;
+        inputsList.push(
+          abiCoder.encode(
+            ['address', 'uint256'],
+            [wrapRecipient, wrapAmount],
+          ) as `0x${string}`,
+        );
+        continue;
+      }
+
+      if (cmd === 0x00) {
+        if (!path) {
+          throw new Error('V3 swap command requires a path');
+        }
+        const swapInput = abiCoder.encode(
+          ['address', 'uint256', 'uint256', 'bytes', 'bool'],
+          [recipient, amountIn, amountOutMin, path, false],
+        ) as `0x${string}`;
+        const decoded = abiCoder.decode(
+          ['address', 'uint256', 'uint256', 'bytes', 'bool'],
+          swapInput,
+        ) as unknown as [string, bigint, bigint, string, boolean];
+        const decodedPath = ethers.getBytes(decoded[3]);
+        if (decodedPath.length !== 43) {
+          throw new Error(
+            `Path encoding wrong: expected 43 bytes, got ${decodedPath.length}`,
+          );
+        }
+        this.logger.log(`Path correctly encoded: ${ethers.hexlify(decodedPath)}`);
+        inputsList.push(
+          swapInput,
+        );
+        continue;
+      }
+
+      throw new Error(`Universal Router command 0x${cmd.toString(16)} not supported yet`);
+    }
+
+    return {
+      commands: ethers.hexlify(new Uint8Array(commands)) as `0x${string}`,
+      inputs: inputsList,
+    };
+  }
+
+  private async findBestSepoliaRoute(tokenIn: string, tokenOut: string): Promise<number> {
+    const provider = this.getProviderForChain('sepolia');
+    const factory = new ethers.Contract(
+      UNISWAP_V3_FACTORY_SEPOLIA,
+      UNISWAP_V3_FACTORY_ABI,
+      provider,
+    );
+
+    for (const fee of SEPOLIA_V3_FEE_TIER_PRIORITY) {
+      try {
+        const poolAddr = (await factory.getPool(tokenIn, tokenOut, fee)) as string;
+        if (!poolAddr || poolAddr === ethers.ZeroAddress) {
+          continue;
+        }
+
+        const poolContract = new ethers.Contract(poolAddr, UNISWAP_V3_POOL_ABI, provider);
+        const liquidity = (await poolContract.liquidity()) as bigint;
+        if (liquidity <= 0n) {
+          continue;
+        }
+
+        const [sqrtPriceX96] = (await poolContract.slot0()) as [bigint, number, number, number, number, number, boolean];
+        if (sqrtPriceX96 === 0n) {
+          continue;
+        }
+
+        this.logger.log(
+          `Selected pool: ${poolAddr} fee=${fee} liquidity=${liquidity.toString()} sqrtPriceX96=${sqrtPriceX96.toString()}`,
+        );
+        return fee;
+      } catch (err) {
+        this.logger.warn(`Could not inspect Sepolia pool fee ${fee}: ${String(err)}`);
+      }
+    }
+
+    try {
+      const fallbackPoolAddr = (await factory.getPool(
+        tokenIn,
+        tokenOut,
+        SEPOLIA_V3_FALLBACK_FEE,
+      )) as string;
+      if (fallbackPoolAddr && fallbackPoolAddr !== ethers.ZeroAddress) {
+        const fallbackPool = new ethers.Contract(fallbackPoolAddr, UNISWAP_V3_POOL_ABI, provider);
+        const fallbackLiquidity = (await fallbackPool.liquidity()) as bigint;
+        const [fallbackSqrtPriceX96] = (await fallbackPool.slot0()) as [bigint, number, number, number, number, number, boolean];
+        if (fallbackLiquidity > 0n && fallbackSqrtPriceX96 > 0n) {
+          this.logger.log(
+            `Selected pool: ${fallbackPoolAddr} fee=${SEPOLIA_V3_FALLBACK_FEE} liquidity=${fallbackLiquidity.toString()} sqrtPriceX96=${fallbackSqrtPriceX96.toString()} (confirmed fallback)`,
+          );
+          return SEPOLIA_V3_FALLBACK_FEE;
+        }
+      }
+    } catch (err) {
+      this.logger.warn(`Could not inspect confirmed fallback fee ${SEPOLIA_V3_FALLBACK_FEE}: ${String(err)}`);
+    }
+
+    throw new Error('No initialized Sepolia Uniswap v3 pool found for this token pair');
   }
 
   private resolveToken(symbol: string, chain: string): { address: string; decimals: number; symbol: string } {
@@ -1433,32 +1760,6 @@ export class SessionSignerService implements OnModuleInit {
     }
 
     return token;
-  }
-
-  private async grossUpForSessionFee(netValueWei: bigint, chain = 'sepolia'): Promise<bigint> {
-    const sessionContract = this.getSessionContract(chain);
-    if (!sessionContract || netValueWei === 0n) {
-      return netValueWei;
-    }
-
-    try {
-      const feeBps = BigInt((await sessionContract.feeBps()) as number);
-      if (feeBps === 0n) {
-        return netValueWei;
-      }
-
-      const denominator = 10_000n - feeBps;
-      let gross = (netValueWei * 10_000n + denominator - 1n) / denominator;
-
-      while (gross - ((gross * feeBps) / 10_000n) < netValueWei) {
-        gross += 1n;
-      }
-
-      return gross;
-    } catch (err) {
-      this.logger.warn(`Could not gross up fee for ${chain}: ${String(err)}`);
-      return netValueWei;
-    }
   }
 
   private getChainConfig(chain: string): {

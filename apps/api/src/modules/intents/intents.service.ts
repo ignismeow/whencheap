@@ -4,7 +4,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { randomUUID } from 'crypto';
 import { In, Repository } from 'typeorm';
-import { formatEther } from 'viem';
+import { formatEther, parseEther } from 'viem';
 import { isAddress } from 'ethers';
 import { OllamaIntentParserService } from '../agent/ollama-intent-parser.service';
 import { ParsedIntent } from '../agent/parsed-intent.schema';
@@ -526,17 +526,31 @@ export class IntentsService implements OnModuleInit {
 
   private async executeSwap(intent: IntentRecord, baseFeeGwei: number) {
     try {
+      const swapAmountWei = this.parseIntentAmountWei(intent.parsed.amount);
+      const feeWei = await this.sessionSigner.getPlatformFeeWei(
+        swapAmountWei,
+        intent.parsed.chain ?? 'sepolia',
+      );
+      const netSwapWei = await this.sessionSigner.getNetSwapAmountWei(
+        swapAmountWei,
+        intent.parsed.chain ?? 'sepolia',
+      );
+
       await this.addAudit(
         intent,
         'SWAP_EXECUTING',
         `Executing swap: ${intent.parsed.amount} ${intent.parsed.fromToken} -> ${intent.parsed.toToken ?? 'USDC'} ` +
-          `via Uniswap on ${intent.parsed.chain ?? 'sepolia'}.`,
+          `via Uniswap on ${intent.parsed.chain ?? 'sepolia'}. ` +
+          `Net routed to swap: ${formatEther(netSwapWei)} ETH. ` +
+          `Fee to collect after confirmation: ${formatEther(feeWei)} ETH.`,
         {
           chain: intent.parsed.chain ?? 'sepolia',
           baseFeeGwei,
           fromToken: intent.parsed.fromToken,
           toToken: intent.parsed.toToken ?? 'USDC',
           amount: intent.parsed.amount,
+          feeWei: feeWei.toString(),
+          netSwapWei: netSwapWei.toString(),
           senderModel: 'eip7702-managed-wallet',
         },
       );
@@ -760,6 +774,39 @@ export class IntentsService implements OnModuleInit {
       );
 
       if (receipt.status === 1) {
+        if (intent.parsed.type === 'swap') {
+          try {
+            const swapAmountWei = this.parseIntentAmountWei(intent.parsed.amount);
+            const feeTransfers = await this.sessionSigner.collectSwapPlatformFee(
+              intent.wallet,
+              swapAmountWei,
+              intent.parsed.chain ?? 'sepolia',
+            );
+
+            for (const feeTransfer of feeTransfers) {
+              await this.addAudit(
+                intent,
+                'FEE_COLLECTED',
+                `Swap fee collected (${feeTransfer.feeType}): ` +
+                  `${formatEther(BigInt(feeTransfer.feeWei))} ETH. Recipient: ${feeTransfer.recipient.slice(0, 10)}...`,
+                {
+                  feeWei: feeTransfer.feeWei,
+                  recipient: feeTransfer.recipient,
+                  feeType: feeTransfer.feeType,
+                  feeTxHash: feeTransfer.txHash,
+                  collectedAfterSwap: true,
+                },
+              );
+            }
+          } catch (err) {
+            await this.addAudit(
+              intent,
+              'FEE_COLLECTION_FAILED',
+              `Could not collect swap fee after confirmation: ${String(err)}`,
+            );
+          }
+        }
+
         try {
           const spendTxHash = await this.sessionSigner.recordSpend(
             intent.wallet,
@@ -782,21 +829,23 @@ export class IntentsService implements OnModuleInit {
           );
         }
 
-        const feeEvents = this.sessionSigner.decodeFeeCollectionFromReceipt(receipt);
-        for (const feeEvent of feeEvents) {
-          await this.addAudit(
-            intent,
-            'FEE_COLLECTED',
-            `Execution fee (${feeEvent.feeType}): ${formatEther(BigInt(feeEvent.feeWei))} ETH. ` +
-              `Recipient: ${feeEvent.recipient.slice(0, 10)}... Net: ${formatEther(BigInt(feeEvent.netAmount))} ETH`,
-            {
-              feeWei: feeEvent.feeWei,
-              recipient: feeEvent.recipient,
-              totalValueWei: feeEvent.totalValue,
-              netAmountWei: feeEvent.netAmount,
-              feeType: feeEvent.feeType,
-            },
-          );
+        if (intent.parsed.type !== 'swap') {
+          const feeEvents = this.sessionSigner.decodeFeeCollectionFromReceipt(receipt);
+          for (const feeEvent of feeEvents) {
+            await this.addAudit(
+              intent,
+              'FEE_COLLECTED',
+              `Execution fee (${feeEvent.feeType}): ${formatEther(BigInt(feeEvent.feeWei))} ETH. ` +
+                `Recipient: ${feeEvent.recipient.slice(0, 10)}... Net: ${formatEther(BigInt(feeEvent.netAmount))} ETH`,
+              {
+                feeWei: feeEvent.feeWei,
+                recipient: feeEvent.recipient,
+                totalValueWei: feeEvent.totalValue,
+                netAmountWei: feeEvent.netAmount,
+                feeType: feeEvent.feeType,
+              },
+            );
+          }
         }
 
         intent.completedExecutions += 1;
@@ -937,6 +986,10 @@ export class IntentsService implements OnModuleInit {
 
   private appendNote(existing: string | undefined, note: string): string {
     return existing ? `${existing} ${note}` : note;
+  }
+
+  private parseIntentAmountWei(amount: string): bigint {
+    return parseEther(amount);
   }
 
   private async logKeeperHubExecution(intent: IntentRecord): Promise<void> {
