@@ -504,7 +504,7 @@ export class IntentsService implements OnModuleInit {
       await this.logKeeperHubExecution(intent);
     } catch (err) {
       const message = String(err);
-      if (intent.parsed.type === 'swap' && message.includes('Uniswap API 404')) {
+      if (intent.parsed.type === 'swap' && message.includes('No route found')) {
         await this.transition(
           intent,
           IntentStatus.Stuck,
@@ -570,7 +570,7 @@ export class IntentsService implements OnModuleInit {
       await this.logKeeperHubExecution(intent);
     } catch (err) {
       const message = String(err);
-      if (message.includes('Uniswap API 404')) {
+      if (message.includes('No route found')) {
         await this.transition(
           intent,
           IntentStatus.Stuck,
@@ -774,78 +774,45 @@ export class IntentsService implements OnModuleInit {
       );
 
       if (receipt.status === 1) {
-        if (intent.parsed.type === 'swap') {
+        if (intent.parsed.type !== 'swap') {
           try {
-            const swapAmountWei = this.parseIntentAmountWei(intent.parsed.amount);
-            const feeTransfers = await this.sessionSigner.collectSwapPlatformFee(
+            const spendTxHash = await this.sessionSigner.recordSpend(
               intent.wallet,
-              swapAmountWei,
+              feePaid,
               intent.parsed.chain ?? 'sepolia',
             );
-
-            for (const feeTransfer of feeTransfers) {
+            if (spendTxHash) {
               await this.addAudit(
                 intent,
-                'FEE_COLLECTED',
-                `Swap fee collected (${feeTransfer.feeType}): ` +
-                  `${formatEther(BigInt(feeTransfer.feeWei))} ETH. Recipient: ${feeTransfer.recipient.slice(0, 10)}...`,
-                {
-                  feeWei: feeTransfer.feeWei,
-                  recipient: feeTransfer.recipient,
-                  feeType: feeTransfer.feeType,
-                  feeTxHash: feeTransfer.txHash,
-                  collectedAfterSwap: true,
-                },
+                'SESSION_SPEND_RECORDED',
+                `Session spend recorded. Tx: ${spendTxHash}`,
+                { spendTxHash, feePaidWei: feePaid.toString() },
               );
             }
           } catch (err) {
             await this.addAudit(
               intent,
-              'FEE_COLLECTION_FAILED',
-              `Could not collect swap fee after confirmation: ${String(err)}`,
+              'SESSION_SPEND_RECORD_FAILED',
+              `Could not record session spend: ${String(err)}`,
             );
           }
         }
 
-        try {
-          const spendTxHash = await this.sessionSigner.recordSpend(
-            intent.wallet,
-            feePaid,
-            intent.parsed.chain ?? 'sepolia',
-          );
-          if (spendTxHash) {
-            await this.addAudit(
-              intent,
-              'SESSION_SPEND_RECORDED',
-              `Session spend recorded. Tx: ${spendTxHash}`,
-              { spendTxHash, feePaidWei: feePaid.toString() },
-            );
-          }
-        } catch (err) {
+        const feeEvents = this.sessionSigner.decodeFeeCollectionFromReceipt(receipt);
+        for (const feeEvent of feeEvents) {
           await this.addAudit(
             intent,
-            'SESSION_SPEND_RECORD_FAILED',
-            `Could not record session spend: ${String(err)}`,
+            'FEE_COLLECTED',
+            `Execution fee (${feeEvent.feeType}): ${formatEther(BigInt(feeEvent.feeWei))} ETH. ` +
+              `Recipient: ${feeEvent.recipient.slice(0, 10)}... Net: ${formatEther(BigInt(feeEvent.netAmount))} ETH`,
+            {
+              feeWei: feeEvent.feeWei,
+              recipient: feeEvent.recipient,
+              totalValueWei: feeEvent.totalValue,
+              netAmountWei: feeEvent.netAmount,
+              feeType: feeEvent.feeType,
+            },
           );
-        }
-
-        if (intent.parsed.type !== 'swap') {
-          const feeEvents = this.sessionSigner.decodeFeeCollectionFromReceipt(receipt);
-          for (const feeEvent of feeEvents) {
-            await this.addAudit(
-              intent,
-              'FEE_COLLECTED',
-              `Execution fee (${feeEvent.feeType}): ${formatEther(BigInt(feeEvent.feeWei))} ETH. ` +
-                `Recipient: ${feeEvent.recipient.slice(0, 10)}... Net: ${formatEther(BigInt(feeEvent.netAmount))} ETH`,
-              {
-                feeWei: feeEvent.feeWei,
-                recipient: feeEvent.recipient,
-                totalValueWei: feeEvent.totalValue,
-                netAmountWei: feeEvent.netAmount,
-                feeType: feeEvent.feeType,
-              },
-            );
-          }
         }
 
         intent.completedExecutions += 1;
