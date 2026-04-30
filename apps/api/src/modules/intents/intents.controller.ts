@@ -12,6 +12,11 @@ export class IntentsController {
 
   constructor(private readonly intents: IntentsService) {}
 
+  @Post('preview')
+  preview(@Body() dto: CreateIntentDto) {
+    return this.intents.preview(dto);
+  }
+
   @Post()
   create(@Body() dto: CreateIntentDto) {
     return this.intents.create(dto);

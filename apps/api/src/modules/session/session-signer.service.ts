@@ -132,6 +132,7 @@ interface UniswapSwapCalldataResult {
   calldata: string;
   value: bigint;
   to: string;
+  endpointUsed: 'swap_7702' | 'swap';
 }
 
 interface StoredEip7702Authorization {
@@ -646,10 +647,14 @@ export class SessionSignerService implements OnModuleInit {
     }
 
     const execution = await this.buildExecutionTransaction(intent, userAccount.address);
+    const fromToken = intent.parsed.fromToken?.toUpperCase() ?? 'ETH';
+    const isNativeETH = fromToken === 'ETH';
     const outerTxValue =
       execution.sessionValueWei !== undefined
         ? execution.sessionValueWei
-        : parseEther(String(intent.parsed.amount));
+        : isNativeETH
+          ? parseEther(String(intent.parsed.amount))
+          : 0n;
     const executeCalldata = encodeFunctionData({
       abi: WHEN_CHEAP_SESSION_EXECUTE_ABI,
       functionName: 'execute',
@@ -679,7 +684,10 @@ export class SessionSignerService implements OnModuleInit {
     });
   }
 
-  async executeSwap(intent: IntentRecord): Promise<string> {
+  async executeSwap(intent: IntentRecord): Promise<{
+    txHash: string;
+    uniswapEndpoint: 'swap_7702' | 'swap';
+  }> {
     const wallet = await this.getWalletByAddress(intent.wallet);
     if (!wallet) {
       throw new Error(
@@ -733,7 +741,7 @@ export class SessionSignerService implements OnModuleInit {
       transport: http(chainConfig.rpcUrl),
     });
 
-    return await (
+    const txHash = await (
       agentClient as unknown as {
         sendTransaction: (request: {
           authorizationList: unknown[];
@@ -750,6 +758,11 @@ export class SessionSignerService implements OnModuleInit {
       value: execution.value,
       gas: execution.gasLimit ?? 600_000n,
     });
+
+    return {
+      txHash,
+      uniswapEndpoint: execution.uniswapEndpoint ?? 'swap',
+    };
   }
 
   private async broadcastAgentWalletExecution(
@@ -789,6 +802,9 @@ export class SessionSignerService implements OnModuleInit {
     authorization: unknown,
   ): Promise<string> {
     const pk = this.requireAgentPrivateKey();
+    this.logger.warn(
+      'Using stored authorization — this should not happen. Auth should be re-signed fresh per execution.',
+    );
     const storedAuthorization = this.normalizeAuthorizationForLogging(authorization);
     const chainConfig = this.getChainConfig(intent.parsed.chain ?? 'sepolia');
     if (chainConfig.chainId === MAINNET_CHAIN_ID) {
@@ -834,7 +850,9 @@ export class SessionSignerService implements OnModuleInit {
 
     const outerTxValue =
       intent.parsed.type === 'send'
-        ? parseEther(String(intent.parsed.amount))
+        ? (intent.parsed.fromToken?.toUpperCase() ?? 'ETH') === 'ETH'
+          ? parseEther(String(intent.parsed.amount))
+          : 0n
         : execution.value;
 
     const signedAuth = await (
@@ -970,25 +988,53 @@ export class SessionSignerService implements OnModuleInit {
     baseFeeGwei: number,
     type: 'send' | 'swap',
     chain = 'sepolia',
+    fromToken = 'ETH',
   ): Promise<void> {
     const wallet = await this.getWalletByAddress(userWalletAddress);
     if (!wallet) {
       return;
     }
 
-    const amountWei = parseEther(intentAmount);
+    const provider = this.getProviderForChain(chain);
     const gasBufferWei = this.estimateFeeWei(baseFeeGwei, type, chain);
-    const feeWei =
-      type === 'swap'
-        ? await this.getPlatformFeeWei(amountWei, chain)
-        : 0n;
-    const requiredWei = amountWei + feeWei + gasBufferWei;
-    const availableWei = await this.getProviderForChain(chain).getBalance(userWalletAddress);
+    const tokenInfo = this.resolveToken(fromToken, chain);
+    const isNative = tokenInfo.symbol.toUpperCase() === 'ETH';
 
-    if (availableWei < requiredWei) {
+    if (isNative) {
+      const amountWei = parseEther(intentAmount);
+      const feeWei =
+        type === 'swap'
+          ? await this.getPlatformFeeWei(amountWei, chain)
+          : 0n;
+      const requiredWei = amountWei + feeWei + gasBufferWei;
+      const availableWei = await provider.getBalance(userWalletAddress);
+
+      if (availableWei < requiredWei) {
+        throw new BadRequestException(
+          `Insufficient ETH balance. Required: ${formatEther(requiredWei)} ETH, ` +
+          `Available: ${formatEther(availableWei)} ETH`,
+        );
+      }
+
+      return;
+    }
+
+    const tokenContract = new ethers.Contract(tokenInfo.address, ERC20_ABI, provider);
+    const amountToken = ethers.parseUnits(intentAmount, tokenInfo.decimals);
+    const availableToken = (await tokenContract.balanceOf(userWalletAddress)) as bigint;
+
+    if (availableToken < amountToken) {
       throw new BadRequestException(
-        `Insufficient balance in managed wallet. Required: ${formatEther(requiredWei)} ETH, ` +
-        `Available: ${formatEther(availableWei)} ETH`,
+        `Insufficient ${tokenInfo.symbol} balance. Required: ${intentAmount} ${tokenInfo.symbol}, ` +
+        `Available: ${ethers.formatUnits(availableToken, tokenInfo.decimals)} ${tokenInfo.symbol}`,
+      );
+    }
+
+    const availableEth = await provider.getBalance(userWalletAddress);
+    if (availableEth < gasBufferWei) {
+      throw new BadRequestException(
+        `Insufficient ETH for gas. Required: ${formatEther(gasBufferWei)} ETH, ` +
+        `Available: ${formatEther(availableEth)} ETH`,
       );
     }
   }
@@ -1021,6 +1067,19 @@ export class SessionSignerService implements OnModuleInit {
     } catch (err) {
       this.logger.warn(`netAfterFee check failed on ${chain}: ${String(err)}`);
       return valueWei;
+    }
+  }
+
+  formatTokenAmount(
+    valueWei: bigint,
+    tokenSymbol: string,
+    chain = 'sepolia',
+  ): string {
+    try {
+      const token = this.resolveToken(tokenSymbol, chain);
+      return `${ethers.formatUnits(valueWei, token.decimals)} ${token.symbol}`;
+    } catch {
+      return `${valueWei.toString()} ${tokenSymbol.toUpperCase()}`;
     }
   }
 
@@ -1310,9 +1369,31 @@ export class SessionSignerService implements OnModuleInit {
     value: bigint;
     gasLimit?: bigint;
     sessionValueWei?: bigint;
+    uniswapEndpoint?: 'swap_7702' | 'swap';
   }> {
     if (intent.parsed.type === 'send') {
       const recipient = this.getRecipient(intent);
+      const chain = intent.parsed.chain ?? 'sepolia';
+      const fromToken = intent.parsed.fromToken?.toUpperCase() ?? 'ETH';
+      const isNative = fromToken === 'ETH';
+
+      if (!isNative) {
+        const tokenInfo = this.resolveToken(fromToken, chain);
+        const amountToken = ethers.parseUnits(String(intent.parsed.amount), tokenInfo.decimals);
+        const transferCalldata = encodeFunctionData({
+          abi: parseAbi(['function transfer(address to, uint256 amount) returns (bool)']),
+          functionName: 'transfer',
+          args: [recipient as `0x${string}`, amountToken],
+        });
+
+        return {
+          to: tokenInfo.address as `0x${string}`,
+          data: transferCalldata,
+          value: 0n,
+          gasLimit: 80_000n,
+        };
+      }
+
       return {
         to: recipient as `0x${string}`,
         data: '0x',
@@ -1341,16 +1422,27 @@ export class SessionSignerService implements OnModuleInit {
     value: bigint;
     gasLimit?: bigint;
     sessionValueWei?: bigint;
+    uniswapEndpoint?: 'swap_7702' | 'swap';
   }> {
     const chain = intent.parsed.chain ?? 'sepolia';
     const chainConfig = this.getChainConfig(chain);
     const sessionContractAddress = this.requireSessionContractAddress(chain);
     const tokenIn = this.resolveToken(intent.parsed.fromToken, chain);
     const tokenOut = this.resolveToken(intent.parsed.toToken ?? 'USDC', chain);
+
+    if (
+      chainConfig.chainId === SEPOLIA_CHAIN_ID &&
+      !['ETH', 'WETH'].includes(tokenIn.symbol.toUpperCase())
+    ) {
+      throw new Error(
+        'Sepolia demo currently supports ETH-funded swaps only. Try ETH -> USDC or ETH -> DAI.',
+      );
+    }
+
     const fullAmount = ethers.parseUnits(String(intent.parsed.amount), tokenIn.decimals);
     const feeWei = await this.getPlatformFeeWei(fullAmount, chain);
     const netAmount = fullAmount - feeWei;
-    const { calldata, to: swapRouter } = await this.buildUniswapSwapCalldata(
+    const { calldata, to: swapRouter, endpointUsed } = await this.buildUniswapSwapCalldata(
       chainConfig.chainId,
       tokenIn.address,
       tokenOut.address,
@@ -1369,8 +1461,9 @@ export class SessionSignerService implements OnModuleInit {
 
     this.logger.log(
       `Swap via session contract. Router: ${swapRouter}. ` +
-      `Full: ${formatEther(fullAmount)} ETH. Net: ${formatEther(netAmount)} ETH. ` +
-      `Fee: ${formatEther(feeWei)} ETH. Contract: ${sessionContractAddress}`,
+      `Full: ${this.formatTokenAmount(fullAmount, tokenIn.symbol, chain)}. ` +
+      `Net: ${this.formatTokenAmount(netAmount, tokenIn.symbol, chain)}. ` +
+      `Fee: ${this.formatTokenAmount(feeWei, tokenIn.symbol, chain)}. Contract: ${sessionContractAddress}`,
     );
 
     return {
@@ -1378,6 +1471,7 @@ export class SessionSignerService implements OnModuleInit {
       data: executeSwapCalldata,
       value: fullAmount,
       gasLimit: 600_000n,
+      uniswapEndpoint: endpointUsed,
     };
   }
 
@@ -1459,7 +1553,13 @@ export class SessionSignerService implements OnModuleInit {
       );
     }
 
-    const swapBody: Record<string, unknown> = { quote };
+    const chain = chainId === MAINNET_CHAIN_ID ? 'mainnet' : 'sepolia';
+    const sessionContractAddress = this.requireSessionContractAddress(chain);
+
+    const swapBody: Record<string, unknown> = {
+      quote,
+      delegation: sessionContractAddress,
+    };
     if (permitData) {
       const agentWallet = this.requireAgentWallet();
       const signature = await agentWallet.signTypedData(
@@ -1472,9 +1572,10 @@ export class SessionSignerService implements OnModuleInit {
     }
 
     let swapRes: AxiosResponse<Record<string, unknown>>;
+    let endpointUsed: 'swap_7702' | 'swap' = 'swap_7702';
     try {
       swapRes = await axios.post(
-        'https://trade-api.gateway.uniswap.org/v1/swap',
+        'https://trade-api.gateway.uniswap.org/v1/swap_7702',
         swapBody,
         {
           headers: {
@@ -1484,14 +1585,35 @@ export class SessionSignerService implements OnModuleInit {
           },
         },
       );
+      this.logger.log('Uniswap /swap_7702 endpoint used — EIP-7702 optimized calldata');
     } catch (err) {
-      if (err instanceof AxiosError) {
-        const status = err.response?.status;
-        const body = JSON.stringify(err.response?.data ?? {});
-        const url = err.config?.url;
-        throw new Error(`Uniswap API ${status} at ${url}: ${body}`);
+      this.logger.warn(`Uniswap /swap_7702 failed: ${String(err)} — falling back to /swap`);
+      const fallbackBody = { ...swapBody };
+      delete fallbackBody.delegation;
+      endpointUsed = 'swap';
+
+      try {
+        swapRes = await axios.post(
+          'https://trade-api.gateway.uniswap.org/v1/swap',
+          fallbackBody,
+          {
+            headers: {
+              'x-api-key': apiKey,
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
+          },
+        );
+        this.logger.log('Uniswap /swap fallback used');
+      } catch (fallbackErr) {
+        if (fallbackErr instanceof AxiosError) {
+          const status = fallbackErr.response?.status;
+          const body = JSON.stringify(fallbackErr.response?.data ?? {});
+          const url = fallbackErr.config?.url;
+          throw new Error(`Uniswap API ${status} at ${url}: ${body}`);
+        }
+        throw fallbackErr;
       }
-      throw err;
     }
 
     const { swap } = swapRes.data as {
@@ -1511,6 +1633,7 @@ export class SessionSignerService implements OnModuleInit {
           ? amountIn
           : BigInt(swap.value ?? '0'),
       to: swap.to ?? SWAP_ROUTER_02_ADDRESS,
+      endpointUsed,
     };
   }
 

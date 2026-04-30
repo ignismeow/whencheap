@@ -55,6 +55,13 @@ export class GeminiIntentParser {
       'type must be swap or send. For send intents, put the destination in recipient and omit toToken.',
       'For swap intents, omit recipient unless the user explicitly provides one.',
       'Use ISO datetime for deadlineIso.',
+      'CRITICAL PARSING RULES:',
+      'amount: extract the exact number the user typed. "0.001 ETH" = 0.001, not 10 and not 1.',
+      'maxFeeUsd: extract from "when gas is under $X". "under $1" = 1, "under $2" = 2.',
+      'If user says "in next 30 minutes" or "in 30 minutes", set the deadline to now plus exactly that duration.',
+      'recipient: only set it if the user explicitly provides an address or ENS name.',
+      'chain: if the user says sepolia or testnet use sepolia. If no chain is mentioned, swaps default to ethereum and sends default to sepolia.',
+      'type: use send when the user explicitly says send and provides a recipient. Use swap when the user names an output token.',
       "For swap intents, default chain to 'ethereum' unless the user explicitly says 'sepolia' or 'testnet'.",
       "For send intents, default chain to 'sepolia'.",
       'maxFeeUsd and slippageBps must be numbers. amount must be a string.',
@@ -108,22 +115,32 @@ export class GeminiIntentParser {
 
   private parseJsonContent(content: string): unknown {
     try {
-      return this.normalizeParsedJson(JSON.parse(content));
+      return this.normalizeParsedJson(JSON.parse(content), content);
     } catch {
       const match = content.match(/\{[\s\S]*\}/);
       if (!match) {
         throw new Error('Gemini response did not contain JSON');
       }
-      return this.normalizeParsedJson(JSON.parse(match[0]));
+      return this.normalizeParsedJson(JSON.parse(match[0]), content);
     }
   }
 
-  private normalizeParsedJson(value: unknown): unknown {
+  private normalizeParsedJson(value: unknown, input = ''): unknown {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return value;
     }
 
     const parsed = { ...value } as Record<string, unknown>;
+    const lower = input.toLowerCase();
+    const explicitChain = this.extractChain(lower);
+    const explicitDeadline = this.extractDeadline(lower);
+    const explicitAmount = this.extractExactAmount(input);
+    const explicitMaxFeeUsd = this.extractMaxFeeUsd(input);
+    const explicitTokenPair = this.extractTokenPair(lower);
+    const explicitRecipient = input.match(/0x[a-fA-F0-9]{40}|\b[a-z0-9-]+\.eth\b/i)?.[0];
+    const isExplicitSend = /\bsend\b/i.test(input);
+    const isExplicitSwap = /\bswap\b|\bexchange\b|\btrade\b/i.test(input);
+
     for (const key of ['recipient', 'toToken', 'repeatCount', 'notes']) {
       if (parsed[key] === null) {
         delete parsed[key];
@@ -136,6 +153,37 @@ export class GeminiIntentParser {
     if (parsed.chain === null) delete parsed.chain;
     if (typeof parsed.chain !== 'string' || !parsed.chain.trim()) {
       parsed.chain = parsed.type === 'swap' ? 'ethereum' : 'sepolia';
+    }
+
+    if (explicitAmount) {
+      parsed.amount = explicitAmount;
+    }
+    if (explicitMaxFeeUsd !== null) {
+      parsed.maxFeeUsd = explicitMaxFeeUsd;
+    }
+    if (explicitTokenPair) {
+      parsed.fromToken = explicitTokenPair.fromToken;
+      if (explicitTokenPair.toToken) {
+        parsed.toToken = explicitTokenPair.toToken;
+      }
+    }
+
+    if (isExplicitSend && !isExplicitSwap) {
+      parsed.type = 'send';
+      if (explicitRecipient) {
+        parsed.recipient = explicitRecipient;
+      }
+      delete parsed.toToken;
+    } else if (isExplicitSwap) {
+      parsed.type = 'swap';
+    }
+
+    if (explicitChain) {
+      parsed.chain = explicitChain;
+    }
+
+    if (explicitDeadline) {
+      parsed.deadlineIso = explicitDeadline.toISOString();
     }
 
     return parsed;
@@ -221,5 +269,31 @@ export class GeminiIntentParser {
     if (/\b(sepolia|testnet)\b/.test(input)) return 'sepolia';
     if (/\b(ethereum|mainnet| on eth\b| eth chain)\b/.test(input)) return 'ethereum';
     return null;
+  }
+
+  private extractExactAmount(input: string): string | null {
+    return (
+      input.match(/\b(?:send|swap)\s+([0-9]*\.?[0-9]+)/i)?.[1] ??
+      input.match(/\b([0-9]*\.?[0-9]+)\s*(?:eth|weth|usdc|usdt|dai)\b/i)?.[1] ??
+      null
+    );
+  }
+
+  private extractMaxFeeUsd(input: string): number | null {
+    const value = input.match(/\b(?:when\s+gas\s+is\s+under|under)\s*\$ ?([0-9]*\.?[0-9]+)/i)?.[1];
+    return value ? Number(value) : null;
+  }
+
+  private extractTokenPair(input: string): { fromToken: string; toToken?: string } | null {
+    const tokenPair = input.match(/\b(eth|weth|usdc|usdt|dai)\s+(?:to|for|into)\s+(eth|weth|usdc|usdt|dai)\b/i);
+    if (tokenPair) {
+      return {
+        fromToken: tokenPair[1].toUpperCase(),
+        toToken: tokenPair[2].toUpperCase(),
+      };
+    }
+
+    const explicitToken = input.match(/\b(?:send|swap)\s+[0-9]*\.?[0-9]+\s+([a-zA-Z]+)/i)?.[1];
+    return explicitToken ? { fromToken: explicitToken.toUpperCase() } : null;
   }
 }

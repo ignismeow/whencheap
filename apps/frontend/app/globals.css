@@ -283,6 +283,8 @@ textarea::placeholder {
   gap: 16px;
   overflow-y: auto;
   padding-right: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) transparent;
 }
 
 .console-main {
@@ -340,11 +342,24 @@ textarea::placeholder {
   height: 6px;
 }
 
+.console-sidebar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
 .console-scroll::-webkit-scrollbar-thumb {
   background: var(--color-border);
 }
 
+.console-sidebar::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+}
+
 .console-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.console-sidebar::-webkit-scrollbar-track {
   background: transparent;
 }
 
@@ -517,6 +532,93 @@ textarea::placeholder {
   border-color: var(--color-accent);
   background: rgba(255, 69, 0, 0.05);
   outline: none;
+}
+
+.chat-avatar {
+  display: flex;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 69, 0, 0.35);
+  background: var(--color-accent);
+  color: #000;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.chat-bubble {
+  max-width: min(88%, 520px);
+  border: 1px solid var(--color-border);
+  padding: 14px 16px;
+}
+
+.chat-bubble-agent {
+  background: #16171b;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+.chat-bubble-user {
+  background: linear-gradient(180deg, #ff5a1f 0%, #ff4500 100%);
+  border-color: rgba(255, 69, 0, 0.7);
+  color: #120700;
+  box-shadow: 0 8px 24px rgba(255, 69, 0, 0.18);
+}
+
+.chat-message-line {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  letter-spacing: 0.01em;
+  text-transform: none;
+  word-break: break-word;
+}
+
+.chat-message-title {
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+.chat-message-note {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 11px;
+  line-height: 1.55;
+  text-transform: none;
+}
+
+.chat-structured-card {
+  display: grid;
+  gap: 1px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.chat-structured-row {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  background: rgba(0, 0, 0, 0.2);
+  padding: 8px 10px;
+}
+
+.chat-structured-label {
+  color: var(--color-label);
+  font-size: 10px;
+  line-height: 1.4;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.chat-structured-value {
+  color: var(--color-text);
+  font-size: 12px;
+  line-height: 1.5;
+  text-transform: none;
+  word-break: break-word;
 }
 
 .terminal-line {

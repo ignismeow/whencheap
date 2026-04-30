@@ -7,19 +7,19 @@ export class HealthController {
 
   @Get()
   getHealth() {
-    const zeroGConfigured = Boolean(this.config.get<string>('ZG_BEARER_TOKEN'));
-    const ollamaConfigured = Boolean(this.config.get<string>('OLLAMA_BASE_URL'));
+    const zeroGConfigured = Boolean(this.config.get<string>('ZG_API_KEY'));
+    const groqConfigured = Boolean(this.config.get<string>('GROQ_API_KEY'));
 
     return {
       ok: true,
       service: 'whencheap-api',
       network: this.config.get<string>('NETWORK') ?? 'sepolia',
       ai: {
-        provider: zeroGConfigured ? '0g' : 'ollama',
+        provider: zeroGConfigured ? '0g' : 'groq',
         model: zeroGConfigured
           ? (this.config.get<string>('ZG_MODEL') ?? 'auto')
-          : (this.config.get<string>('OLLAMA_MODEL') ?? 'llama3.1:8b'),
-        configured: zeroGConfigured || ollamaConfigured
+          : 'llama-3.3-70b-versatile',
+        configured: zeroGConfigured || groqConfigured
       }
     };
   }

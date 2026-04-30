@@ -9,7 +9,7 @@ import {
   XCircle
 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
-import { FormEvent, KeyboardEvent, ReactNode, useEffect, useMemo, useState } from 'react';
+import { FormEvent, KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { formatEther, parseEther } from 'viem';
 import { mainnet, sepolia } from 'viem/chains';
 import { useReadContract } from 'wagmi';
@@ -28,26 +28,28 @@ type AuditEvent = {
   metadata?: Record<string, unknown>;
 };
 
+type ParsedIntentPayload = {
+  type: string;
+  fromToken: string;
+  toToken?: string;
+  recipient?: string;
+  resolvedRecipient?: string;
+  amount: string;
+  maxFeeUsd: number;
+  deadlineIso: string;
+  chain: string;
+  slippageBps: number;
+  repeatCount?: number;
+  notes?: string;
+};
+
 type IntentRecord = {
   id: string;
   wallet: string;
   rawInput: string;
   status: string;
   txHash?: string;
-  parsed: {
-    type: string;
-    fromToken: string;
-    toToken?: string;
-    recipient?: string;
-    resolvedRecipient?: string;
-    amount: string;
-    maxFeeUsd: number;
-    deadlineIso: string;
-    chain: string;
-    slippageBps: number;
-    repeatCount?: number;
-    notes?: string;
-  };
+  parsed: ParsedIntentPayload;
   createdAt: string;
   updatedAt: string;
   audit: AuditEvent[];
@@ -80,6 +82,25 @@ type ManagedIdentity = {
   email: string;
   address: `0x${string}`;
   created?: boolean;
+};
+
+type ChatMessage = {
+  id: string;
+  role: 'agent' | 'user';
+  content: string;
+  timestamp: Date;
+  intentId?: string;
+};
+
+type IntentPreviewResponse = {
+  parsed: ParsedIntentPayload;
+  providerUsed: string;
+  deadlineMinutes: number | null;
+};
+
+type PendingIntentPreview = {
+  normalizedInput: string;
+  preview: IntentPreviewResponse;
 };
 
 type SessionStatus = {
@@ -141,7 +162,7 @@ const alchemyKey = process.env.NEXT_PUBLIC_ALCHEMY_KEY ?? '';
 
 export default function Home() {
   const router = useRouter();
-  const [input, setInput] = useState('Send 0.001 ETH to 0xfC2b1688B9776ae0cA6dbf8Fc335a69a6e97578D when gas is under $1 in next 30 minutes'
+  const [input, setInput] = useState('Send 0.001 ETH to 0x9dD40426fe0dbaF3d28B4fe7f499231e6FFd3873 when gas is under $1 in next 30 minutes'
 );
   const [selectedChain, setSelectedChain] = useState<'sepolia' | 'mainnet'>('sepolia');
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -156,6 +177,19 @@ export default function Home() {
   const [ensResolutionError, setEnsResolutionError] = useState<string | null>(null);
   const [isResolvingEns, setIsResolvingEns] = useState(false);
   const [liveGasPriceWei, setLiveGasPriceWei] = useState<bigint | null>(null);
+  const [awaitingConfirmation, setAwaitingConfirmation] = useState(false);
+  const [pendingIntentPreview, setPendingIntentPreview] = useState<PendingIntentPreview | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([
+    {
+      id: 'welcome',
+      role: 'agent',
+      content:
+        "Hey! I'm WhenCheap.\n\nTell me what you want to swap or send. Try:\n\n\"Swap 0.001 ETH to USDC when gas is under $2 on Sepolia\"",
+      timestamp: new Date(),
+    },
+  ]);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const pollingIntervalsRef = useRef<Record<string, number>>({});
 
   const { data, mutate, isLoading } = useSWR<IntentRecord[]>(`${apiUrl}/intents`, fetcher, {
     refreshInterval: 5000
@@ -218,6 +252,17 @@ export default function Home() {
     window.localStorage.setItem(chainStorageKey, selectedChain);
     setSelectedId(null);
   }, [selectedChain]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, isSubmitting]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(pollingIntervalsRef.current).forEach((intervalId) => window.clearInterval(intervalId));
+      pollingIntervalsRef.current = {};
+    };
+  }, []);
 
   useEffect(() => {
     const candidate = extractEnsCandidate(input);
@@ -305,10 +350,141 @@ export default function Home() {
     window.google?.accounts.id.disableAutoSelect();
   }
 
-  async function createIntent(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  function addAgentMessage(content: string, intentId?: string) {
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `${intentId ?? 'agent'}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+        role: 'agent',
+        content,
+        timestamp: new Date(),
+        intentId,
+      },
+    ]);
+  }
+
+  function describePreview(preview: IntentPreviewResponse) {
+    const { parsed, deadlineMinutes } = preview;
+    return (
+      `Here's what I understood:\n\n` +
+      `Type: ${parsed.type}\n` +
+      `Amount: ${parsed.amount} ${parsed.fromToken}\n` +
+      `${parsed.toToken ? `To: ${parsed.toToken}\n` : ''}` +
+      `${parsed.recipient ? `Recipient: ${truncateAddress(parsed.recipient)}\n` : ''}` +
+      `Max gas fee: $${parsed.maxFeeUsd}\n` +
+      `Chain: ${normalizeIntentChain(parsed.chain) === 'mainnet' ? 'Mainnet' : 'Sepolia'}\n` +
+      `${deadlineMinutes ? `Deadline: ${deadlineMinutes} minutes\n` : ''}` +
+      `\nType "confirm" to execute or "cancel" to start over.`
+    );
+  }
+
+  function startPolling(intentId: string) {
+    if (pollingIntervalsRef.current[intentId]) {
+      window.clearInterval(pollingIntervalsRef.current[intentId]);
+    }
+
+    let lastStatus = '';
+    const statusMessages: Record<string, (intent: IntentRecord) => string> = {
+      PENDING_INTENT: () => 'Monitoring gas now...',
+      SUBMITTED: (intent) =>
+        intent.parsed.type === 'swap'
+          ? `Broadcasting via Uniswap /${getUniswapEndpointForIntent(intent)} (${getUniswapEndpointForIntent(intent) === 'swap_7702' ? 'EIP-7702 optimized' : 'fallback'})...\n${intent.parsed.amount} ${intent.parsed.fromToken} -> ${intent.parsed.toToken ?? 'USDC'}`
+          : 'Broadcast accepted. Waiting for confirmations...',
+      CONFIRMING: () => 'Transaction seen onchain. Confirming now...',
+      CONFIRMED: (intent) =>
+        `Confirmed onchain${intent.txHash ? `.\nTx: ${intent.txHash.slice(0, 10)}...${intent.txHash.slice(-6)}` : '.'}`,
+      FINALIZED: (intent) =>
+        `Execution complete.\n\n${intent.parsed.amount} ${intent.parsed.fromToken} -> ${intent.parsed.toToken ?? intent.parsed.recipient ?? 'destination'}\n${
+          intent.txHash ? `View: ${explorerUrlForIntent(intent, intent.txHash)}` : ''
+        }`.trim(),
+      NEEDS_REAUTHORIZATION: () => 'Session expired or needs re-authorization before execution can continue.',
+      INSUFFICIENT_BALANCE: () => 'Managed wallet balance is too low for this command.',
+      CANCELLED: () => 'Intent cancelled.',
+      STUCK: () => 'Intent is stuck. Try cancelling and resubmitting with a simpler route.',
+      DEADLINE_EXCEEDED: () => 'The intent deadline passed before execution.',
+    };
+
+    const intervalId = window.setInterval(async () => {
+      try {
+        const response = await fetch(`${apiUrl}/intents/${intentId}`);
+        if (!response.ok) return;
+
+        const intent = (await response.json()) as IntentRecord;
+        if (intent.status === lastStatus) return;
+        lastStatus = intent.status;
+
+        const buildMessage = statusMessages[intent.status];
+        if (buildMessage) {
+          addAgentMessage(buildMessage(intent), intentId);
+        }
+
+        if (
+          [
+            'FINALIZED',
+            'CONFIRMED',
+            'CANCELLED',
+            'STUCK',
+            'DEADLINE_EXCEEDED',
+            'INSUFFICIENT_BALANCE',
+          ].includes(intent.status)
+        ) {
+          window.clearInterval(intervalId);
+          delete pollingIntervalsRef.current[intentId];
+          void mutate();
+        }
+      } catch {
+        // Keep polling quietly during transient frontend/network failures.
+      }
+    }, 4000);
+
+    pollingIntervalsRef.current[intentId] = intervalId;
+  }
+
+  async function submitConfirmedIntent(previewToSubmit: PendingIntentPreview) {
     if (!effectiveAddress) {
-      setError('Verify with Google first.');
+      throw new Error('Verify with Google first.');
+    }
+
+    const response = await fetch(`${apiUrl}/intents`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        wallet: effectiveAddress,
+        input: previewToSubmit.normalizedInput,
+        parsed: previewToSubmit.preview.parsed,
+      }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(body || 'Intent creation failed');
+    }
+
+    return (await response.json()) as IntentRecord;
+  }
+
+  async function handleQuickReply(action: 'confirm' | 'cancel') {
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `user-${Date.now()}`,
+        role: 'user',
+        content: action,
+        timestamp: new Date(),
+      },
+    ]);
+    setInput('');
+
+    if (action === 'cancel') {
+      setAwaitingConfirmation(false);
+      setPendingIntentPreview(null);
+      addAgentMessage('Cancelled. What would you like to do instead?');
+      return;
+    }
+
+    if (!pendingIntentPreview) {
+      addAgentMessage('There is no pending intent to confirm. Start with a new message.');
+      setAwaitingConfirmation(false);
       return;
     }
 
@@ -316,8 +492,68 @@ export default function Home() {
     setError(null);
 
     try {
-      const normalizedInput = enforceChainSelection(input, selectedChain);
-      const response = await fetch(`${apiUrl}/intents`, {
+      const created = await submitConfirmedIntent(pendingIntentPreview);
+      setSelectedId(created.id);
+      await mutate();
+      addAgentMessage(
+        `Intent #${created.id.slice(0, 8).toUpperCase()} created.\n\n` +
+          `${created.parsed.amount} ${created.parsed.fromToken} -> ${created.parsed.toToken ?? created.parsed.recipient ?? 'destination'}\n` +
+          `Max fee: $${created.parsed.maxFeeUsd ?? 1}\n` +
+          `Chain: ${normalizeIntentChain(created.parsed.chain) === 'mainnet' ? 'Mainnet' : 'Sepolia'}\n\n` +
+          'Monitoring gas now...',
+        created.id,
+      );
+      startPolling(created.id);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Intent creation failed';
+      setError(message);
+      addAgentMessage(`I couldn't create that intent.\n\n${message}`);
+    } finally {
+      setAwaitingConfirmation(false);
+      setPendingIntentPreview(null);
+      setIsSubmitting(false);
+    }
+  }
+
+  async function handleSend() {
+    if (!effectiveAddress) {
+      setError('Verify with Google first.');
+      addAgentMessage('Verify with Google first so I can create intents from your managed wallet.');
+      return;
+    }
+    if (!input.trim() || isSubmitting) return;
+
+    const userText = input.trim();
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `user-${Date.now()}`,
+        role: 'user',
+        content: userText,
+        timestamp: new Date(),
+      },
+    ]);
+
+    setInput('');
+
+    if (awaitingConfirmation) {
+      const command = userText.toLowerCase();
+      if (command === 'confirm') {
+        await handleQuickReply('confirm');
+      } else if (command === 'cancel') {
+        await handleQuickReply('cancel');
+      } else {
+        addAgentMessage('Type "confirm" to proceed or "cancel" to start over.');
+      }
+      return;
+    }
+
+    setIsSubmitting(true);
+    setError(null);
+
+    try {
+      const normalizedInput = enforceChainSelection(userText, selectedChain);
+      const response = await fetch(`${apiUrl}/intents/preview`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ wallet: effectiveAddress, input: normalizedInput })
@@ -328,20 +564,30 @@ export default function Home() {
         throw new Error(body || 'Intent creation failed');
       }
 
-      const created = (await response.json()) as IntentRecord;
-      setSelectedId(created.id);
-      await mutate();
+      const preview = (await response.json()) as IntentPreviewResponse;
+      setPendingIntentPreview({ normalizedInput, preview });
+      setAwaitingConfirmation(true);
+      addAgentMessage(describePreview(preview));
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Intent creation failed');
+      const message = err instanceof Error ? err.message : 'Intent preview failed';
+      setError(message);
+      addAgentMessage(
+        `I couldn't parse that intent.\n\n${message}\n\nTry: "Swap 0.001 ETH to USDC when gas is under $2 on Sepolia"`,
+      );
     } finally {
       setIsSubmitting(false);
     }
   }
 
+  async function createIntent(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await handleSend();
+  }
+
   function submitIntentOnEnter(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
-      event.currentTarget.form?.requestSubmit();
+      void handleSend();
     }
   }
 
@@ -392,22 +638,64 @@ export default function Home() {
       <div className="console-root">
         <aside className="console-sidebar">
           <ConsolePanel title="Intent Input" eyebrow="Translate Natural Language" className="console-intent-panel">
-            <form onSubmit={createIntent} className="space-y-4">
-              <textarea
-                value={input}
-                onChange={(event) => setInput(event.target.value)}
-                onKeyDown={submitIntentOnEnter}
-                className="console-input min-h-[220px] w-full resize-none xl:min-h-[320px]"
-                placeholder="Send 0.1 ETH to vitalik.eth when gas is under $0.50..."
-              />
+            <form onSubmit={createIntent} className="flex h-full min-h-0 flex-col space-y-4">
+              <div className="console-scroll flex min-h-[220px] flex-1 flex-col gap-3 px-4 py-3 xl:min-h-[320px]">
+                {messages.map((msg) => (
+                  <ChatMessageBubble key={msg.id} message={msg} />
+                ))}
+
+                {isSubmitting ? (
+                  <div className="flex items-start gap-2">
+                    <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[var(--color-accent)] text-[10px] font-bold text-black">
+                      W
+                    </div>
+                    <div className="flex gap-1 rounded-[18px] rounded-tl-[4px] border border-[var(--color-border)] bg-zinc-900 px-3 py-3">
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-zinc-400" style={{ animationDelay: '0ms' }} />
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-zinc-400" style={{ animationDelay: '150ms' }} />
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-zinc-400" style={{ animationDelay: '300ms' }} />
+                    </div>
+                  </div>
+                ) : null}
+                <div ref={messagesEndRef} />
+              </div>
+
+              <div className="px-4 pb-2">
+                <textarea
+                  value={input}
+                  onChange={(event) => setInput(event.target.value)}
+                  onKeyDown={submitIntentOnEnter}
+                  rows={2}
+                  className="w-full resize-none rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 placeholder-zinc-500 focus:border-[var(--color-accent)] focus:outline-none"
+                  placeholder="Swap 0.001 ETH to USDC when gas < $2..."
+                />
+                <p className="mt-1 text-[10px] normal-case tracking-normal text-[var(--color-muted)]">
+                  Press Enter to send · Shift+Enter for new line
+                </p>
+              </div>
+
+              {awaitingConfirmation ? (
+                <div className="flex gap-2 px-4 pb-2">
+                  <button
+                    type="button"
+                    onClick={() => void handleQuickReply('confirm')}
+                    className="flex-1 rounded-lg bg-[var(--color-accent)] py-2 text-xs font-medium text-black"
+                  >
+                    Confirm
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleQuickReply('cancel')}
+                    className="flex-1 rounded-lg bg-zinc-700 py-2 text-xs text-white"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : null}
 
               <div className="space-y-2 text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
                 <div className="console-subpanel">
                   <span className="block text-[10px] text-[var(--color-label)]">Managed wallet</span>
                   <span className="mt-1 block text-[var(--color-text)]">{truncateAddress(effectiveAddress ?? '')}</span>
-                  <span className="mt-2 block normal-case tracking-normal text-[var(--color-muted)]">
-                    Press Enter to submit. Use Shift+Enter for a new line.
-                  </span>
                 </div>
 
                 {showsMainnetSwapWarning(input) ? (
@@ -430,8 +718,6 @@ export default function Home() {
                     </span>
                   </div>
                 ) : null}
-
-                {error ? <p className="text-[var(--color-danger)] normal-case tracking-normal">{error}</p> : null}
               </div>
 
               <div className="space-y-2">
@@ -446,6 +732,11 @@ export default function Home() {
                 <p className="text-[10px] normal-case tracking-normal text-[var(--color-muted)]">
                   0.3% execution fee applies on confirmed transactions.
                 </p>
+                {/\bswap\b/i.test(input) && selectedChain === 'sepolia' ? (
+                  <p className="text-[10px] normal-case tracking-normal text-[var(--color-warning)]">
+                    Demo note: Sepolia currently supports ETH -&gt; token swaps only. Try ETH -&gt; USDC or ETH -&gt; DAI.
+                  </p>
+                ) : null}
               </div>
             </form>
           </ConsolePanel>
@@ -587,6 +878,105 @@ function LandingHero({ onLaunch }: { onLaunch: () => void }) {
         </div>
       </div>
     </section>
+  );
+}
+
+function ChatMessageBubble({ message }: { message: ChatMessage }) {
+  if (message.role === 'user') {
+    return (
+      <div className="flex justify-end">
+        <div className="chat-bubble chat-bubble-user">
+          <ChatMessageContent content={message.content} role="user" />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-start gap-3">
+      <div className="chat-avatar">W</div>
+      <div className="chat-bubble chat-bubble-agent">
+        <ChatMessageContent content={message.content} role="agent" />
+      </div>
+    </div>
+  );
+}
+
+function ChatMessageContent({
+  content,
+  role,
+}: {
+  content: string;
+  role: 'agent' | 'user';
+}) {
+  const lines = content.split('\n').map((line) => line.trimEnd());
+  const structuredLines = lines.filter(
+    (line) =>
+      /^(Type|Amount|To|Recipient|Max gas fee|Max fee|Chain|Deadline|Tx|View):/i.test(line),
+  );
+  const hasStructuredContent = role === 'agent' && structuredLines.length >= 2;
+  const header = lines[0] ?? '';
+  const trailingNote =
+    role === 'agent' && /^Type "confirm" to execute or "cancel" to start over\.$/i.test(lines.at(-1) ?? '')
+      ? (lines.at(-1) ?? '')
+      : null;
+
+  if (hasStructuredContent) {
+    const introLines = lines.filter(
+      (line) =>
+        line &&
+        !/^(Type|Amount|To|Recipient|Max gas fee|Max fee|Chain|Deadline|Tx|View):/i.test(line) &&
+        line !== trailingNote,
+    );
+
+    return (
+      <div className="space-y-3">
+        {introLines.length > 0 ? (
+          <div className="space-y-2">
+            {introLines.map((line, index) => (
+              <p
+                key={`${line}-${index}`}
+                className={`chat-message-line ${index === 0 ? 'chat-message-title' : ''}`}
+              >
+                {renderInlineContent(line, role)}
+              </p>
+            ))}
+          </div>
+        ) : null}
+
+        <div className="chat-structured-card">
+          {structuredLines.map((line, index) => {
+            const [rawLabel, ...rest] = line.split(':');
+            const value = rest.join(':').trim();
+            return (
+              <div key={`${line}-${index}`} className="chat-structured-row">
+                <span className="chat-structured-label">{rawLabel}</span>
+                <span className="chat-structured-value">{renderInlineContent(value, role)}</span>
+              </div>
+            );
+          })}
+        </div>
+
+        {trailingNote ? <p className="chat-message-note">{trailingNote}</p> : null}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {lines.map((line, index) =>
+        line ? (
+          <p
+            key={`${line}-${index}`}
+            className={`chat-message-line ${index === 0 && role === 'agent' ? 'chat-message-title' : ''}`}
+          >
+            {renderInlineContent(line, role)}
+          </p>
+        ) : (
+          <div key={`spacer-${index}`} className="h-1.5" />
+        ),
+      )}
+    </div>
   );
 }
 
@@ -1049,10 +1439,15 @@ function SessionCard({
                     You will receive the output for exactly {draftIntentEstimate.amount} {draftIntentEstimate.fromToken} swapped, plus gas is charged separately.
                   </p>
                 ) : null}
+                {draftIntentEstimate.type === 'swap' && draftIntentEstimate.chain === 'sepolia' ? (
+                  <p className="mt-2 text-[11px] normal-case tracking-normal text-[var(--color-warning)]">
+                    Demo supports ETH -&gt; USDC and ETH -&gt; DAI on Sepolia. Token -&gt; ETH routes are intentionally blocked for now.
+                  </p>
+                ) : null}
               </>
             ) : (
               <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
-                Enter an ETH send or swap intent to calculate the minimum wallet funding requirement.
+                Enter an ETH send or ETH -&gt; token swap intent to calculate the minimum wallet funding requirement.
               </p>
             )}
           </div>
@@ -1137,6 +1532,40 @@ function SessionCard({
 
 function normalizeIntentChain(chain: string) {
   return isMainnetChain(chain) ? 'mainnet' : 'sepolia';
+}
+
+function getUniswapEndpointForIntent(intent: IntentRecord): 'swap_7702' | 'swap' {
+  const endpoint = intent.audit.find((event) => {
+    const value = event.metadata?.uniswapEndpoint;
+    return value === 'swap' || value === 'swap_7702';
+  })?.metadata?.uniswapEndpoint;
+  return endpoint === 'swap' ? 'swap' : 'swap_7702';
+}
+
+function renderInlineContent(value: string, role: 'agent' | 'user') {
+  const urlMatch = value.match(/https?:\/\/\S+/i);
+  if (!urlMatch) {
+    return value;
+  }
+
+  const url = urlMatch[0];
+  const before = value.slice(0, urlMatch.index ?? 0);
+  const after = value.slice((urlMatch.index ?? 0) + url.length);
+
+  return (
+    <>
+      {before}
+      <a
+        href={url}
+        target="_blank"
+        rel="noreferrer"
+        className={role === 'user' ? 'underline' : 'text-[var(--color-accent)] underline'}
+      >
+        {url}
+      </a>
+      {after}
+    </>
+  );
 }
 
 function enforceChainSelection(input: string, chain: 'sepolia' | 'mainnet') {
@@ -1557,6 +1986,10 @@ function explorerTxUrl(chain: string, hash: string) {
   return isMainnetChain(chain)
     ? `https://etherscan.io/tx/${hash}`
     : `https://sepolia.etherscan.io/tx/${hash}`;
+}
+
+function explorerUrlForIntent(intent: IntentRecord, hash: string) {
+  return explorerTxUrl(intent.parsed.chain, hash);
 }
 
 function normalizeChainLabel(chain: string) {

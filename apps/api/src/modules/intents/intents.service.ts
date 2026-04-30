@@ -87,9 +87,40 @@ export class IntentsService implements OnModuleInit {
     }
   }
 
-  async create(dto: CreateIntentDto): Promise<IntentRecord> {
+  async preview(dto: CreateIntentDto): Promise<{
+    parsed: ParsedIntent;
+    providerUsed: string;
+    deadlineMinutes: number | null;
+  }> {
     const { parsed: rawParsed, providerUsed } = await this.parser.parse(dto.input, dto.wallet);
     const parsed = await this.resolveEnsRecipient(rawParsed);
+    const deadlineMs = new Date(parsed.deadlineIso).getTime();
+    const deadlineMinutes = Number.isFinite(deadlineMs)
+      ? Math.max(0, Math.round((deadlineMs - Date.now()) / 60000))
+      : null;
+
+    return {
+      parsed,
+      providerUsed,
+      deadlineMinutes,
+    };
+  }
+
+  async create(dto: CreateIntentDto): Promise<IntentRecord> {
+    const preview = dto.parsed
+      ? {
+          parsed: await this.resolveEnsRecipient(dto.parsed as ParsedIntent),
+          providerUsed: 'preview-confirmed',
+        }
+      : await (async () => {
+          const { parsed: rawParsed, providerUsed } = await this.parser.parse(dto.input, dto.wallet);
+          return {
+            parsed: await this.resolveEnsRecipient(rawParsed),
+            providerUsed,
+          };
+        })();
+    const parsed = preview.parsed;
+    const providerUsed = preview.providerUsed;
     const now = new Date().toISOString();
     const id = randomUUID();
     const requestedExecutions = Math.max(parsed.repeatCount ?? 1, 1);
@@ -398,10 +429,6 @@ export class IntentsService implements OnModuleInit {
       }
 
       const registeredWallet = await this.sessionSigner.getRegisteredWallet(intent.wallet);
-      const authorization = await this.sessionSigner.getAuthorization(
-        intent.wallet,
-        intent.parsed.chain ?? 'sepolia',
-      );
 
       if (intent.parsed.type === 'swap') {
         if (!registeredWallet) {
@@ -420,6 +447,7 @@ export class IntentsService implements OnModuleInit {
             baseFeeGwei,
             'swap',
             intent.parsed.chain ?? 'sepolia',
+            intent.parsed.fromToken ?? 'ETH',
           );
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
@@ -431,6 +459,11 @@ export class IntentsService implements OnModuleInit {
         continue;
       }
 
+      const authorization = await this.sessionSigner.getAuthorization(
+        intent.wallet,
+        intent.parsed.chain ?? 'sepolia',
+      );
+
       if (registeredWallet) {
         try {
           await this.sessionSigner.ensureManagedWalletHasRequiredBalance(
@@ -439,6 +472,7 @@ export class IntentsService implements OnModuleInit {
             baseFeeGwei,
             intent.parsed.type as 'send' | 'swap',
             intent.parsed.chain ?? 'sepolia',
+            intent.parsed.fromToken ?? 'ETH',
           );
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
@@ -526,36 +560,40 @@ export class IntentsService implements OnModuleInit {
 
   private async executeSwap(intent: IntentRecord, baseFeeGwei: number) {
     try {
+      const chain = intent.parsed.chain ?? 'sepolia';
+      const fromToken = intent.parsed.fromToken;
       const swapAmountWei = this.parseIntentAmountWei(intent.parsed.amount);
       const feeWei = await this.sessionSigner.getPlatformFeeWei(
         swapAmountWei,
-        intent.parsed.chain ?? 'sepolia',
+        chain,
       );
       const netSwapWei = await this.sessionSigner.getNetSwapAmountWei(
         swapAmountWei,
-        intent.parsed.chain ?? 'sepolia',
+        chain,
       );
 
       await this.addAudit(
         intent,
         'SWAP_EXECUTING',
-        `Executing swap: ${intent.parsed.amount} ${intent.parsed.fromToken} -> ${intent.parsed.toToken ?? 'USDC'} ` +
-          `via Uniswap on ${intent.parsed.chain ?? 'sepolia'}. ` +
-          `Net routed to swap: ${formatEther(netSwapWei)} ETH. ` +
-          `Fee to collect after confirmation: ${formatEther(feeWei)} ETH.`,
+        `Executing swap: ${intent.parsed.amount} ${fromToken} -> ${intent.parsed.toToken ?? 'USDC'} ` +
+          `via Uniswap /swap_7702 on ${chain}. ` +
+          `Net routed to swap: ${this.sessionSigner.formatTokenAmount(netSwapWei, fromToken, chain)}. ` +
+          `Platform fee: ${this.sessionSigner.formatTokenAmount(feeWei, fromToken, chain)}.`,
         {
-          chain: intent.parsed.chain ?? 'sepolia',
+          chain,
           baseFeeGwei,
-          fromToken: intent.parsed.fromToken,
+          fromToken,
           toToken: intent.parsed.toToken ?? 'USDC',
           amount: intent.parsed.amount,
+          uniswapEndpoint: 'swap_7702',
+          eip7702Optimized: true,
           feeWei: feeWei.toString(),
           netSwapWei: netSwapWei.toString(),
           senderModel: 'eip7702-managed-wallet',
         },
       );
 
-      const txHash = await this.sessionSigner.executeSwap(intent);
+      const { txHash, uniswapEndpoint } = await this.sessionSigner.executeSwap(intent);
       intent.txHash = txHash;
       await this.transition(
         intent,
@@ -563,6 +601,8 @@ export class IntentsService implements OnModuleInit {
         `Swap broadcast. Hash: ${txHash}`,
         {
           txHash,
+          uniswapEndpoint,
+          eip7702Optimized: uniswapEndpoint === 'swap_7702',
           senderModel: 'eip7702-managed-wallet',
           userWallet: intent.wallet,
         },
@@ -570,11 +610,16 @@ export class IntentsService implements OnModuleInit {
       await this.logKeeperHubExecution(intent);
     } catch (err) {
       const message = String(err);
-      if (message.includes('No route found')) {
+      if (
+        message.includes('No route found') ||
+        message.includes('Sepolia demo currently supports ETH-funded swaps only')
+      ) {
         await this.transition(
           intent,
           IntentStatus.Stuck,
-          `Uniswap route not available for this pair on ${intent.parsed.chain ?? 'sepolia'}. Try a different token pair.`,
+          message.includes('Sepolia demo currently supports ETH-funded swaps only')
+            ? 'Sepolia demo currently supports ETH -> token swaps only. Try ETH -> USDC or ETH -> DAI.'
+            : `Uniswap route not available for this pair on ${intent.parsed.chain ?? 'sepolia'}. Try a different token pair.`,
           { error: message, chain: intent.parsed.chain ?? 'sepolia' },
         );
         this.intents.delete(intent.id);
