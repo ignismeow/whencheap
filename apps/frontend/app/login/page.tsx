@@ -34,7 +34,7 @@ declare global {
   }
 }
 
-const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+const apiUrl = '/api';
 const googleClientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ?? '';
 const authStorageKey = 'whencheap-google-identity';
 

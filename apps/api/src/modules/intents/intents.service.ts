@@ -24,6 +24,25 @@ import { IntentEntity } from './intent.entity';
 import { IntentStatus } from './intent-status';
 import { AuditEvent, ExecutionRecord, IntentRecord } from './intent.types';
 
+const MAX_RETRIES_ROUTING = 3;
+const MAX_RETRIES_GENERAL = 5;
+const ROUTING_RETRY_DELAY_MS = 2 * 60 * 1000;
+const PERMANENT_ERRORS = [
+  'insufficient funds',
+  'Session expired',
+  'session expired',
+  'budget exceeded',
+  'BudgetExceeded',
+  'Session limits exceeded',
+  'session limits exceeded',
+  'Sepolia demo currently supports ETH-funded swaps only',
+];
+const ROUTING_ERRORS = [
+  'No quotes available',
+  'No route found',
+  'ResourceNotFound',
+];
+
 @Injectable()
 export class IntentsService implements OnModuleInit {
   private readonly logger = new Logger(IntentsService.name);
@@ -140,6 +159,9 @@ export class IntentsService implements OnModuleInit {
       txHash: undefined,
       blockNumber: null,
       inferenceProvider: providerUsed,
+      retryCount: 0,
+      nextRetryAt: null,
+      lastError: null,
       audit: [],
       executions: [],
     };
@@ -157,6 +179,9 @@ export class IntentsService implements OnModuleInit {
         inferenceProvider: providerUsed,
         repeatCount: requestedExecutions,
         repeatCompleted: 0,
+        retryCount: 0,
+        nextRetryAt: null,
+        lastError: null,
         deadline: parsed.deadlineIso ? new Date(parsed.deadlineIso) : null,
       }),
     );
@@ -339,6 +364,10 @@ export class IntentsService implements OnModuleInit {
     if (pending.length === 0) return;
 
     for (const intent of pending) {
+      if (intent.nextRetryAt && new Date(intent.nextRetryAt).getTime() > Date.now()) {
+        continue;
+      }
+
       if (new Date(intent.parsed.deadlineIso).getTime() < Date.now()) {
         await this.transition(
           intent,
@@ -537,24 +566,7 @@ export class IntentsService implements OnModuleInit {
       );
       await this.logKeeperHubExecution(intent);
     } catch (err) {
-      const message = String(err);
-      if (intent.parsed.type === 'swap' && message.includes('No route found')) {
-        await this.transition(
-          intent,
-          IntentStatus.Stuck,
-          `Uniswap route not available for this pair on ${intent.parsed.chain ?? 'sepolia'}. Try a different token pair.`,
-          { error: message, chain: intent.parsed.chain ?? 'sepolia' },
-        );
-        this.intents.delete(intent.id);
-        return;
-      }
-
-      this.logger.warn(`Direct execution failed for intent ${intent.id}: ${String(err)}`);
-      await this.addAudit(
-        intent,
-        'EXECUTION_FAILED',
-        `Broadcast failed: ${message}. Will retry next gas check.`,
-      );
+      await this.handleExecutionFailure(intent, err, 'Direct execution failed');
     }
   }
 
@@ -609,29 +621,7 @@ export class IntentsService implements OnModuleInit {
       );
       await this.logKeeperHubExecution(intent);
     } catch (err) {
-      const message = String(err);
-      if (
-        message.includes('No route found') ||
-        message.includes('Sepolia demo currently supports ETH-funded swaps only')
-      ) {
-        await this.transition(
-          intent,
-          IntentStatus.Stuck,
-          message.includes('Sepolia demo currently supports ETH-funded swaps only')
-            ? 'Sepolia demo currently supports ETH -> token swaps only. Try ETH -> USDC or ETH -> DAI.'
-            : `Uniswap route not available for this pair on ${intent.parsed.chain ?? 'sepolia'}. Try a different token pair.`,
-          { error: message, chain: intent.parsed.chain ?? 'sepolia' },
-        );
-        this.intents.delete(intent.id);
-        return;
-      }
-
-      this.logger.warn(`Swap execution failed for intent ${intent.id}: ${message}`);
-      await this.addAudit(
-        intent,
-        'EXECUTION_FAILED',
-        `Swap failed: ${message}. Will retry next gas check.`,
-      );
+      await this.handleExecutionFailure(intent, err, 'Swap execution failed');
     }
   }
 
@@ -780,11 +770,7 @@ export class IntentsService implements OnModuleInit {
       await this.logKeeperHubExecution(intent);
     } catch (err) {
       this.logger.warn(`On-chain-session execution failed for intent ${intent.id}: ${String(err)}`);
-      await this.addAudit(
-        intent,
-        'EXECUTION_FAILED',
-        `On-chain-session-backed broadcast failed: ${String(err)}. Will retry next gas check.`,
-      );
+      await this.handleExecutionFailure(intent, err, 'On-chain-session execution failed');
     }
   }
 
@@ -946,18 +932,92 @@ export class IntentsService implements OnModuleInit {
     await this.addAudit(intent, 'STATUS_CHANGED', message, { status, ...metadata });
   }
 
+  private async handleExecutionFailure(
+    intent: IntentRecord,
+    error: unknown,
+    context: string,
+  ): Promise<void> {
+    const errorStr = error instanceof Error ? error.message : String(error);
+    this.logger.warn(`${context} for intent ${intent.id}: ${errorStr}`);
+
+    const isPermanent = PERMANENT_ERRORS.some((item) => errorStr.includes(item));
+    const isRoutingError = ROUTING_ERRORS.some((item) => errorStr.includes(item));
+    const maxRetries = isRoutingError ? MAX_RETRIES_ROUTING : MAX_RETRIES_GENERAL;
+    const retryCount = (intent.retryCount ?? 0) + 1;
+    intent.retryCount = retryCount;
+
+    if (isPermanent || retryCount >= maxRetries) {
+      const userFriendlyReason = this.userFriendlyFailureReason(errorStr, isRoutingError);
+      intent.status = IntentStatus.Failed;
+      intent.lastError = userFriendlyReason;
+      intent.nextRetryAt = null;
+      intent.updatedAt = new Date().toISOString();
+      await this.persistIntent(intent);
+      await this.addAudit(intent, 'INTENT_FAILED', userFriendlyReason, {
+        reason: userFriendlyReason,
+        retryCount,
+        maxRetries,
+      });
+      this.intents.delete(intent.id);
+      return;
+    }
+
+    const nextRetryAt = isRoutingError
+      ? new Date(Date.now() + ROUTING_RETRY_DELAY_MS).toISOString()
+      : null;
+
+    intent.status = IntentStatus.PendingIntent;
+    intent.nextRetryAt = nextRetryAt;
+    intent.lastError = isRoutingError
+      ? 'No swap route found on Sepolia. Will retry in 2 minutes.'
+      : 'Execution failed. Will retry next gas check.';
+    intent.updatedAt = new Date().toISOString();
+    await this.persistIntent(intent);
+    await this.addAudit(intent, 'EXECUTION_FAILED', intent.lastError, {
+      reason: intent.lastError,
+      retryCount,
+      maxRetries,
+      nextRetryAt,
+      routingRetry: isRoutingError,
+    });
+  }
+
+  private userFriendlyFailureReason(errorStr: string, isRoutingError: boolean): string {
+    if (errorStr.includes('insufficient funds')) {
+      return 'Insufficient ETH balance to cover swap + gas fees.';
+    }
+
+    if (errorStr.includes('Session expired') || errorStr.includes('session expired')) {
+      return 'Session expired. Please re-authorize.';
+    }
+
+    if (isRoutingError) {
+      return 'No swap route available after 3 attempts. Sepolia liquidity may be low.';
+    }
+
+    if (errorStr.includes('Sepolia demo currently supports ETH-funded swaps only')) {
+      return 'Sepolia demo currently supports ETH-funded swaps only. Try ETH to USDC or ETH to DAI.';
+    }
+
+    return 'Max retries exceeded. Please create a new intent.';
+  }
+
   private async addAudit(
     intent: IntentRecord,
     type: string,
     message: string,
     metadata?: Record<string, unknown>,
   ) {
+    const displayMessage = this.formatAuditMessage(type, {
+      message,
+      ...(metadata ?? {}),
+    });
     const event: AuditEvent = {
       id: randomUUID(),
       intentId: intent.id,
       at: new Date().toISOString(),
       type,
-      message,
+      message: displayMessage,
       metadata,
     };
     intent.audit.unshift(event);
@@ -968,11 +1028,76 @@ export class IntentsService implements OnModuleInit {
         id: event.id,
         intentId: intent.id,
         eventType: type,
-        message,
+        message: displayMessage,
         metadata: metadata ?? null,
         createdAt: new Date(event.at),
       }),
     );
+  }
+
+  private formatAuditMessage(event: string, data: Record<string, unknown>): string {
+    switch (event) {
+      case 'INTENT_CREATED':
+        return 'Intent accepted and parsed.';
+      case 'GAS_CHECK_PASSED':
+        return 'Gas is under your limit - ready to execute.';
+      case 'GAS_CHECK_FAILED':
+        return 'Gas too high. Waiting for cheaper window...';
+      case 'GAS_CHECK_SKIPPED':
+        return 'Gas oracle unavailable. Will retry next cycle.';
+      case 'SESSION_CHECK_PASSED':
+        return 'Session valid. Proceeding to execution.';
+      case 'SESSION_INVALID':
+      case 'NEEDS_AUTHORIZATION':
+        return 'Session authorization is required before execution can continue.';
+      case 'SWAP_EXECUTING':
+        return `Executing swap: ${String(data.amount ?? '')} ${String(data.fromToken ?? '')} -> ${String(data.toToken ?? 'USDC')} via Uniswap.`;
+      case 'SWAP_EXECUTED':
+        return `Swap executed successfully in block ${String(data.blockNumber ?? 'N/A')}.`;
+      case 'FEE_COLLECTED':
+        return `Platform fee collected: ${this.formatWeiMetadataAsEth(data.feeWei)} ETH.`;
+      case 'STATUS_CHANGED':
+        return `Status updated: ${String(data.status ?? '').replace(/_/g, ' ')}.`;
+      case 'EXECUTION_FAILED': {
+        const raw = String(data.error ?? data.reason ?? data.message ?? '');
+        if (raw.includes('No quotes available') || raw.includes('No swap route found')) {
+          return 'No swap route found on Sepolia. Will retry in 2 minutes.';
+        }
+        if (raw.includes('insufficient funds') || raw.includes('Insufficient')) {
+          return 'Insufficient balance to cover swap + gas. Please fund your wallet.';
+        }
+        if (raw.includes('Session expired')) {
+          return 'Session expired. Please re-authorize.';
+        }
+        if (raw.includes('replacement transaction underpriced')) {
+          return 'Transaction underpriced - retrying with higher gas.';
+        }
+        if (raw.includes('in-flight transaction limit')) {
+          return 'Network busy - retrying shortly.';
+        }
+        return 'Execution failed. Will retry next gas check.';
+      }
+      case 'INTENT_FAILED':
+        return `Intent permanently failed: ${String(data.reason ?? 'Unknown error')}.`;
+      case 'INTENT_CANCELLED':
+        return 'Intent cancelled by user.';
+      case 'SESSION_SPEND_RECORDED':
+        return 'Session spend recorded on-chain.';
+      case 'SWAP_BROADCAST':
+        return `Swap broadcast. Hash: ${String(data.hash ?? data.txHash ?? '').slice(0, 10)}...`;
+      default:
+        return `${event.replace(/_/g, ' ').toLowerCase()}.`;
+    }
+  }
+
+  private formatWeiMetadataAsEth(value: unknown): string {
+    if (typeof value !== 'string') return '0';
+
+    try {
+      return formatEther(BigInt(value));
+    } catch {
+      return value;
+    }
   }
 
   private async resolveEnsRecipient(parsed: ParsedIntent): Promise<ParsedIntent> {
@@ -1056,6 +1181,9 @@ export class IntentsService implements OnModuleInit {
         inferenceProvider: intent.inferenceProvider ?? null,
         repeatCount: intent.requestedExecutions,
         repeatCompleted: intent.completedExecutions,
+        retryCount: intent.retryCount ?? 0,
+        nextRetryAt: intent.nextRetryAt ? new Date(intent.nextRetryAt) : null,
+        lastError: intent.lastError ?? null,
         deadline: intent.parsed.deadlineIso ? new Date(intent.parsed.deadlineIso) : null,
         createdAt: new Date(intent.createdAt),
         updatedAt: new Date(intent.updatedAt),
@@ -1137,6 +1265,9 @@ export class IntentsService implements OnModuleInit {
       completedExecutions,
       remainingExecutions: Math.max(requestedExecutions - completedExecutions, 0),
       status: entity.status as IntentStatus,
+      retryCount: entity.retryCount ?? 0,
+      nextRetryAt: entity.nextRetryAt?.toISOString() ?? null,
+      lastError: entity.lastError ?? null,
       txHash: entity.txHash ?? undefined,
       blockNumber: entity.blockNumber,
       inferenceProvider: entity.inferenceProvider,

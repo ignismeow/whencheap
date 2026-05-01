@@ -8,6 +8,8 @@ import { HealthController } from './health.controller';
 import { AuditEventEntity } from './intents/audit-event.entity';
 import { ExecutionEntity } from './intents/execution.entity';
 import { IntentEntity } from './intents/intent.entity';
+import { GasModule } from './gas/gas.module';
+import { GasSnapshotEntity } from './gas/gas-snapshot.entity';
 import { SessionAuthorizationEntity } from './session/session-auth.entity';
 import { WhenCheapWallet } from './session/wallet.entity';
 import { StatsModule } from './stats.module';
@@ -31,6 +33,7 @@ import { UserEntity } from './user/user.entity';
           IntentEntity,
           ExecutionEntity,
           AuditEventEntity,
+          GasSnapshotEntity,
         ],
         synchronize: true,
         logging: false,
@@ -38,6 +41,7 @@ import { UserEntity } from './user/user.entity';
     }),
     ScheduleModule.forRoot(),
     AgentModule,
+    GasModule,
     IntentsModule,
     StatsModule,
     UserModule,

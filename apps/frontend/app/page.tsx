@@ -49,6 +49,8 @@ type IntentRecord = {
   rawInput: string;
   status: string;
   txHash?: string;
+  blockNumber?: number | null;
+  lastError?: string | null;
   parsed: ParsedIntentPayload;
   createdAt: string;
   updatedAt: string;
@@ -98,6 +100,25 @@ type IntentPreviewResponse = {
   deadlineMinutes: number | null;
 };
 
+type GasSuggestion = {
+  currentCosts: {
+    sendUsd: number;
+    swapUsd: number;
+    sendGwei: number;
+    swapGwei: number;
+  };
+  recommendedMaxFeeGwei: number;
+  recommendedMaxFeeUsd: number;
+  bestWindowMinutes: number;
+  estimatedSavingsUsd: number;
+  estimatedSavingsPct: number;
+  urgency: 'high' | 'medium' | 'low';
+  trend: 'rising' | 'falling' | 'stable';
+  trendPct: number;
+  recommendation: string;
+  confidence: 'high' | 'medium' | 'low';
+};
+
 type PendingIntentPreview = {
   normalizedInput: string;
   preview: IntentPreviewResponse;
@@ -142,7 +163,7 @@ declare global {
   }
 }
 
-const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+const apiUrl = '/api';
 const fetcher = (url: string) => fetch(url).then((res) => res.json());
 const sessionStatusFetcher = async (url: string) => {
   const response = await fetch(url);
@@ -154,6 +175,24 @@ const sessionStatusFetcher = async (url: string) => {
 
   return payload;
 };
+
+async function fetchGasSuggestion(preview: IntentPreviewResponse): Promise<GasSuggestion | null> {
+  const parsed = preview.parsed;
+  const params = new URLSearchParams({
+    type: parsed.type === 'swap' ? 'swap' : 'send',
+    chain: normalizeIntentChain(parsed.chain),
+  });
+
+  if (preview.deadlineMinutes) {
+    params.set('deadline', String(preview.deadlineMinutes));
+  }
+
+  const response = await fetch(`${apiUrl}/gas/suggestion?${params.toString()}`);
+  if (!response.ok) return null;
+
+  return (await response.json()) as GasSuggestion;
+}
+
 const authStorageKey = 'whencheap-google-identity';
 const chainStorageKey = 'whencheap-selected-chain';
 const EXECUTION_FEE_BPS = 30n;
@@ -363,18 +402,41 @@ export default function Home() {
     ]);
   }
 
-  function describePreview(preview: IntentPreviewResponse) {
+  function describePreview(preview: IntentPreviewResponse, gas: GasSuggestion | null) {
     const { parsed, deadlineMinutes } = preview;
+    const costKey = parsed.type === 'swap' ? 'swapUsd' : 'sendUsd';
+    const currentCostUsd = gas?.currentCosts?.[costKey] ?? 0;
+    const gasCostLine = gas
+      ? `⛽ Gas now: $${currentCostUsd.toFixed(8)} (${gas.trend})`
+      : '';
+    const recLine = gas
+      ? `💡 Rec. max fee: $${gas.recommendedMaxFeeUsd.toFixed(8)} (${gas.recommendedMaxFeeGwei.toFixed(6)} Gwei)`
+      : '';
+    const savingsLine =
+      gas && gas.estimatedSavingsPct > 10
+        ? `💰 Savings: Wait ~${gas.bestWindowMinutes}min -> save ~${gas.estimatedSavingsPct.toFixed(0)}% on gas`
+        : '';
+    const vsAvgLine = gas
+      ? gas.trend === 'falling'
+        ? '📉 Signal: Gas is falling - good time to execute'
+        : gas.trend === 'rising'
+          ? '📈 Signal: Gas is rising - consider executing now'
+          : '📊 Signal: Gas is stable near average'
+      : '';
+    const recTextLine = gas?.recommendation ? `\n🧠 Recommendation: ${gas.recommendation}` : '';
+    const gasSection = [gasCostLine, recLine, savingsLine, vsAvgLine].filter(Boolean).join('\n');
+
     return (
       `Here's what I understood:\n\n` +
-      `Type: ${parsed.type}\n` +
-      `Amount: ${parsed.amount} ${parsed.fromToken}\n` +
-      `${parsed.toToken ? `To: ${parsed.toToken}\n` : ''}` +
-      `${parsed.recipient ? `Recipient: ${truncateAddress(parsed.recipient)}\n` : ''}` +
-      `Max gas fee: $${parsed.maxFeeUsd}\n` +
-      `Chain: ${normalizeIntentChain(parsed.chain) === 'mainnet' ? 'Mainnet' : 'Sepolia'}\n` +
-      `${deadlineMinutes ? `Deadline: ${deadlineMinutes} minutes\n` : ''}` +
-      `\nType "confirm" to execute or "cancel" to start over.`
+      `📤 Type: ${parsed.type}\n` +
+      `💰 Amount: ${parsed.amount} ${parsed.fromToken}\n` +
+      `${parsed.toToken ? `🔄 To: ${parsed.toToken}\n` : ''}` +
+      `${parsed.recipient ? `📬 Recipient: ${truncateAddress(parsed.recipient)}\n` : ''}` +
+      `⛽ Max fee: $${parsed.maxFeeUsd}\n` +
+      `🔗 Chain: ${normalizeIntentChain(parsed.chain) === 'mainnet' ? 'Mainnet' : 'Sepolia'}\n` +
+      `${deadlineMinutes ? `⏰ Deadline: ${deadlineMinutes} min\n` : ''}` +
+      `${gasSection ? `\n─────────────────\n${gasSection}${recTextLine}\n─────────────────` : ''}` +
+      `\n\nConfirm to execute or cancel to start over.`
     );
   }
 
@@ -385,23 +447,42 @@ export default function Home() {
 
     let lastStatus = '';
     const statusMessages: Record<string, (intent: IntentRecord) => string> = {
-      PENDING_INTENT: () => 'Monitoring gas now...',
+      PENDING_INTENT: () => '⏳ Monitoring gas prices...',
+      GAS_CHECK_PASSED: () => '⛽ Gas is under your limit - executing now...',
+      SWAP_EXECUTING: (intent) =>
+        `🔄 Broadcasting your swap to ${normalizeIntentChain(intent.parsed.chain) === 'mainnet' ? 'Mainnet' : 'Sepolia'}...`,
       SUBMITTED: (intent) =>
         intent.parsed.type === 'swap'
-          ? `Broadcasting via Uniswap /${getUniswapEndpointForIntent(intent)} (${getUniswapEndpointForIntent(intent) === 'swap_7702' ? 'EIP-7702 optimized' : 'fallback'})...\n${intent.parsed.amount} ${intent.parsed.fromToken} -> ${intent.parsed.toToken ?? 'USDC'}`
-          : 'Broadcast accepted. Waiting for confirmations...',
-      CONFIRMING: () => 'Transaction seen onchain. Confirming now...',
-      CONFIRMED: (intent) =>
-        `Confirmed onchain${intent.txHash ? `.\nTx: ${intent.txHash.slice(0, 10)}...${intent.txHash.slice(-6)}` : '.'}`,
+          ? `🔄 Broadcasting your swap to ${normalizeIntentChain(intent.parsed.chain) === 'mainnet' ? 'Mainnet' : 'Sepolia'}...\n${intent.parsed.amount} ${intent.parsed.fromToken} -> ${intent.parsed.toToken ?? 'USDC'}`
+          : '📡 Broadcast accepted. Waiting for confirmations...',
+      CONFIRMING: () => '📡 Transaction seen onchain. Confirming now...',
+      CONFIRMED: (intent) => {
+        const details = deriveExecutionDetails(intent);
+        const txHash = details.txHash ?? intent.txHash;
+        const destination = intent.parsed.toToken ?? intent.parsed.recipient ?? 'destination';
+        const explorerLine = txHash ? `View on Etherscan -> ${explorerUrlForIntent(intent, txHash)}` : 'View on Etherscan ->';
+        return (
+          `🎉 Done! ${intent.parsed.type === 'swap' ? 'Swap' : 'Transaction'} confirmed.\n\n` +
+          `${intent.parsed.amount} ${intent.parsed.fromToken} -> ${destination}\n` +
+          `Block: ${details.blockNumber ?? intent.blockNumber ?? 'N/A'}\n` +
+          `⛽ Gas paid: ${details.gasPaidWei ? formatWeiAsGwei(details.gasPaidWei) : 'N/A'} Gwei\n` +
+          `${txHash ? `Tx: ${txHash.slice(0, 10)}...${txHash.slice(-6)}\n\n` : '\n'}` +
+          explorerLine
+        );
+      },
       FINALIZED: (intent) =>
         `Execution complete.\n\n${intent.parsed.amount} ${intent.parsed.fromToken} -> ${intent.parsed.toToken ?? intent.parsed.recipient ?? 'destination'}\n${
           intent.txHash ? `View: ${explorerUrlForIntent(intent, intent.txHash)}` : ''
         }`.trim(),
-      NEEDS_REAUTHORIZATION: () => 'Session expired or needs re-authorization before execution can continue.',
-      INSUFFICIENT_BALANCE: () => 'Managed wallet balance is too low for this command.',
-      CANCELLED: () => 'Intent cancelled.',
-      STUCK: () => 'Intent is stuck. Try cancelling and resubmitting with a simpler route.',
-      DEADLINE_EXCEEDED: () => 'The intent deadline passed before execution.',
+      EXECUTION_FAILED: () => '⚠️ Execution failed - retrying on next gas check.',
+      FAILED: (intent) =>
+        `❌ Intent failed.\n\n${intent.lastError ?? 'Could not complete this transaction.'}\n\nCreate a new intent to try again.`,
+      NEEDS_REAUTHORIZATION: () => '🔐 Session expired. Please re-authorize your wallet to continue.',
+      NEEDS_REAUTH: () => '🔐 Session expired. Please re-authorize your wallet to continue.',
+      INSUFFICIENT_BALANCE: () => '💸 Insufficient balance to cover this command.',
+      CANCELLED: () => '🚫 Intent cancelled.',
+      STUCK: () => '⚠️ Intent is stuck. Try cancelling and creating a new one.',
+      DEADLINE_EXCEEDED: () => '⏰ The intent deadline passed before execution.',
     };
 
     const intervalId = window.setInterval(async () => {
@@ -424,6 +505,7 @@ export default function Home() {
             'CONFIRMED',
             'CANCELLED',
             'STUCK',
+            'FAILED',
             'DEADLINE_EXCEEDED',
             'INSUFFICIENT_BALANCE',
           ].includes(intent.status)
@@ -553,21 +635,26 @@ export default function Home() {
 
     try {
       const normalizedInput = enforceChainSelection(userText, selectedChain);
-      const response = await fetch(`${apiUrl}/intents/preview`, {
+      const previewPromise = fetch(`${apiUrl}/intents/preview`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ wallet: effectiveAddress, input: normalizedInput })
+      }).then(async (response) => {
+        if (!response.ok) {
+          const body = await response.text();
+          throw new Error(body || 'Intent creation failed');
+        }
+
+        return (await response.json()) as IntentPreviewResponse;
       });
 
-      if (!response.ok) {
-        const body = await response.text();
-        throw new Error(body || 'Intent creation failed');
-      }
-
-      const preview = (await response.json()) as IntentPreviewResponse;
+      const [preview, gasSuggestion] = await Promise.all([
+        previewPromise,
+        previewPromise.then(fetchGasSuggestion).catch(() => null),
+      ]);
       setPendingIntentPreview({ normalizedInput, preview });
       setAwaitingConfirmation(true);
-      addAgentMessage(describePreview(preview));
+      addAgentMessage(describePreview(preview, gasSuggestion));
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Intent preview failed';
       setError(message);
@@ -910,14 +997,18 @@ function ChatMessageContent({
   role: 'agent' | 'user';
 }) {
   const lines = content.split('\n').map((line) => line.trimEnd());
+  const structuredLinePattern =
+    /^(?:\S+\s+)?(Type|Amount|To|Recipient|Max gas fee|Max fee|Chain|Deadline|Gas now|Rec\. max fee|Savings|Signal|Recommendation|Gas paid|Tx|View):/i;
   const structuredLines = lines.filter(
-    (line) =>
-      /^(Type|Amount|To|Recipient|Max gas fee|Max fee|Chain|Deadline|Tx|View):/i.test(line),
+    (line) => structuredLinePattern.test(line),
   );
   const hasStructuredContent = role === 'agent' && structuredLines.length >= 2;
   const header = lines[0] ?? '';
   const trailingNote =
-    role === 'agent' && /^Type "confirm" to execute or "cancel" to start over\.$/i.test(lines.at(-1) ?? '')
+    role === 'agent' &&
+    /^(Type "confirm" to execute or "cancel" to start over\.|Confirm to execute or cancel to start over\.)$/i.test(
+      lines.at(-1) ?? '',
+    )
       ? (lines.at(-1) ?? '')
       : null;
 
@@ -925,7 +1016,8 @@ function ChatMessageContent({
     const introLines = lines.filter(
       (line) =>
         line &&
-        !/^(Type|Amount|To|Recipient|Max gas fee|Max fee|Chain|Deadline|Tx|View):/i.test(line) &&
+        !structuredLinePattern.test(line) &&
+        line !== '─────────────────' &&
         line !== trailingNote,
     );
 
@@ -1012,6 +1104,12 @@ function HeaderBar({
         </div>
 
         <div className="flex items-center gap-2">
+          <a
+            href="/gas"
+            className="console-chip hidden md:flex hover:bg-[var(--color-accent)] hover:text-black focus-visible:bg-[var(--color-accent)] focus-visible:text-black focus-visible:outline-none"
+          >
+            <span>Gas Analytics</span>
+          </a>
           <button
             type="button"
             onClick={onToggleChain}
@@ -1951,6 +2049,17 @@ function healthDotClassName(level: SessionHealthLevel) {
 
 function formatEthFixed(value: bigint): string {
   return Number.parseFloat(formatEther(value)).toFixed(6);
+}
+
+function formatWeiAsGwei(value: string): string {
+  try {
+    const wei = BigInt(value);
+    const whole = wei / 1_000_000_000n;
+    const fractional = (wei % 1_000_000_000n).toString().padStart(9, '0').replace(/0+$/, '');
+    return fractional ? `${whole}.${fractional}` : whole.toString();
+  } catch {
+    return 'N/A';
+  }
 }
 
 function ChainBadge({ chain, compact = false }: { chain: string; compact?: boolean }) {

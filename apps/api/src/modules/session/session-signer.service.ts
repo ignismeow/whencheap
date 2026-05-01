@@ -1859,16 +1859,12 @@ export class SessionSignerService implements OnModuleInit {
       userIdentifier?: string | null;
     };
 
-    let legacyRows: LegacyWalletRow[] = [];
-    try {
-      legacyRows = (await this.walletRepository.query(
-        'SELECT id, "userId", "walletAddress", "encryptedPrivateKey", iv, "authTag", "userIdentifier" FROM whencheap_wallets',
-      )) as LegacyWalletRow[];
-    } catch {
-      legacyRows = (await this.walletRepository.query(
-        'SELECT id, "userId", "walletAddress", "encryptedPrivateKey", iv, "authTag" FROM whencheap_wallets',
-      )) as LegacyWalletRow[];
-    }
+    const hasUserIdentifierColumn = await this.walletTableHasColumn('userIdentifier');
+    const legacyRows = (await this.walletRepository.query(
+      hasUserIdentifierColumn
+        ? 'SELECT id, "userId", "walletAddress", "encryptedPrivateKey", iv, "authTag", "userIdentifier" FROM whencheap_wallets'
+        : 'SELECT id, "userId", "walletAddress", "encryptedPrivateKey", iv, "authTag" FROM whencheap_wallets',
+    )) as LegacyWalletRow[];
 
     let migrated = 0;
     for (const row of legacyRows) {
@@ -1911,6 +1907,19 @@ export class SessionSignerService implements OnModuleInit {
     if (migrated > 0) {
       this.logger.log(`Migrated ${migrated} legacy wallet row(s) to the new PostgreSQL schema.`);
     }
+  }
+
+  private async walletTableHasColumn(columnName: string): Promise<boolean> {
+    const rows = (await this.walletRepository.query(
+      `SELECT 1
+         FROM information_schema.columns
+        WHERE table_name = 'whencheap_wallets'
+          AND column_name = $1
+        LIMIT 1`,
+      [columnName],
+    )) as Array<Record<string, unknown>>;
+
+    return rows.length > 0;
   }
 
   private inferIdentifierType(identifier: string): UserIdentifierType {

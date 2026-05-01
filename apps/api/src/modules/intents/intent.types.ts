@@ -30,6 +30,9 @@ export interface IntentRecord {
   completedExecutions: number;
   remainingExecutions: number;
   status: IntentStatus;
+  retryCount?: number;
+  nextRetryAt?: string | null;
+  lastError?: string | null;
   keeperHubWorkflowId?: string;
   txHash?: string;
   blockNumber?: number | null;

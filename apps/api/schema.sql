@@ -57,6 +57,9 @@ CREATE TABLE IF NOT EXISTS intents (
   "inferenceProvider" varchar(32) NULL,
   "repeatCount" integer NOT NULL DEFAULT 1,
   "repeatCompleted" integer NOT NULL DEFAULT 0,
+  "retryCount" integer NOT NULL DEFAULT 0,
+  "nextRetryAt" timestamptz NULL,
+  "lastError" text NULL,
   deadline timestamptz NULL,
   "createdAt" timestamptz NOT NULL DEFAULT now(),
   "updatedAt" timestamptz NOT NULL DEFAULT now()

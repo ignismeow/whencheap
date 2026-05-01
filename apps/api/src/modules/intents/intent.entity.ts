@@ -51,6 +51,15 @@ export class IntentEntity {
   @Column({ type: 'integer', default: 0 })
   repeatCompleted!: number;
 
+  @Column({ type: 'integer', default: 0 })
+  retryCount!: number;
+
+  @Column({ type: 'timestamp with time zone', nullable: true })
+  nextRetryAt!: Date | null;
+
+  @Column({ type: 'text', nullable: true })
+  lastError!: string | null;
+
   @Column({ type: 'timestamp with time zone', nullable: true })
   deadline!: Date | null;
 

@@ -13,5 +13,7 @@ export enum IntentStatus {
   InsufficientBalance = 'INSUFFICIENT_BALANCE',
   NeedsReauthorization = 'NEEDS_REAUTHORIZATION',
   NonceConflict = 'NONCE_CONFLICT',
-  Rescheduled = 'RESCHEDULED'
+  Rescheduled = 'RESCHEDULED',
+  Failed = 'FAILED',
+  ExecutionFailed = 'EXECUTION_FAILED',
 }

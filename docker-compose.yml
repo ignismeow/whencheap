@@ -3,31 +3,34 @@ services:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
-    network_mode: host
     env_file:
       - apps/api/.env
     environment:
       HOST: 0.0.0.0
       NODE_OPTIONS: --dns-result-order=ipv4first
-      DATABASE_URL: postgresql://whencheap:whencheap@localhost:5432/whencheap
-      REDIS_URL: redis://localhost:6379
+      DATABASE_URL: postgresql://whencheap:whencheap@postgres:5432/whencheap
+      REDIS_URL: redis://redis:6379
     depends_on:
       - postgres
       - redis
     restart: unless-stopped
+    ports:
+      - "3001:3001"
 
   frontend:
     build:
       context: .
       dockerfile: apps/frontend/Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://api:3001}
         NEXT_PUBLIC_CHAIN_ID: ${NEXT_PUBLIC_CHAIN_ID:-11155111}
-        NEXT_PUBLIC_WALLETCONNECT_ID: ${NEXT_PUBLIC_WALLETCONNECT_ID:-65d52a70398ba52d4f9f60b9bb6a1c97}
-        NEXT_PUBLIC_SESSION_CONTRACT: ${NEXT_PUBLIC_SESSION_CONTRACT:-0x0E1EbA5Ccb787B12C760bf8C9228f92Ba79f64a7}
-        NEXT_PUBLIC_GOOGLE_CLIENT_ID: ${NEXT_PUBLIC_GOOGLE_CLIENT_ID:-908105228801-6lqqrdas2fvgrbod26n5ej45gdb4shqv.apps.googleusercontent.com}
+        NEXT_PUBLIC_WALLETCONNECT_ID: ${NEXT_PUBLIC_WALLETCONNECT_ID:-}
+        NEXT_PUBLIC_SESSION_CONTRACT: ${NEXT_PUBLIC_SESSION_CONTRACT:-}
+        NEXT_PUBLIC_GOOGLE_CLIENT_ID: ${NEXT_PUBLIC_GOOGLE_CLIENT_ID:-}
     env_file:
       - apps/frontend/.env
+    environment:
+      NEXT_PUBLIC_API_URL: http://api:3001
     ports:
       - "3000:3000"
     depends_on:
