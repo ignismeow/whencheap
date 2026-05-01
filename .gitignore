@@ -8,5 +8,5 @@ coverage
 out
 cache
 broadcast
-lib
+contracts/lib
 *.log
