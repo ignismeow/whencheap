@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
 import { useAccount, useChainId, usePublicClient, useReadContract, useWriteContract } from 'wagmi';
 import { formatEther, parseEther } from 'viem';
@@ -71,7 +71,13 @@ async function readJsonSafely<T>(response: Response): Promise<T> {
   }
 }
 
-export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string) => void }) {
+export function WalletConnect({
+  onAuthorized,
+  mode = 'setup',
+}: {
+  onAuthorized: (address: string) => void;
+  mode?: 'setup' | 'status-only';
+}) {
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
   const { writeContractAsync } = useWriteContract();
@@ -86,9 +92,11 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
   const [actionError, setActionError] = useState<UiError | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [sessionStatus, setSessionStatus] = useState<SessionStatusResponse | null>(null);
+  const [isLoadingSession, setIsLoadingSession] = useState(false);
   const [statusTick, setStatusTick] = useState(0);
   const [pendingOutcome, setPendingOutcome] = useState<PendingOutcome | null>(null);
-  const [showRefreshHint, setShowRefreshHint] = useState(false);
+  const [pendingTxHash, setPendingTxHash] = useState<`0x${string}` | null>(null);
+  const hasAutoContinuedRef = useRef(false);
 
   const hasMetaMask =
     typeof window !== 'undefined' &&
@@ -97,28 +105,48 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
   const activeChain = chainId === mainnet.id ? 'mainnet' : 'sepolia';
   const sessionContract = chainId === mainnet.id ? mainnetSessionContractAddress : sessionContractAddress;
   const isBusy = txStep !== 'idle';
+  const isStatusOnly = mode === 'status-only';
 
-  const { data: depositWei, refetch: refetchDeposit } = useReadContract({
+  useEffect(() => {
+    if (!isStatusOnly || !address || !isConnected || !isSupportedChain || hasAutoContinuedRef.current) {
+      return;
+    }
+
+    hasAutoContinuedRef.current = true;
+    onAuthorized(address);
+  }, [address, isConnected, isStatusOnly, isSupportedChain, onAuthorized]);
+
+  const {
+    data: depositWei,
+    refetch: refetchDeposit,
+    isLoading: isDepositLoading,
+    isFetched: hasFetchedDeposit,
+  } = useReadContract({
     address: sessionContract,
     abi: whenCheapSessionAbi,
     functionName: 'deposits',
     args: address ? [address] : undefined,
     chainId,
     query: {
-      enabled: Boolean(isConnected && address && sessionContract && isSupportedChain),
-      refetchInterval: 15_000,
+      enabled: Boolean(!isStatusOnly && isConnected && address && sessionContract && isSupportedChain),
+      refetchInterval: 10_000,
     },
   });
 
-  const { data: onChainSession, refetch: refetchSession } = useReadContract({
+  const {
+    data: onChainSession,
+    refetch: refetchSession,
+    isLoading: isSessionLoading,
+    isFetched: hasFetchedSession,
+  } = useReadContract({
     address: sessionContract,
     abi: whenCheapSessionAbi,
     functionName: 'sessions',
     args: address ? [address] : undefined,
     chainId,
     query: {
-      enabled: Boolean(isConnected && address && sessionContract && isSupportedChain),
-      refetchInterval: 15_000,
+      enabled: Boolean(!isStatusOnly && isConnected && address && sessionContract && isSupportedChain),
+      refetchInterval: 10_000,
     },
   });
 
@@ -127,16 +155,6 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
     const timeout = window.setTimeout(() => setSuccessMessage(null), 2500);
     return () => window.clearTimeout(timeout);
   }, [successMessage]);
-
-  useEffect(() => {
-    if (txStep !== 'confirming') {
-      setShowRefreshHint(false);
-      return;
-    }
-
-    const timeout = window.setTimeout(() => setShowRefreshHint(true), 30_000);
-    return () => window.clearTimeout(timeout);
-  }, [txStep]);
 
   useEffect(() => {
     if (!sessionStatus) return;
@@ -149,17 +167,35 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
   }, [sessionStatus]);
 
   useEffect(() => {
+    if (isStatusOnly) return undefined;
+    if (!isConnected || !address || !sessionContract || !isSupportedChain) return undefined;
+
+    const interval = window.setInterval(() => {
+      setStatusTick((current) => current + 1);
+    }, 10_000);
+
+    return () => window.clearInterval(interval);
+  }, [address, isConnected, isStatusOnly, isSupportedChain, sessionContract]);
+
+  useEffect(() => {
+    if (isStatusOnly) {
+      setSessionStatus(null);
+      setStatusError(null);
+      setIsLoadingSession(false);
+      return;
+    }
+
     if (!isConnected || !address || !sessionContract || !isSupportedChain) {
       setSessionStatus(null);
       setStatusError(null);
-      setTxStep((current) => (current === 'checking' ? 'idle' : current));
+      setIsLoadingSession(false);
       return;
     }
 
     let cancelled = false;
 
     const loadSessionStatus = async () => {
-      setTxStep('checking');
+      setIsLoadingSession(true);
       setStatusError(null);
 
       try {
@@ -177,11 +213,13 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
       } catch (err) {
         if (!cancelled) {
           setStatusError(toWalletUiError(err, 'Session Check Failed'));
-          setSessionStatus(null);
+          if (!hasFetchedDeposit && !hasFetchedSession) {
+            setSessionStatus(null);
+          }
         }
       } finally {
         if (!cancelled) {
-          setTxStep('idle');
+          setIsLoadingSession(false);
         }
       }
     };
@@ -191,35 +229,62 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
     return () => {
       cancelled = true;
     };
-  }, [activeChain, address, isConnected, isSupportedChain, sessionContract, statusTick]);
+  }, [activeChain, address, hasFetchedDeposit, hasFetchedSession, isConnected, isStatusOnly, isSupportedChain, sessionContract, statusTick]);
+
+  const chainSnapshot = useMemo<SessionStatusResponse | null>(() => {
+    if (depositWei === undefined || !onChainSession) return null;
+
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const expiresAtSeconds = Number(onChainSession[3]);
+    const remainingBudgetWei = onChainSession[1] > onChainSession[2]
+      ? onChainSession[1] - onChainSession[2]
+      : 0n;
+
+    return {
+      active: expiresAtSeconds > nowSeconds,
+      maxFeePerTxEth: formatEther(onChainSession[0]),
+      maxTotalSpendEth: formatEther(onChainSession[1]),
+      spentEth: formatEther(onChainSession[2]),
+      remainingEth: formatEther(remainingBudgetWei),
+      expiresAt: expiresAtSeconds > 0 ? new Date(expiresAtSeconds * 1000).toISOString() : null,
+      expiresInMinutes: expiresAtSeconds > nowSeconds
+        ? Math.max(0, Math.ceil((expiresAtSeconds - nowSeconds) / 60))
+        : 0,
+      canExecute: depositWei > 0n && expiresAtSeconds > nowSeconds,
+      estimatedFeeEth: '0',
+    };
+  }, [depositWei, onChainSession]);
+
+  const effectiveSessionStatus = sessionStatus ?? chainSnapshot;
+  const contractDataLoading = isDepositLoading || isSessionLoading || (!hasFetchedDeposit && !hasFetchedSession);
 
   const sessionMetrics = useMemo(() => {
     const hasDeposit = depositWei !== undefined && depositWei > 0n;
     const depositEth = fmtEth(depositWei);
     const onChainActive = onChainSession ? Number(onChainSession[3]) * 1000 > Date.now() : false;
-    const expiresInMinutes = sessionStatus?.expiresInMinutes ?? (
+    const expiresInMinutes = effectiveSessionStatus?.expiresInMinutes ?? (
       onChainSession ? Math.max(0, Math.ceil((Number(onChainSession[3]) * 1000 - Date.now()) / 60_000)) : 0
     );
 
     return {
       hasDeposit,
       depositEth,
-      active: sessionStatus?.active ?? onChainActive,
+      active: effectiveSessionStatus?.active ?? onChainActive,
       expiresInMinutes,
-      remainingEth: sessionStatus?.remainingEth ?? (onChainSession ? formatEther(onChainSession[1] > onChainSession[2] ? onChainSession[1] - onChainSession[2] : 0n) : '0'),
-      spentEth: sessionStatus?.spentEth ?? (onChainSession ? formatEther(onChainSession[2]) : '0'),
-      maxFeePerTxEth: sessionStatus?.maxFeePerTxEth ?? (onChainSession ? formatEther(onChainSession[0]) : maxFeePerTxEth),
+      remainingEth: effectiveSessionStatus?.remainingEth ?? (onChainSession ? formatEther(onChainSession[1] > onChainSession[2] ? onChainSession[1] - onChainSession[2] : 0n) : '0'),
+      spentEth: effectiveSessionStatus?.spentEth ?? (onChainSession ? formatEther(onChainSession[2]) : '0'),
+      maxFeePerTxEth: effectiveSessionStatus?.maxFeePerTxEth ?? (onChainSession ? formatEther(onChainSession[0]) : maxFeePerTxEth),
     };
-  }, [depositWei, maxFeePerTxEth, onChainSession, sessionStatus]);
+  }, [depositWei, effectiveSessionStatus, maxFeePerTxEth, onChainSession]);
 
   const flowState: SessionFlowState = useMemo(() => {
     if (!isConnected || !address) return 'DISCONNECTED';
     if (!isSupportedChain || !sessionContract) return 'WRONG_NETWORK';
-    if (txStep === 'checking') return 'CHECKING';
+    if (isLoadingSession || contractDataLoading) return 'CHECKING';
     if (sessionMetrics.hasDeposit && sessionMetrics.active) return 'READY';
     if (sessionMetrics.hasDeposit) return 'NEEDS_AUTH';
     return 'NEEDS_DEPOSIT';
-  }, [address, isConnected, isSupportedChain, sessionContract, sessionMetrics, txStep]);
+  }, [address, contractDataLoading, isConnected, isLoadingSession, isSupportedChain, sessionContract, sessionMetrics]);
 
   const refreshAll = async () => {
     await Promise.all([refetchDeposit(), refetchSession()]);
@@ -260,12 +325,13 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
 
     setTxStep('confirming');
     setPendingOutcome(outcome);
+    setPendingTxHash(hash);
 
     try {
       const receipt = await publicClient.waitForTransactionReceipt({
         hash,
         pollingInterval: 2_000,
-        timeout: 60_000,
+        timeout: 30_000,
       });
       if (receipt.status !== 'success') {
         throw new Error(`Transaction reverted (tx: ${hash})`);
@@ -276,8 +342,8 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
         throw error;
       }
 
-      for (let attempt = 0; attempt < 12; attempt += 1) {
-        await sleep(5_000);
+      for (let attempt = 0; attempt < 15; attempt += 1) {
+        await sleep(2_000);
         const resolved = await verifyPendingOutcome(outcome).catch(() => false);
         if (resolved) {
           return;
@@ -285,12 +351,16 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
       }
 
       throw new Error(
-        'Confirmation is taking longer than expected. We refreshed the session status, but please check MetaMask or Etherscan if this persists.',
+        'Confirmation is taking longer than expected. We could not verify the latest contract state yet. Please check MetaMask or Etherscan if this persists.',
       );
     } finally {
       setPendingOutcome(null);
     }
   };
+
+  const explorerBaseUrl = activeChain === 'mainnet'
+    ? 'https://etherscan.io'
+    : 'https://sepolia.etherscan.io';
 
   const registerSessionMarker = async () => {
     if (!address) throw new Error('Wallet not connected.');
@@ -325,6 +395,7 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
 
     setActionError(null);
     setSuccessMessage(null);
+    setPendingTxHash(null);
 
     try {
       setTxStep('signing');
@@ -347,6 +418,7 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
       setActionError(toWalletUiError(err, 'Authorization Failed'));
     } finally {
       setTxStep('idle');
+      setPendingTxHash(null);
     }
   };
 
@@ -361,6 +433,7 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
 
     setActionError(null);
     setSuccessMessage(null);
+    setPendingTxHash(null);
     const parsed = parseFloat(depositAmount);
     if (!depositAmount || Number.isNaN(parsed) || parsed <= 0) {
       setActionError({ title: 'Invalid Amount', message: 'Enter a valid deposit amount before continuing.' });
@@ -388,6 +461,7 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
       setActionError(toWalletUiError(err, 'Deposit Failed'));
     } finally {
       setTxStep('idle');
+      setPendingTxHash(null);
     }
   };
 
@@ -395,8 +469,8 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
     if (flowState === 'READY') {
       return {
         tone: 'var(--color-accent)',
-        label: 'Wallet Connected',
-        body: "You're ready to create intents.",
+        label: 'Ready to Create Intents',
+        body: "Your wallet is funded and the session is active.",
       };
     }
     if (flowState === 'NEEDS_AUTH') {
@@ -491,44 +565,46 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
         }}
       </ConnectButton.Custom>
 
-      <div
-        style={{
-          border: '1px solid var(--color-border)',
-          padding: 14,
-          display: 'flex',
-          flexDirection: 'column',
-          gap: 10,
-          background: 'rgba(255,255,255,0.01)',
-        }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span
-            aria-hidden
-            style={{
-              width: 8,
-              height: 8,
-              borderRadius: '50%',
-              background: statusCard.tone,
-              boxShadow: `0 0 10px ${statusCard.tone}`,
-              flexShrink: 0,
-            }}
-          />
-          <span style={{ fontSize: 10, letterSpacing: '0.14em', textTransform: 'uppercase', color: statusCard.tone }}>
-            {flowState === 'READY' ? '✓ ' : flowState === 'NEEDS_AUTH' || flowState === 'NEEDS_DEPOSIT' ? '⚠ ' : flowState === 'WRONG_NETWORK' ? '✗ ' : ''}
-            {statusCard.label}
-          </span>
-        </div>
-        <p style={{ margin: 0, fontSize: 11, color: 'var(--color-text)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
-          {statusCard.body}
-        </p>
-        {address ? (
-          <p style={{ margin: 0, fontSize: 10, color: 'var(--color-muted)', letterSpacing: '0.12em', textTransform: 'uppercase' }}>
-            Connected: {`${address.slice(0, 6)}...${address.slice(-4)}`}
+      {!isStatusOnly ? (
+        <div
+          style={{
+            border: '1px solid var(--color-border)',
+            padding: 14,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 10,
+            background: 'rgba(255,255,255,0.01)',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span
+              aria-hidden
+              style={{
+                width: 8,
+                height: 8,
+                borderRadius: '50%',
+                background: statusCard.tone,
+                boxShadow: `0 0 10px ${statusCard.tone}`,
+                flexShrink: 0,
+              }}
+            />
+            <span style={{ fontSize: 10, letterSpacing: '0.14em', textTransform: 'uppercase', color: statusCard.tone }}>
+              {flowState === 'READY' ? '✓ ' : flowState === 'NEEDS_AUTH' || flowState === 'NEEDS_DEPOSIT' ? '⚠ ' : flowState === 'WRONG_NETWORK' ? '✗ ' : ''}
+              {statusCard.label}
+            </span>
+          </div>
+          <p style={{ margin: 0, fontSize: 11, color: 'var(--color-text)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+            {statusCard.body}
           </p>
-        ) : null}
-      </div>
+          {address ? (
+            <p style={{ margin: 0, fontSize: 10, color: 'var(--color-muted)', letterSpacing: '0.12em', textTransform: 'uppercase' }}>
+              Connected: {`${address.slice(0, 6)}...${address.slice(-4)}`}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
 
-      {statusError ? (
+      {!isStatusOnly && statusError && !effectiveSessionStatus && !contractDataLoading ? (
         <div className="console-alert console-alert-danger">
           <span className="console-alert-label">{statusError.title}</span>
           <p>{statusError.message}</p>
@@ -545,16 +621,26 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
         </div>
       ) : null}
 
-      {isConnected && isSupportedChain ? (
+      {!isStatusOnly && isConnected && isSupportedChain ? (
         <div className="grid gap-3 border border-[var(--color-border)] p-4">
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 16px' }}>
-            <Metric label="Deposit Balance" value={`${sessionMetrics.depositEth} ETH`} />
-            <Metric label="Budget Remaining" value={`${sessionMetrics.remainingEth} ETH`} />
-            <Metric label="Expires" value={formatDuration(sessionMetrics.expiresInMinutes)} />
-            <Metric label="Max Fee / Tx" value={`${sessionMetrics.maxFeePerTxEth} ETH`} />
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 16px' }}>
+            <Metric label="Deposit Balance" value={flowState === 'CHECKING' ? 'Loading...' : `${sessionMetrics.depositEth} ETH`} />
+            <Metric label="Budget Remaining" value={flowState === 'CHECKING' ? 'Loading...' : `${sessionMetrics.remainingEth} ETH`} />
+            <Metric label="Expires" value={flowState === 'CHECKING' ? 'Loading...' : formatDuration(sessionMetrics.expiresInMinutes)} />
+            <Metric label="Max Fee / Tx" value={flowState === 'CHECKING' ? 'Loading...' : `${sessionMetrics.maxFeePerTxEth} ETH`} />
           </div>
 
-          {flowState === 'READY' ? (
+          {isStatusOnly ? (
+            <div className="grid gap-2">
+              <p style={{ margin: 0, fontSize: 10, color: 'var(--color-muted)', textTransform: 'uppercase', letterSpacing: '0.1em' }}>
+                {address && isSupportedChain
+                  ? 'Wallet connected. Opening console...'
+                  : address && !isSupportedChain
+                    ? 'Switch to Sepolia or Mainnet to continue.'
+                    : 'Connect MetaMask to continue.'}
+              </p>
+            </div>
+          ) : flowState === 'READY' ? (
             <>
               <div className="flex flex-wrap gap-2">
                 <button
@@ -600,7 +686,7 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
             </>
           ) : null}
 
-          {flowState === 'NEEDS_DEPOSIT' ? (
+          {!isStatusOnly && flowState === 'NEEDS_DEPOSIT' ? (
             <div className="grid gap-3">
               <div className="grid gap-2">
                 <label style={{ fontSize: 10, color: 'var(--color-label)', textTransform: 'uppercase', letterSpacing: '0.14em' }}>
@@ -636,7 +722,7 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
             </div>
           ) : null}
 
-          {flowState === 'NEEDS_AUTH' ? (
+          {!isStatusOnly && flowState === 'NEEDS_AUTH' ? (
             <div className="grid gap-3">
               <div className="grid gap-3 sm:grid-cols-3">
                 <LabeledInput label="Max Fee / Tx" value={maxFeePerTxEth} onChange={setMaxFeePerTxEth} />
@@ -662,14 +748,14 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
         </div>
       ) : null}
 
-      {successMessage ? (
+      {!isStatusOnly && successMessage ? (
         <div className="console-alert console-alert-success">
           <span className="console-alert-label">Success</span>
           <p>{successMessage}</p>
         </div>
       ) : null}
 
-      {txStep === 'confirming' && pendingOutcome ? (
+      {!isStatusOnly && txStep === 'confirming' && pendingOutcome ? (
         <div className="console-alert">
           <span className="console-alert-label">Waiting for Confirmation</span>
           <p>
@@ -677,20 +763,21 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
               ? 'MetaMask has submitted your deposit. We are waiting for the chain to confirm it.'
               : 'MetaMask has submitted your authorization. We are waiting for the chain to confirm it.'}
           </p>
-          {showRefreshHint ? (
-            <button
-              type="button"
-              onClick={() => void refreshAll()}
+          {pendingTxHash ? (
+            <a
+              href={`${explorerBaseUrl}/tx/${pendingTxHash}`}
+              target="_blank"
+              rel="noreferrer"
               className="console-text-button"
               style={{ alignSelf: 'flex-start' }}
             >
-              Taking too long? Refresh session status
-            </button>
+              View transaction on Etherscan
+            </a>
           ) : null}
         </div>
       ) : null}
 
-      {actionError ? (
+      {!isStatusOnly && actionError ? (
         <div className="console-alert console-alert-danger">
           <span className="console-alert-label">{actionError.title}</span>
           <p>{actionError.message}</p>
@@ -707,7 +794,7 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
         </div>
       ) : null}
 
-      {isConnected ? (
+      {!isStatusOnly && isConnected ? (
         <p
           style={{
             fontSize: 10,

@@ -20,8 +20,16 @@ const wagmiConfig = getDefaultConfig({
   projectId: process.env.NEXT_PUBLIC_WALLETCONNECT_ID || '65d52a70398ba52d4f9f60b9bb6a1c97',
   chains: [mainnet, sepolia],
   transports: {
-    [mainnet.id]: http(mainnetRpc),
-    [sepolia.id]: http(sepoliaRpc),
+    [mainnet.id]: http(mainnetRpc, {
+      retryCount: 3,
+      retryDelay: 1_000,
+      timeout: 90_000,
+    }),
+    [sepolia.id]: http(sepoliaRpc, {
+      retryCount: 3,
+      retryDelay: 1_000,
+      timeout: 90_000,
+    }),
   },
   ssr: false,
 });

@@ -9,7 +9,7 @@ import {
   ShieldCheck,
   XCircle
 } from 'lucide-react';
-import { useRouter } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 import { FormEvent, KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { formatEther, parseEther } from 'viem';
 import { mainnet, sepolia } from 'viem/chains';
@@ -199,6 +199,7 @@ function clearIdentityStorage() {
 
 export default function Home() {
   const router = useRouter();
+  const pathname = usePathname();
   const { disconnectAsync } = useDisconnect();
   const [input, setInput] = useState('Send 0.001 ETH to 0x9dD40426fe0dbaF3d28B4fe7f499231e6FFd3873 when gas is under $1 in next 30 minutes'
 );
@@ -209,7 +210,9 @@ export default function Home() {
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [cancellingIntentId, setCancellingIntentId] = useState<string | null>(null);
   const [managedIdentity, setManagedIdentity] = useState<WalletIdentity | null>(null);
+  const [authHydrated, setAuthHydrated] = useState(false);
   const [isSessionCardOpen, setIsSessionCardOpen] = useState(false);
+  const [isSetupModalOpen, setIsSetupModalOpen] = useState(false);
   const [disconnectNotice, setDisconnectNotice] = useState<string | null>(null);
   const [ensCandidate, setEnsCandidate] = useState<string | null>(null);
   const [resolvedEnsAddress, setResolvedEnsAddress] = useState<string | null>(null);
@@ -265,7 +268,6 @@ export default function Home() {
     () => deriveSessionHealth(sessionStatus),
     [sessionStatus],
   );
-  const canCreateIntent = Boolean(effectiveAddress && sessionHealth.level === 'green');
 
   useEffect(() => {
     try {
@@ -287,6 +289,8 @@ export default function Home() {
       }
     } catch {
       clearIdentityStorage();
+    } finally {
+      setAuthHydrated(true);
     }
   }, []);
 
@@ -641,6 +645,16 @@ export default function Home() {
       addAgentMessage('Connect MetaMask first so I have an active wallet for new intents.');
       return;
     }
+    if (sessionHealth.level !== 'green') {
+      setIsSetupModalOpen(true);
+      setError(null);
+      addAgentMessage(
+        sessionStatus?.active
+          ? 'Your wallet is connected, but the session needs attention before I can create a new intent. Fund or adjust the current setup and try again.'
+          : 'Your wallet is connected, but the session is not ready yet. Deposit ETH and authorize the session from inside the app, then try again.',
+      );
+      return;
+    }
     if (!input.trim() || isSubmitting) return;
 
     const userText = input.trim();
@@ -744,6 +758,27 @@ export default function Home() {
     }
   }
 
+  useEffect(() => {
+    if (pathname === '/app' && authHydrated && !managedIdentity) {
+      router.replace('/login');
+    }
+  }, [authHydrated, managedIdentity, pathname, router]);
+
+  if (pathname === '/') {
+    return (
+      <main className="console-shell">
+        <LandingHero
+          onLaunch={() => router.push(managedIdentity ? '/app' : '/login')}
+          notice={disconnectNotice}
+        />
+      </main>
+    );
+  }
+
+  if (pathname === '/app' && !authHydrated) {
+    return <main className="console-shell" />;
+  }
+
   if (!managedIdentity) {
     return (
       <main className="console-shell">
@@ -757,6 +792,7 @@ export default function Home() {
       <HeaderBar
         address={effectiveAddress}
         selectedChain={selectedChain}
+        sessionStatus={sessionStatus ?? null}
         sessionHealth={sessionHealth}
         onToggleChain={() =>
           setSelectedChain((current) => (current === 'sepolia' ? 'mainnet' : 'sepolia'))
@@ -765,9 +801,9 @@ export default function Home() {
         onDisconnect={() => void disconnectWallet()}
       />
 
-      <div className="console-root">
-        <aside className="console-sidebar">
-          <ConsolePanel title="Intent Input" eyebrow="Translate Natural Language" className="console-intent-panel">
+      <div className="console-root xl:h-[calc(100vh-104px)] xl:min-h-0">
+        <aside className="console-sidebar xl:grid xl:min-h-0 xl:grid-rows-[minmax(0,1fr)_minmax(280px,0.72fr)] xl:overflow-hidden">
+          <ConsolePanel title="Intent Input" eyebrow="Translate Natural Language" className="console-intent-panel min-h-0 xl:h-full">
             <form onSubmit={createIntent} className="flex h-full min-h-0 flex-col space-y-4">
               <div className="console-scroll flex min-h-[220px] flex-1 flex-col gap-3 px-4 py-3 xl:min-h-[320px]">
                 {messages.map((msg) => (
@@ -853,7 +889,7 @@ export default function Home() {
               <div className="space-y-2">
                 <button
                   type="submit"
-                  disabled={isSubmitting || !canCreateIntent}
+                  disabled={isSubmitting || !effectiveAddress}
                   className="console-button console-button-primary w-full"
                 >
                   <Send size={15} />
@@ -862,9 +898,9 @@ export default function Home() {
                 <p className="text-[10px] normal-case tracking-normal text-[var(--color-muted)]">
                   0.3% execution fee applies on confirmed transactions.
                 </p>
-                {!canCreateIntent ? (
+                {effectiveAddress && !sessionStatus?.active ? (
                   <p className="text-[10px] normal-case tracking-normal text-[var(--color-warning)]">
-                    Authorize and fund your session before creating new intents. You can disconnect afterward and execution will continue autonomously.
+                    Explore freely. We will prompt for deposit and session authorization only when you actually submit a new intent.
                   </p>
                 ) : null}
                 {/\bswap\b/i.test(input) && selectedChain === 'sepolia' ? (
@@ -878,7 +914,12 @@ export default function Home() {
 
           {/* Deposit manager for the connected external wallet. */}
           {managedIdentity.mode === 'external' && managedIdentity.address && (
-            <DepositManager walletAddress={managedIdentity.address} />
+            <DepositManager
+              walletAddress={managedIdentity.address}
+              selectedChain={selectedChain}
+              sessionStatus={sessionStatus ?? null}
+              className="min-h-0 xl:h-full"
+            />
           )}
 
           {/* <ConsolePanel
@@ -930,8 +971,8 @@ export default function Home() {
           </ConsolePanel> */}
         </aside>
 
-        <section className="console-main">
-          <div className="grid min-h-0 gap-4 xl:grid-rows-[minmax(0,1fr)_minmax(260px,auto)]">
+        <section className="console-main xl:min-h-0">
+          <div className="grid min-h-0 gap-4 xl:h-full xl:grid-rows-[minmax(0,1fr)_minmax(280px,0.72fr)]">
             <div className="grid min-h-0 gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(340px,0.85fr)]">
               {selected ? (
                 <CommandCenter
@@ -969,6 +1010,21 @@ export default function Home() {
             onSessionChainChange={setSelectedChain}
             onLogout={() => void disconnectWallet()}
             onClose={() => setIsSessionCardOpen(false)}
+          />
+        </SessionCardModal>
+      ) : null}
+
+      {isSetupModalOpen && managedIdentity?.address ? (
+        <SessionCardModal onClose={() => setIsSetupModalOpen(false)}>
+          <SetupRequiredCard
+            walletAddress={managedIdentity.address}
+            sessionStatus={sessionStatus ?? null}
+            selectedChain={selectedChain}
+            onOpenSessionMatrix={() => {
+              setIsSetupModalOpen(false);
+              setIsSessionCardOpen(true);
+            }}
+            onClose={() => setIsSetupModalOpen(false)}
           />
         </SessionCardModal>
       ) : null}
@@ -1139,6 +1195,7 @@ function ChatMessageContent({
 function HeaderBar({
   address,
   selectedChain,
+  sessionStatus,
   sessionHealth,
   onToggleChain,
   onOpenSessionCard,
@@ -1146,6 +1203,7 @@ function HeaderBar({
 }: {
   address?: `0x${string}`;
   selectedChain: 'sepolia' | 'mainnet';
+  sessionStatus?: SessionStatus | null;
   sessionHealth: { level: SessionHealthLevel; label: string };
   onToggleChain: () => void;
   onOpenSessionCard: () => void;
@@ -1180,6 +1238,12 @@ function HeaderBar({
     setMenuOpen(false);
   };
 
+  const sessionIndicatorText = sessionHealth.level === 'green'
+    ? `${Number(sessionStatus?.depositEth ?? sessionStatus?.remainingEth ?? '0').toFixed(3)} ETH Ready`
+    : sessionHealth.level === 'loading'
+      ? 'Checking Session'
+      : 'Setup Required';
+
   return (
     <header className="console-header">
       <div className="mx-auto flex h-[64px] w-full max-w-[1600px] items-center justify-between px-4 sm:px-6 lg:px-8">
@@ -1212,6 +1276,16 @@ function HeaderBar({
             <span className="h-2 w-2 bg-[var(--color-accent)]" />
             <span>{selectedChain === 'mainnet' ? 'Mainnet' : 'Sepolia'}</span>
           </button>
+          {address ? (
+            <button
+              type="button"
+              onClick={onOpenSessionCard}
+              className="console-chip hidden md:flex hover:bg-[var(--color-accent)] hover:text-black focus-visible:bg-[var(--color-accent)] focus-visible:text-black focus-visible:outline-none"
+            >
+              <span className={`h-2 w-2 ${healthDotClassName(sessionHealth.level)}`} />
+              <span>{sessionIndicatorText}</span>
+            </button>
+          ) : null}
           {address ? (
             <div className="relative hidden sm:block" ref={menuRef}>
               <button
@@ -1300,6 +1374,107 @@ function SessionCardModal({
       />
       <div className="relative z-10 w-full max-w-[760px]">
         {children}
+      </div>
+    </div>
+  );
+}
+
+function SetupRequiredCard({
+  walletAddress,
+  sessionStatus,
+  selectedChain,
+  onOpenSessionMatrix,
+  onClose,
+}: {
+  walletAddress: `0x${string}`;
+  sessionStatus: SessionStatus | null;
+  selectedChain: 'sepolia' | 'mainnet';
+  onOpenSessionMatrix: () => void;
+  onClose: () => void;
+}) {
+  const hasDeposit = Number(sessionStatus?.depositEth ?? '0') > 0
+    || Number(sessionStatus?.spentEth ?? '0') > 0
+    || Number(sessionStatus?.remainingEth ?? '0') > 0;
+  const needsAuthorization = hasDeposit && !sessionStatus?.active;
+  const depositLabel = sessionStatus?.depositEth
+    ? `${Number(sessionStatus.depositEth).toFixed(4)} ETH`
+    : hasDeposit
+      ? 'Funded on contract'
+      : '0.0000 ETH';
+
+  return (
+    <div className="border border-[var(--color-border)] bg-black p-6 sm:p-8">
+      <div className="space-y-3 border-b border-[var(--color-border)] pb-5">
+        <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+          Setup Required
+        </p>
+        <h2 className="text-lg font-medium uppercase tracking-[0.18em] text-[var(--color-text)]">
+          Finish Session Setup
+        </h2>
+        <p className="max-w-2xl text-sm uppercase tracking-[0.12em] text-[var(--color-muted)]">
+          You can explore the console freely. To create a new intent, this wallet needs deposit funding and an active session.
+        </p>
+      </div>
+
+      <div className="mt-5 grid gap-5">
+        <div className="grid gap-2 border border-[var(--color-border)] p-4 text-[11px] uppercase tracking-[0.14em] text-[var(--color-text)]">
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-[var(--color-label)]">Connected Wallet</span>
+            <span>{truncateAddress(walletAddress)}</span>
+          </div>
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-[var(--color-label)]">Deposit</span>
+            <span>{depositLabel}</span>
+          </div>
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-[var(--color-label)]">Session</span>
+            <span>{sessionStatus?.active ? `Active (${sessionStatus.expiresInMinutes}m)` : 'Not Active'}</span>
+          </div>
+          {sessionStatus?.active ? (
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-[var(--color-label)]">Budget Remaining</span>
+              <span>{Number(sessionStatus.remainingEth).toFixed(4)} ETH</span>
+            </div>
+          ) : null}
+        </div>
+
+        <DepositManager
+          walletAddress={walletAddress}
+          selectedChain={selectedChain}
+          sessionStatus={sessionStatus}
+        />
+
+        <div className="grid gap-3 border border-[var(--color-border)] p-4">
+          <div className="space-y-1">
+            <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+              Next Step
+            </p>
+            <p className="text-sm uppercase tracking-[0.12em] text-[var(--color-text)]">
+              {needsAuthorization
+                ? 'Deposit is funded. Re-authorize the session to unlock intent creation.'
+                : hasDeposit
+                  ? 'Open Session Matrix to authorize your session.'
+                  : 'Fund the deposit first. After that, authorize the session in Session Matrix.'}
+            </p>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={onOpenSessionMatrix}
+              className="console-button console-button-primary"
+            >
+              Open Session Matrix
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              className="console-button"
+            >
+              Keep Exploring
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -2105,9 +2280,9 @@ function RecentCommandsPanel({
           <RefreshCcw size={14} />
         </button>
       }
-      className="min-h-0"
+      className="min-h-0 h-full"
     >
-      <div className="console-scroll grid max-h-[340px] min-h-0 gap-2 pr-1 xl:grid-cols-3">
+      <div className="console-scroll grid h-full min-h-0 content-start gap-2 pr-1 xl:grid-cols-3">
         {isLoading ? (
           <p className="text-xs uppercase tracking-[0.14em] text-[var(--color-muted)]">
             Loading intents...

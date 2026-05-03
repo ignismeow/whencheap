@@ -40,7 +40,7 @@ export default function LoginPage() {
           mode: 'external',
           created: parsed.created,
         });
-        router.replace('/');
+        router.replace('/app');
       }
     } catch {
       window.localStorage.removeItem(authStorageKey);
@@ -57,7 +57,7 @@ export default function LoginPage() {
       mode: 'external',
       created: true,
     });
-    router.replace('/');
+    router.replace('/app');
   };
 
   return (
@@ -85,7 +85,7 @@ export default function LoginPage() {
               <li>✓ No private keys stored on the server</li>
               <li>✓ Session-backed autonomous execution</li>
             </ul>
-            <WalletConnect onAuthorized={handleWalletAuthorized} />
+            <WalletConnect onAuthorized={handleWalletAuthorized} mode="status-only" />
           </div>
 
           <button type="button" onClick={() => router.push('/')} className="console-text-button mt-6">

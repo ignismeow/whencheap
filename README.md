@@ -5,7 +5,7 @@
 WhenCheap is a gas-aware intent execution agent. Tell it what you want in plain English. It monitors gas prices and executes your transaction at the optimal moment — atomically, with on-chain fee proof.
 
 **Live demo:** [whencheap.eth](https://whencheap.eth)
-**Mainnet contract:** `0xA928D43DEA05e2ce4Af9208150468d472932bB74`
+**Mainnet contract:** `0x3CAD995494954a8197391c4194Bd39E2Eda16274`
 **Sepolia contract:** `0x1a0775f6cfe22ECB1D6aE84699b76E540ddD7D9e`
 
 ---
@@ -132,7 +132,7 @@ One transaction. Atomic. Verifiable. No post-swap fee collection. No nonce confl
 
 Deployed on both networks:
 - **Sepolia:** [`0x1a0775f6cfe22ECB1D6aE84699b76E540ddD7D9e`](https://sepolia.etherscan.io/address/0x1a0775f6cfe22ECB1D6aE84699b76E540ddD7D9e)
-- **Mainnet:** [`0xA928D43DEA05e2ce4Af9208150468d472932bB74`](https://etherscan.io/address/0xA928D43DEA05e2ce4Af9208150468d472932bB74)
+- **Mainnet:** [`0x3CAD995494954a8197391c4194Bd39E2Eda16274`](https://etherscan.io/address/0x3CAD995494954a8197391c4194Bd39E2Eda16274)
 
 Key design decisions:
 - `agentAddress` is **immutable** — required for EIP-7702 (storage reads zero via delegation)

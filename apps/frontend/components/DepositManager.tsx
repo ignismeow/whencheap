@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { useAccount, useChainId, useWriteContract, usePublicClient, useReadContract } from 'wagmi';
+import { useAccount, useWriteContract, usePublicClient, useReadContract } from 'wagmi';
 import { formatEther, parseEther } from 'viem';
 import { whenCheapSessionAbi, sessionContractAddress, mainnetSessionContractAddress } from '../lib/session-contract';
 import { UiError, toWalletUiError } from '../lib/ui-errors';
@@ -29,11 +29,21 @@ function secondsToHms(seconds: number): string {
 
 type Props = {
   walletAddress: `0x${string}`;
-};
+  selectedChain: 'sepolia' | 'mainnet';
+  className?: string;
+  sessionStatus?: {
+    active: boolean;
+    maxFeePerTxEth: string;
+    spentEth: string;
+    remainingEth: string;
+    expiresInMinutes: number;
+    depositEth?: string;
+    hasDeposit?: boolean;
+  } | null;
+}
 
-export function DepositManager({ walletAddress }: Props) {
+export function DepositManager({ walletAddress, selectedChain, sessionStatus, className = '' }: Props) {
   const { address } = useAccount();
-  const chainId = useChainId();
   const { writeContractAsync } = useWriteContract();
   const publicClient = usePublicClient();
 
@@ -44,14 +54,16 @@ export function DepositManager({ walletAddress }: Props) {
   const [txSuccess, setTxSuccess] = useState<string | null>(null);
   const [confirmRevoke, setConfirmRevoke] = useState(false);
 
-  const contract = chainId === 1 ? mainnetSessionContractAddress : sessionContractAddress;
+  const resolvedChainId = selectedChain === 'mainnet' ? 1 : 11155111;
+  const contract = selectedChain === 'mainnet' ? mainnetSessionContractAddress : sessionContractAddress;
 
   const { data: depositWei, refetch: refetchDeposit } = useReadContract({
     address: contract,
     abi: whenCheapSessionAbi,
     functionName: 'deposits',
     args: [walletAddress],
-    query: { refetchInterval: 10_000 },
+    chainId: resolvedChainId,
+    query: { refetchInterval: 10_000, enabled: Boolean(contract && walletAddress) },
   });
 
   const { data: session, refetch: refetchSession } = useReadContract({
@@ -59,7 +71,8 @@ export function DepositManager({ walletAddress }: Props) {
     abi: whenCheapSessionAbi,
     functionName: 'sessions',
     args: [walletAddress],
-    query: { refetchInterval: 10_000 },
+    chainId: resolvedChainId,
+    query: { refetchInterval: 10_000, enabled: Boolean(contract && walletAddress) },
   });
 
   const refetchAll = () => { void refetchDeposit(); void refetchSession(); };
@@ -68,10 +81,31 @@ export function DepositManager({ walletAddress }: Props) {
 
   const now = Math.floor(Date.now() / 1000);
   const expiresAt = session ? Number(session[3]) : 0;
-  const sessionActive = expiresAt > now;
+  const onChainSessionActive = expiresAt > now;
   const secondsLeft = expiresAt - now;
-  const hasDeposit = depositWei !== undefined && depositWei > 0n;
+  const onChainHasDeposit = depositWei !== undefined && depositWei > 0n;
   const remainingBudgetWei = session && session[1] > session[2] ? session[1] - session[2] : 0n;
+  const sessionActive = sessionStatus?.active ?? onChainSessionActive;
+  const hasDeposit = sessionStatus?.hasDeposit ?? onChainHasDeposit;
+  const displayDeposit = sessionStatus?.depositEth !== undefined
+    ? Number(sessionStatus.depositEth).toFixed(6)
+    : fmt(depositWei);
+  const displaySpent = sessionStatus?.spentEth !== undefined
+    ? `${Number(sessionStatus.spentEth).toFixed(6)} ETH`
+    : `${fmt(session?.[2])} ETH`;
+  const displayRemaining = sessionStatus?.remainingEth !== undefined
+    ? `${Number(sessionStatus.remainingEth).toFixed(6)} ETH`
+    : `${fmt(remainingBudgetWei)} ETH`;
+  const displayMaxFee = sessionStatus?.maxFeePerTxEth !== undefined
+    ? `${Number(sessionStatus.maxFeePerTxEth).toFixed(6)} ETH`
+    : `${fmt(session?.[0])} ETH`;
+  const displaySession = sessionStatus
+    ? sessionStatus.active
+      ? `${Math.max(0, sessionStatus.expiresInMinutes)}m left`
+      : 'Not set / Expired'
+    : sessionActive
+      ? `${secondsToHms(secondsLeft)} left`
+      : 'Not set / Expired';
   const healthLabel = sessionActive && hasDeposit
     ? 'Session Ready'
     : sessionActive
@@ -194,7 +228,7 @@ export function DepositManager({ walletAddress }: Props) {
   const isBusy = busy !== null;
 
   return (
-    <div className="console-panel" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+    <div className={`console-panel ${className}`} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       <p style={{ margin: 0, fontSize: 10, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--color-label)' }}>
         Deposit &amp; Session
       </p>
@@ -219,19 +253,19 @@ export function DepositManager({ walletAddress }: Props) {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 16px' }}>
         <Row
           label="Deposit"
-          value={`${fmt(depositWei)} ETH`}
+          value={`${displayDeposit} ETH`}
           tone={hasDeposit ? 'success' : 'danger'}
         />
         <Row
           label="Session"
-          value={sessionActive ? `${secondsToHms(secondsLeft)} left` : 'Not set / Expired'}
+          value={displaySession}
           tone={sessionActive ? 'success' : 'danger'}
         />
-        {session && (
+        {(session || sessionStatus) && (
           <>
-            <Row label="Spent" value={`${fmt(session[2])} ETH`} />
-            <Row label="Budget Left" value={`${fmt(remainingBudgetWei)} ETH`} />
-            <Row label="Max Fee / Tx" value={`${fmt(session[0])} ETH`} />
+            <Row label="Spent" value={displaySpent} />
+            <Row label="Budget Left" value={displayRemaining} />
+            <Row label="Max Fee / Tx" value={displayMaxFee} />
           </>
         )}
       </div>

@@ -69,7 +69,7 @@ The entire execution is one transaction. No approval transactions, no post-swap 
 
 ### What's Live
 
-- Mainnet contract: `0xA928D43DEA05e2ce4Af9208150468d472932bB74`
+- Mainnet contract: `0x3CAD995494954a8197391c4194Bd39E2Eda16274`
 - Sepolia contract: `0x1a0775f6cfe22ECB1D6aE84699b76E540ddD7D9e`
 - Confirmed swaps on Sepolia with real USDC received
 - Gas Analytics page with live DB-backed charts
@@ -92,6 +92,6 @@ The entire execution is one transaction. No approval transactions, no post-swap 
 - **GitHub:** https://github.com/saadaltafofficial/whencheap
 - **ENS:** whencheap.eth
 - **Demo video:** [Loom link]
-- **Mainnet contract:** https://etherscan.io/address/0xA928D43DEA05e2ce4Af9208150468d472932bB74
+- **Mainnet contract:** https://etherscan.io/address/0x3CAD995494954a8197391c4194Bd39E2Eda16274
 - **Sepolia contract:** https://sepolia.etherscan.io/address/0x1a0775f6cfe22ECB1D6aE84699b76E540ddD7D9e
 - **Sample tx (EIP-7702 swap):** https://sepolia.etherscan.io/tx/0x19f59f30a22675b8f35315d1a70f3c800f8e7da0cc2c379cbe88ece9580c14b3

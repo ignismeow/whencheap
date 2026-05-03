@@ -7,8 +7,8 @@ export default function StatusPage() {
       <p className="mt-3 text-sm text-[var(--muted)]">
         Intent-specific status views will live here once transaction execution is wired in.
       </p>
-      <Link className="mt-5 inline-block text-sm font-semibold text-[var(--accent)]" href="/">
-        Back to intents
+      <Link className="mt-5 inline-block text-sm font-semibold text-[var(--accent)]" href="/app">
+        Back to console
       </Link>
     </main>
   );

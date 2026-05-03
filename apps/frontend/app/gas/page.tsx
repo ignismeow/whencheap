@@ -344,7 +344,7 @@ function GasNav() {
   return (
     <header className="console-header">
       <nav className="mx-auto flex min-h-[64px] w-full max-w-[1600px] flex-wrap items-center justify-between gap-3 px-4 py-3 sm:px-6 lg:px-8">
-        <a href="/" className="flex min-w-0 items-center gap-3">
+        <a href="/app" className="flex min-w-0 items-center gap-3">
           <img
             src="/logo.svg"
             alt="WhenCheap logo"
@@ -357,7 +357,7 @@ function GasNav() {
 
         <div className="flex items-center gap-2">
           <a
-            href="/"
+            href="/app"
             className="console-chip hover:bg-[var(--color-accent)] hover:text-black focus-visible:bg-[var(--color-accent)] focus-visible:text-black focus-visible:outline-none"
           >
             Console

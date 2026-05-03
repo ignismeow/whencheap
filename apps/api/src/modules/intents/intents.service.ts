@@ -284,6 +284,8 @@ export class IntentsService implements OnModuleInit {
     expiresInMinutes: number;
     canExecute: boolean;
     estimatedFeeEth: string;
+    depositEth: string;
+    hasDeposit: boolean;
   }> {
     if (!isAddress(wallet)) {
       throw new BadRequestException('wallet must be a valid EVM address');
@@ -301,6 +303,8 @@ export class IntentsService implements OnModuleInit {
         expiresInMinutes: 0,
         canExecute: false,
         estimatedFeeEth: '0',
+        depositEth: '0',
+        hasDeposit: false,
       };
     }
 
@@ -313,6 +317,7 @@ export class IntentsService implements OnModuleInit {
     }
 
     const canExecute = await this.sessionSigner.canExecuteSession(wallet, estimatedFeeWei, chain);
+    const sessionDetail = await this.sessionSigner.getSessionDetail(wallet, chain, estimatedFeeWei);
 
     const expiresAtMs =
       session.expiresAt > 0n ? Number(session.expiresAt) * 1000 : 0;
@@ -336,6 +341,8 @@ export class IntentsService implements OnModuleInit {
       expiresInMinutes,
       canExecute,
       estimatedFeeEth: formatEther(estimatedFeeWei),
+      depositEth: sessionDetail.depositEth,
+      hasDeposit: !sessionDetail.depositZero,
     };
   }
 

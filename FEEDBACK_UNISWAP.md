@@ -113,4 +113,4 @@ WhenCheap's final architecture uses the Trading API for all quote and calldata g
 
 *Submitted by: Saad Altaf (saadbeenco@gmail.com)*
 *ENS: whencheap.eth*
-*Contracts: Sepolia `0x1a0775f6cfe22ECB1D6aE84699b76E540ddD7D9e` | Mainnet `0xA928D43DEA05e2ce4Af9208150468d472932bB74`*
+*Contracts: Sepolia `0x1a0775f6cfe22ECB1D6aE84699b76E540ddD7D9e` | Mainnet `0x3CAD995494954a8197391c4194Bd39E2Eda16274`*
