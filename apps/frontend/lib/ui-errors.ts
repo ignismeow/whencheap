@@ -63,6 +63,19 @@ export function toWalletUiError(error: unknown, fallbackTitle = 'Transaction Fai
   }
 
   if (
+    lower.includes('http request failed') ||
+    lower.includes('failed to fetch') ||
+    lower.includes('rpc.sepolia.org') ||
+    lower.includes('eth_call')
+  ) {
+    return {
+      title: 'RPC Unavailable',
+      message: 'The frontend could not reach the selected network RPC. Add a working Sepolia RPC to the frontend environment and try again.',
+      details,
+    };
+  }
+
+  if (
     lower.includes('internal server error') ||
     lower.includes('request failed: 500') ||
     lower.includes('unexpected token')

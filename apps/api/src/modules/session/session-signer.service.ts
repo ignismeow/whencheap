@@ -269,6 +269,16 @@ export class SessionSignerService implements OnModuleInit {
     });
 
     if (!persisted) {
+      this.logger.warn(`[getAuthorization] No authorization found for ${key} on ${normalizedChain}`);
+      return null;
+    }
+
+    if (persisted.expiresAt && persisted.expiresAt.getTime() <= Date.now()) {
+      this.logger.warn(`[getAuthorization] Authorization expired for ${key} on ${normalizedChain}`);
+      await this.sessionRepository.update(
+        { walletAddress: key, chain: normalizedChain },
+        { isActive: false },
+      );
       return null;
     }
 
@@ -279,6 +289,7 @@ export class SessionSignerService implements OnModuleInit {
           'Using stored authorization — this should not happen. Auth should be re-signed fresh per execution.',
         );
       }
+      this.logger.log(`[getAuthorization] Found valid authorization for ${key} on ${normalizedChain}`);
       return parsed;
     } catch {
       this.logger.warn(`Stored authorization for ${key} on ${normalizedChain} is invalid JSON.`);

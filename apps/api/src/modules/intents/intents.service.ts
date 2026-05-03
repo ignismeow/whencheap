@@ -138,11 +138,12 @@ export class IntentsService implements OnModuleInit {
     const now = new Date().toISOString();
     const id = randomUUID();
     const requestedExecutions = Math.max(parsed.repeatCount ?? 1, 1);
-    const userId = await this.resolveUserIdByWallet(dto.wallet);
+    const normalizedWallet = dto.wallet.toLowerCase();
+    const userId = await this.resolveUserIdByWallet(normalizedWallet);
 
     const intent: IntentRecord = {
       id,
-      wallet: dto.wallet,
+      wallet: normalizedWallet,
       rawInput: dto.input,
       parsed,
       requestedExecutions,
@@ -165,7 +166,7 @@ export class IntentsService implements OnModuleInit {
       this.intentRepository.create({
         id,
         userId,
-        walletAddress: dto.wallet.toLowerCase(),
+        walletAddress: normalizedWallet,
         rawInput: dto.input,
         status: IntentStatus.PendingIntent,
         parsed: parsed as Record<string, unknown>,
@@ -186,6 +187,8 @@ export class IntentsService implements OnModuleInit {
       requestedExecutions,
       inferenceProvider: providerUsed,
     });
+
+    this.logger.log(`[createIntent] Created intent ${id} for ${normalizedWallet}`);
 
     this.intents.set(id, intent);
     return intent;
@@ -413,16 +416,23 @@ export class IntentsService implements OnModuleInit {
         intent.parsed.chain ?? 'sepolia',
       );
       const intentAmountWei = parseEther(String(intent.parsed.amount));
+      const normalizedWallet = intent.wallet.toLowerCase();
+      const executionChain = intent.parsed.chain ?? 'sepolia';
+      this.logger.log(
+        `[executeIntent] Checking execution method for ${normalizedWallet} on ${executionChain}. ` +
+          `Type: ${intent.parsed.type}. Amount: ${intent.parsed.amount}.`,
+      );
       const sessionOk = await this.sessionSigner.canExecuteSession(
-        intent.wallet,
+        normalizedWallet,
         feeWei,
-        intent.parsed.chain ?? 'sepolia',
+        executionChain,
         intentAmountWei,
       );
+      this.logger.log(`[executeIntent] canExecuteSession(${normalizedWallet}, ${executionChain}) => ${sessionOk}`);
       if (!sessionOk) {
         const sessionDetail = await this.sessionSigner.getSessionDetail(
-          intent.wallet,
-          intent.parsed.chain ?? 'sepolia',
+          normalizedWallet,
+          executionChain,
           feeWei,
         );
         const sessionMessage = sessionDetail.depositZero
@@ -466,18 +476,43 @@ export class IntentsService implements OnModuleInit {
       }
 
       const authorization = await this.sessionSigner.getAuthorization(
-        intent.wallet,
-        intent.parsed.chain ?? 'sepolia',
+        normalizedWallet,
+        executionChain,
+      );
+      const hasOnChainMarker = this.sessionSigner.isOnChainSessionMarker(authorization);
+      this.logger.log(
+        `[executeIntent] Authorization found for ${normalizedWallet} on ${executionChain}: ${!!authorization}. ` +
+          `On-chain marker: ${hasOnChainMarker}.`,
       );
 
+      if (sessionOk && !authorization) {
+        await this.addAudit(
+          intent,
+          'NEEDS_AUTHORIZATION',
+          'On-chain session is valid, but the backend session marker is missing. Re-authorize once from Session Matrix to sync execution state.',
+          { chain: executionChain, wallet: normalizedWallet },
+        );
+        await this.transition(
+          intent,
+          IntentStatus.NeedsReauthorization,
+          'On-chain session valid but backend authorization marker missing.',
+        );
+        this.logger.warn(
+          `[executeIntent] Session valid on-chain for ${normalizedWallet} on ${executionChain}, ` +
+            `but no backend authorization marker was found. Refusing agent fallback.`,
+        );
+        continue;
+      }
+
       if (intent.parsed.type === 'swap') {
-        if (authorization && this.sessionSigner.isOnChainSessionMarker(authorization)) {
+        if (authorization && hasOnChainMarker) {
           await this.addAudit(
             intent,
             'ON_CHAIN_SESSION_EXECUTION',
             'Using on-chain session marker to execute swap from the session contract deposit.',
             { authorization },
           );
+          this.logger.log(`[executeIntent] Using session-backed swap execution for ${normalizedWallet}`);
           await this.executeSessionBacked(intent, baseFeeGwei);
           continue;
         }
@@ -499,17 +534,20 @@ export class IntentsService implements OnModuleInit {
         continue;
       }
 
-      if (authorization && this.sessionSigner.isOnChainSessionMarker(authorization)) {
+      if (authorization && hasOnChainMarker) {
         await this.addAudit(
           intent,
           'ON_CHAIN_SESSION_EXECUTION',
           'Using on-chain session marker to execute from the agent wallet with session limit enforcement.',
           { authorization },
         );
+        this.logger.log(`[executeIntent] Using session-backed send execution for ${normalizedWallet}`);
         await this.executeSessionBacked(intent, baseFeeGwei);
       } else if (authorization) {
+        this.logger.log(`[executeIntent] Using EIP-7702 execution for ${normalizedWallet}`);
         await this.executeEIP7702(intent, authorization, baseFeeGwei);
       } else if (this.agentFallbackEnabled) {
+        this.logger.warn(`[executeIntent] Using agent-funded fallback for ${normalizedWallet}`);
         await this.addAudit(
           intent,
           'AGENT_FALLBACK_USED',

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useAccount, useWriteContract, usePublicClient, useReadContract } from 'wagmi';
 import { formatEther, parseEther } from 'viem';
 import { whenCheapSessionAbi, sessionContractAddress, mainnetSessionContractAddress } from '../lib/session-contract';
@@ -106,6 +106,18 @@ export function DepositManager({ walletAddress, selectedChain, sessionStatus, cl
     : sessionActive
       ? `${secondsToHms(secondsLeft)} left`
       : 'Not set / Expired';
+  const hasOnChainSessionRecord = Boolean(
+    session && (session[0] > 0n || session[1] > 0n || session[2] > 0n || session[3] > 0n),
+  );
+  const hasSessionStatusRecord = Boolean(
+    sessionStatus && (
+      Number(sessionStatus.maxFeePerTxEth) > 0
+      || Number(sessionStatus.remainingEth) > 0
+      || Number(sessionStatus.spentEth) > 0
+      || sessionStatus.active
+    ),
+  );
+  const canRevokeSession = hasDeposit || hasOnChainSessionRecord || hasSessionStatusRecord;
   const healthLabel = sessionActive && hasDeposit
     ? 'Session Ready'
     : sessionActive
@@ -227,8 +239,14 @@ export function DepositManager({ walletAddress, selectedChain, sessionStatus, cl
 
   const isBusy = busy !== null;
 
+  useEffect(() => {
+    if (confirmRevoke && !canRevokeSession) {
+      setConfirmRevoke(false);
+    }
+  }, [canRevokeSession, confirmRevoke]);
+
   return (
-    <div className={`console-panel ${className}`} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+    <div className={`console-panel ${className}`} style={{ display: 'flex', flexDirection: 'column', gap: 16, height: '100%', minHeight: 0 }}>
       <p style={{ margin: 0, fontSize: 10, letterSpacing: '0.16em', textTransform: 'uppercase', color: 'var(--color-label)' }}>
         Deposit &amp; Session
       </p>
@@ -364,7 +382,7 @@ export function DepositManager({ walletAddress, selectedChain, sessionStatus, cl
       </div>
 
       {/* Revoke */}
-      {!confirmRevoke ? (
+      {canRevokeSession && !confirmRevoke ? (
         <button
           type="button"
           onClick={() => setConfirmRevoke(true)}
@@ -374,7 +392,7 @@ export function DepositManager({ walletAddress, selectedChain, sessionStatus, cl
         >
           Revoke Session &amp; Refund All
         </button>
-      ) : (
+      ) : canRevokeSession ? (
         <div className="console-alert console-alert-danger" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <span className="console-alert-label">Confirm Revoke</span>
           <p>This will stop all pending intents and refund your full deposit. Continue?</p>
@@ -394,7 +412,13 @@ export function DepositManager({ walletAddress, selectedChain, sessionStatus, cl
             </button>
           </div>
         </div>
-      )}
+      ) : null}
+
+      {!canRevokeSession ? (
+        <p style={{ margin: 0, fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--color-muted)' }}>
+          No active session or refundable deposit on this contract.
+        </p>
+      ) : null}
 
       {/* Feedback */}
       {txSuccess && (

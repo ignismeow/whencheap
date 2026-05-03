@@ -21,6 +21,7 @@ import {
   whenCheapSessionAbi,
 } from '../lib/session-contract';
 import { DepositManager } from '../components/DepositManager';
+import { toWalletUiError } from '../lib/ui-errors';
 
 type AuditEvent = {
   id: string;
@@ -230,7 +231,6 @@ export default function Home() {
       timestamp: new Date(),
     },
   ]);
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const pollingIntervalsRef = useRef<Record<string, number>>({});
 
   const { data, mutate, isLoading } = useSWR<IntentRecord[]>(`${apiUrl}/intents`, fetcher, {
@@ -316,10 +316,6 @@ export default function Home() {
     window.localStorage.setItem(chainStorageKey, selectedChain);
     setSelectedId(null);
   }, [selectedChain]);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isSubmitting]);
 
   useEffect(() => {
     return () => {
@@ -801,11 +797,11 @@ export default function Home() {
         onDisconnect={() => void disconnectWallet()}
       />
 
-      <div className="console-root xl:h-[calc(100vh-104px)] xl:min-h-0">
-        <aside className="console-sidebar xl:grid xl:min-h-0 xl:grid-rows-[minmax(0,1fr)_minmax(280px,0.72fr)] xl:overflow-hidden">
+      <div className="console-root xl:h-[calc(100vh)] xl:min-h-0">
+        <aside className="console-sidebar xl:grid xl:min-h-0 xl:grid-rows-[700px_500px] xl:overflow-hidden 2xl:grid-rows-[740px_540px]">
           <ConsolePanel title="Intent Input" eyebrow="Translate Natural Language" className="console-intent-panel min-h-0 xl:h-full">
-            <form onSubmit={createIntent} className="flex h-full min-h-0 flex-col space-y-4">
-              <div className="console-scroll flex min-h-[220px] flex-1 flex-col gap-3 px-4 py-3 xl:min-h-[320px]">
+            <form onSubmit={createIntent} className="flex h-full min-h-0 flex-col">
+              <div className="console-scroll flex min-h-0 flex-1 flex-col gap-3 px-4 py-3">
                 {messages.map((msg) => (
                   <ChatMessageBubble key={msg.id} message={msg} />
                 ))}
@@ -822,92 +818,88 @@ export default function Home() {
                     </div>
                   </div>
                 ) : null}
-                <div ref={messagesEndRef} />
               </div>
 
-              <div className="px-4 pb-2">
-                <textarea
-                  value={input}
-                  onChange={(event) => setInput(event.target.value)}
-                  onKeyDown={submitIntentOnEnter}
-                  rows={2}
-                  className="w-full resize-none rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 placeholder-zinc-500 focus:border-[var(--color-accent)] focus:outline-none"
-                  placeholder="Swap 0.001 ETH to USDC when gas < $2..."
-                />
-                <p className="mt-1 text-[10px] normal-case tracking-normal text-[var(--color-muted)]">
-                  Press Enter to send · Shift+Enter for new line
-                </p>
-              </div>
-
-              {awaitingConfirmation ? (
-                <div className="flex gap-2 px-4 pb-2">
-                  <button
-                    type="button"
-                    onClick={() => void handleQuickReply('confirm')}
-                    className="flex-1  bg-[var(--color-accent)] py-2 text-xs font-medium text-black"
-                  >
-                    Confirm
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void handleQuickReply('cancel')}
-                    className="flex-1 bg-zinc-700 py-2 text-xs text-white"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              ) : null}
-
-              <div className="space-y-2 text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
-                <div className="console-subpanel">
-                  <span className="block text-[10px] text-[var(--color-label)]">Connected wallet</span>
-                  <span className="mt-1 block text-[var(--color-text)]">{truncateAddress(effectiveAddress ?? '')}</span>
-                </div>
-
-                {showsMainnetSwapWarning(input) ? (
-                  <p className="text-[11px] normal-case tracking-normal text-[var(--color-warning)]">
-                    {selectedChain === 'mainnet'
-                      ? 'Mainnet mode active. Real ETH will be used.'
-                      : 'Swap intents without an explicit chain default to Ethereum mainnet.'}
+              <div className="mt-auto shrink-0 space-y-4 px-4 pb-2">
+                <div>
+                  <textarea
+                    value={input}
+                    onChange={(event) => setInput(event.target.value)}
+                    onKeyDown={submitIntentOnEnter}
+                    rows={2}
+                    className="w-full resize-none rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs text-zinc-100 placeholder-zinc-500 focus:border-[var(--color-accent)] focus:outline-none"
+                    placeholder="Swap 0.001 ETH to USDC when gas < $2..."
+                  />
+                  <p className="mt-1 text-[10px] normal-case tracking-normal text-[var(--color-muted)]">
+                    Press Enter to send · Shift+Enter for new line
                   </p>
-                ) : null}
+                </div>
 
-                {ensCandidate ? (
-                  <div className="console-subpanel">
-                    <span className="block text-[10px] text-[var(--color-label)]">ENS resolver</span>
-                    <span className="mt-1 block text-[var(--color-text)] normal-case tracking-normal">
-                      {isResolvingEns
-                        ? `Resolving ${ensCandidate}...`
-                        : resolvedEnsAddress
-                          ? `${ensCandidate} -> ${truncateAddress(resolvedEnsAddress)}`
-                          : ensResolutionError ?? `No resolution found for ${ensCandidate}`}
-                    </span>
+                {awaitingConfirmation ? (
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleQuickReply('confirm')}
+                      className="flex-1  bg-[var(--color-accent)] py-2 text-xs font-medium text-black"
+                    >
+                      Confirm
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleQuickReply('cancel')}
+                      className="flex-1 bg-zinc-700 py-2 text-xs text-white"
+                    >
+                      Cancel
+                    </button>
                   </div>
                 ) : null}
-              </div>
 
-              <div className="space-y-2">
-                <button
-                  type="submit"
-                  disabled={isSubmitting || !effectiveAddress}
-                  className="console-button console-button-primary w-full"
-                >
-                  <Send size={15} />
-                  {isSubmitting ? 'Creating Command...' : 'Create Intent'}
-                </button>
-                <p className="text-[10px] normal-case tracking-normal text-[var(--color-muted)]">
-                  0.3% execution fee applies on confirmed transactions.
-                </p>
-                {effectiveAddress && !sessionStatus?.active ? (
-                  <p className="text-[10px] normal-case tracking-normal text-[var(--color-warning)]">
-                    Explore freely. We will prompt for deposit and session authorization only when you actually submit a new intent.
+                <div className="space-y-2 text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
+                  {showsMainnetSwapWarning(input) ? (
+                    <p className="text-[11px] normal-case tracking-normal text-[var(--color-warning)]">
+                      {selectedChain === 'mainnet'
+                        ? 'Mainnet mode active. Real ETH will be used.'
+                        : 'Swap intents without an explicit chain default to Ethereum mainnet.'}
+                    </p>
+                  ) : null}
+
+                  {ensCandidate ? (
+                    <div className="console-subpanel">
+                      <span className="block text-[10px] text-[var(--color-label)]">ENS resolver</span>
+                      <span className="mt-1 block text-[var(--color-text)] normal-case tracking-normal">
+                        {isResolvingEns
+                          ? `Resolving ${ensCandidate}...`
+                          : resolvedEnsAddress
+                            ? `${ensCandidate} -> ${truncateAddress(resolvedEnsAddress)}`
+                            : ensResolutionError ?? `No resolution found for ${ensCandidate}`}
+                      </span>
+                    </div>
+                  ) : null}
+                </div>
+
+                <div className="space-y-2">
+                  <button
+                    type="submit"
+                    disabled={isSubmitting || !effectiveAddress}
+                    className="console-button console-button-primary w-full"
+                  >
+                    <Send size={15} />
+                    {isSubmitting ? 'Creating Command...' : 'Create Intent'}
+                  </button>
+                  <p className="text-[10px] normal-case tracking-normal text-[var(--color-muted)]">
+                    0.3% execution fee applies on confirmed transactions.
                   </p>
-                ) : null}
-                {/\bswap\b/i.test(input) && selectedChain === 'sepolia' ? (
-                  <p className="text-[10px] normal-case tracking-normal text-[var(--color-warning)]">
-                    Demo note: Sepolia currently supports ETH -&gt; token swaps only. Try ETH -&gt; USDC or ETH -&gt; DAI.
-                  </p>
-                ) : null}
+                  {effectiveAddress && !sessionStatus?.active ? (
+                    <p className="text-[10px] normal-case tracking-normal text-[var(--color-warning)]">
+                      Explore freely. We will prompt for deposit and session authorization only when you actually submit a new intent.
+                    </p>
+                  ) : null}
+                  {/\bswap\b/i.test(input) && selectedChain === 'sepolia' ? (
+                    <p className="text-[10px] normal-case tracking-normal text-[var(--color-warning)]">
+                      Demo note: Sepolia currently supports ETH -&gt; token swaps only. Try ETH -&gt; USDC or ETH -&gt; DAI.
+                    </p>
+                  ) : null}
+                </div>
               </div>
             </form>
           </ConsolePanel>
@@ -972,8 +964,8 @@ export default function Home() {
         </aside>
 
         <section className="console-main xl:min-h-0">
-          <div className="grid min-h-0 gap-4 xl:h-full xl:grid-rows-[minmax(0,1fr)_minmax(280px,0.72fr)]">
-            <div className="grid min-h-0 gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(340px,0.85fr)]">
+          <div className="grid min-h-0 gap-4 xl:h-full xl:grid-rows-[700px_400px] 2xl:grid-rows-[740px_420px]">
+            <div className="grid min-h-0 gap-4 xl:h-full xl:grid-cols-[minmax(0,1.15fr)_minmax(340px,0.85fr)]">
               {selected ? (
                 <CommandCenter
                   intent={selected}
@@ -1365,14 +1357,14 @@ function SessionCardModal({
   }, [onClose]);
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 px-4 py-6">
+    <div className="fixed inset-0 z-40 flex items-center justify-center overflow-y-auto bg-black/70 px-3 py-5 sm:px-4 sm:py-6 lg:px-6 lg:py-8">
       <button
         type="button"
         aria-label="Close session details"
         className="absolute inset-0 cursor-default"
         onClick={onClose}
       />
-      <div className="relative z-10 w-full max-w-[760px]">
+      <div className="relative z-10 w-full max-w-[1180px] lg:max-h-[calc(100vh-64px)]">
         {children}
       </div>
     </div>
@@ -1514,6 +1506,7 @@ function SessionCard({
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [copiedAddress, setCopiedAddress] = useState(false);
   const [activeAction, setActiveAction] = useState<'authorize' | 'revoke' | 'disconnect' | null>(null);
+  const [optimisticSessionStatus, setOptimisticSessionStatus] = useState<SessionStatus | null>(null);
   const sessionContractForChain =
     sessionChain === 'mainnet' ? mainnetSessionContractAddress : sessionContractAddress;
   const sessionChainId = sessionChain === 'mainnet' ? mainnet.id : sepolia.id;
@@ -1549,7 +1542,7 @@ function SessionCard({
       enabled: Boolean(sessionContractForChain && draftIntentEstimate)
     }
   });
-  const { data: onChainDeposit } = useReadContract({
+  const { data: onChainDeposit, refetch: refetchOnChainDeposit } = useReadContract({
     address: sessionContractForChain,
     abi: whenCheapSessionAbi,
     functionName: 'deposits',
@@ -1559,7 +1552,7 @@ function SessionCard({
       enabled: Boolean(externalWalletOnSelectedChain && address)
     }
   });
-  const { data: onChainSession } = useReadContract({
+  const { data: onChainSession, refetch: refetchOnChainSession } = useReadContract({
     address: sessionContractForChain,
     abi: whenCheapSessionAbi,
     functionName: 'sessions',
@@ -1569,7 +1562,7 @@ function SessionCard({
       enabled: Boolean(externalWalletOnSelectedChain && address)
     }
   });
-  const { data: onChainCanExecuteWithDeposit } = useReadContract({
+  const { data: onChainCanExecuteWithDeposit, refetch: refetchOnChainCanExecuteWithDeposit } = useReadContract({
     address: sessionContractForChain,
     abi: whenCheapSessionAbi,
     functionName: 'canExecuteWithDeposit',
@@ -1592,6 +1585,52 @@ function SessionCard({
     return () => window.clearTimeout(timeout);
   }, [copiedAddress]);
 
+  const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number): Promise<T> => {
+    let timeoutId: number | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = window.setTimeout(() => reject(new Error('Request timed out')), timeoutMs);
+    });
+
+    try {
+      return await Promise.race([promise, timeoutPromise]);
+    } finally {
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+      }
+    }
+  };
+
+  const waitForOnChainAuthorization = async (
+    walletAddress: `0x${string}`,
+    expectedExpirySeconds: bigint,
+  ) => {
+    if (!publicClient) {
+      throw new Error('Public client unavailable.');
+    }
+    if (!sessionContractForChain) {
+      throw new Error('Session contract unavailable.');
+    }
+
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < 45_000) {
+      const session = await publicClient.readContract({
+        address: sessionContractForChain,
+        abi: whenCheapSessionAbi,
+        functionName: 'sessions',
+        args: [walletAddress],
+      });
+
+      if (session[3] >= expectedExpirySeconds) {
+        return session;
+      }
+
+      await new Promise((resolve) => window.setTimeout(resolve, 2_000));
+    }
+
+    throw new Error('Authorization confirmed on-chain too slowly for the UI to detect automatically.');
+  };
+
   async function authorizeExternalWalletSession() {
     if (!address || !sessionContractForChain || !publicClient) return;
 
@@ -1612,6 +1651,9 @@ function SessionCard({
         throw new Error('Enter a valid expiry duration.');
       }
 
+      const nowSeconds = BigInt(Math.floor(Date.now() / 1000));
+      const expectedExpirySeconds = nowSeconds + durationSeconds;
+
       const hash = await writeContractAsync({
         address: sessionContractForChain,
         abi: whenCheapSessionAbi,
@@ -1624,45 +1666,92 @@ function SessionCard({
         chainId: sessionChainId,
       });
 
-      const receipt = await publicClient.waitForTransactionReceipt({
-        hash,
-        pollingInterval: 2_000,
-        timeout: 120_000,
-      });
+      try {
+        const receipt = await Promise.race([
+          publicClient.waitForTransactionReceipt({
+            hash,
+            pollingInterval: 2_000,
+            timeout: 45_000,
+          }),
+          waitForOnChainAuthorization(address, expectedExpirySeconds).then(() => ({ status: 'success' as const })),
+        ]);
 
-      if (receipt.status !== 'success') {
-        throw new Error(`Authorization reverted (${hash})`);
+        if (receipt.status !== 'success') {
+          throw new Error(`Authorization reverted (${hash})`);
+        }
+      } catch (receiptError) {
+        await waitForOnChainAuthorization(address, expectedExpirySeconds);
+        setSessionMessage('Authorization confirmed on-chain. Syncing local session state...');
       }
 
-      const response = await fetch(`${apiUrl}/intents/authorize-wallet-session`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userAddress: address,
-          maxFeePerTxEth,
-          maxTotalSpendEth,
-          expiryHours,
-          chain: sessionChain,
-        }),
+      const now = Date.now();
+      const expiryMinutes = Math.max(1, Number(expiryHours || '0') * 60);
+      const currentSpentEth = sessionStatus?.spentEth
+        ?? (onChainSession ? formatEther(onChainSession[2]) : '0');
+      const currentDepositEth = sessionStatus?.depositEth
+        ?? (typeof onChainDeposit === 'bigint' ? formatEther(onChainDeposit) : '0');
+      const currentHasDeposit = sessionStatus?.hasDeposit
+        ?? (typeof onChainDeposit === 'bigint' ? onChainDeposit > 0n : false);
+      const currentEstimatedFeeEth = sessionStatus?.estimatedFeeEth ?? '0';
+      setOptimisticSessionStatus({
+        active: true,
+        maxFeePerTxEth,
+        maxTotalSpendEth,
+        spentEth: currentSpentEth,
+        remainingEth: maxTotalSpendEth,
+        expiresAt: new Date(now + expiryMinutes * 60_000).toISOString(),
+        expiresInMinutes: expiryMinutes,
+        canExecute: true,
+        estimatedFeeEth: currentEstimatedFeeEth,
+        depositEth: currentDepositEth,
+        hasDeposit: currentHasDeposit,
       });
-
-      const rawBody = await response.text();
-      const payload = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
-      if (!response.ok || payload.ok !== true) {
-        throw new Error(
-          typeof payload.message === 'string'
-            ? payload.message
-            : rawBody || 'Failed to refresh external wallet session.',
-        );
-      }
-
       setSessionMessage('Session authorized.');
       setSessionTxHash(hash);
-      await refreshSessionStatus();
-    } catch (err) {
-      setSessionError(err instanceof Error ? err.message : 'Session authorization failed');
-    } finally {
       setActiveAction(null);
+
+      void Promise.allSettled([
+        withTimeout(
+          fetch(`${apiUrl}/intents/authorize-wallet-session`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              userAddress: address,
+              maxFeePerTxEth,
+              maxTotalSpendEth,
+              expiryHours,
+              chain: sessionChain,
+            }),
+          }).then(async (response) => {
+            const rawBody = await response.text();
+            const payload = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
+            if (!response.ok || payload.ok !== true) {
+              throw new Error(
+                typeof payload.message === 'string'
+                  ? payload.message
+                  : rawBody || 'Failed to refresh external wallet session.',
+              );
+            }
+          }),
+          12_000,
+        ),
+        withTimeout(refreshSessionStatus(), 12_000),
+        refetchOnChainDeposit(),
+        refetchOnChainSession(),
+        refetchOnChainCanExecuteWithDeposit(),
+      ]).then((results) => {
+        const failed = results.find((result) => result.status === 'rejected') as PromiseRejectedResult | undefined;
+        if (failed) {
+          setSessionMessage('Session authorized on-chain. Sync is still catching up, but the session is active.');
+        }
+      });
+    } catch (err) {
+      const uiError = toWalletUiError(err, 'Session Authorization Failed');
+      setSessionError(`${uiError.title}: ${uiError.message}`);
+    } finally {
+      if (activeAction === 'authorize') {
+        setActiveAction(null);
+      }
     }
   }
 
@@ -1693,6 +1782,9 @@ function SessionCard({
     ? draftIntentEstimate.amountWei + onChainFeeWei + draftIntentEstimate.gasEstimateWei
     : 0n;
   const displayedSessionStatus = useMemo<SessionStatus | null>(() => {
+    if (optimisticSessionStatus) {
+      return optimisticSessionStatus;
+    }
     if (!address || !onChainSession) {
       return sessionStatus;
     }
@@ -1724,6 +1816,7 @@ function SessionCard({
     onChainCanExecuteWithDeposit,
     onChainDeposit,
     onChainSession,
+    optimisticSessionStatus,
     sessionStatus,
   ]);
   const displayedSessionHealth = useMemo(
@@ -1731,18 +1824,23 @@ function SessionCard({
     [displayedSessionStatus],
   );
 
+  useEffect(() => {
+    if (!optimisticSessionStatus || !displayedSessionStatus?.active) return;
+    setOptimisticSessionStatus(null);
+  }, [displayedSessionStatus?.active, optimisticSessionStatus]);
+
   return (
     <ConsolePanel
       title="Session Matrix"
       eyebrow="SESSION EXECUTION LAYER"
-      className="console-glitch-panel"
+      className="console-glitch-panel flex max-h-[calc(100vh-64px)] min-h-0 flex-col overflow-hidden"
       action={
         <button type="button" onClick={onClose} className="console-icon-button" aria-label="Close session details">
           <XCircle size={15} />
         </button>
       }
     >
-      <div className="space-y-4">
+      <div className="flex min-h-0 flex-1 flex-col space-y-4">
         <div className="grid gap-3 text-[11px] uppercase tracking-[0.16em] md:grid-cols-2">
           <div className="console-subpanel">
             <span className="text-[10px] text-[var(--color-label)]">Session health</span>
@@ -1776,224 +1874,229 @@ function SessionCard({
           </p>
         </div>
 
-        <div className="console-scroll max-h-[70vh] space-y-4 pr-1">
-          <div className="console-subpanel">
-            <span className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-label)]">Contract</span>
-            <p className="mt-2 break-all text-[11px] text-[var(--color-text)]">
-              {sessionContractForChain ?? 'Not configured'}
-            </p>
-          </div>
-
-          <div className="grid gap-[1px] border border-[var(--color-border)] bg-[var(--color-border)]">
-            <InfoRow
-              label="ACTIVE"
-              value={
-                <span
-                  className={
-                    !displayedSessionStatus
-                      ? 'text-zinc-400'
-                      : displayedSessionStatus.active
-                        ? 'text-emerald-400'
-                        : 'text-red-500'
-                  }
-                >
-                  {!displayedSessionStatus ? 'CHECKING...' : displayedSessionStatus.active ? 'YES' : 'NO'}
-                </span>
-              }
-            />
-            <InfoRow label="CHAIN" value={sessionChain === 'mainnet' ? 'Mainnet' : 'Sepolia'} />
-            <InfoRow label="DEPOSIT" value={`${displayedSessionStatus?.depositEth ?? '0'} ETH`} />
-            <InfoRow label="BUDGET REMAINING" value={`${displayedSessionStatus?.remainingEth ?? '0'} ETH`} />
-            <InfoRow label="SPENT" value={`${displayedSessionStatus?.spentEth ?? '0'} ETH`} />
-            <InfoRow
-              label="EXPIRES"
-              value={
-                !displayedSessionStatus
-                  ? 'Checking...'
-                  : displayedSessionStatus.active && displayedSessionStatus.expiresAt
-                  ? `in ${displayedSessionStatus.expiresInMinutes} minutes (${new Date(displayedSessionStatus.expiresAt).toLocaleString()})`
-                  : 'Not Set'
-              }
-            />
-            <InfoRow label="MAX FEE/TX" value={`${displayedSessionStatus?.maxFeePerTxEth ?? '0'} ETH`} />
-            <InfoRow
-              label="CAN EXECUTE"
-              value={
-                <span
-                  className={
-                    !displayedSessionStatus
-                      ? 'text-zinc-400'
-                      : displayedSessionStatus.canExecute
-                        ? 'text-emerald-400'
-                        : 'text-red-500'
-                  }
-                >
-                  {!displayedSessionStatus ? 'CHECKING...' : displayedSessionStatus.canExecute ? 'YES' : 'NO'}
-                </span>
-              }
-            />
-          </div>
-
-          {displayedSessionHealth.level === 'yellow' && displayedSessionStatus ? (
-            <div className="console-alert border-[var(--color-warning)] text-[var(--color-warning)]">
-              <span className="console-alert-label">Warning</span>
-              <p>
-                Current estimated fee is above 80% of the per-tx session limit. Raise the limit if you want more headroom during gas spikes.
-              </p>
-            </div>
-          ) : null}
-
-          {displayedSessionHealth.level === 'red' ? (
-            <div className="console-alert border-[var(--color-danger)] text-[var(--color-danger)]">
-              <span className="console-alert-label">Status</span>
-              <p>
-                {displayedSessionStatus && displayedSessionStatus.hasDeposit === false
-                  ? 'Session exists, but no deposit is available on the contract shown above.'
-                  : 'Session is expired, unavailable, or cannot execute with the current estimated fee.'}
-              </p>
-            </div>
-          ) : null}
-
-          <div className="space-y-2">
-            <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
-              Session chain
-            </p>
-            <div className="flex gap-2">
-              {(['sepolia', 'mainnet'] as const).map((chain) => (
-                <button
-                  key={chain}
-                  type="button"
-                  onClick={() => onSessionChainChange(chain)}
-                  className={`border px-3 py-2 text-[10px] uppercase tracking-[0.18em] ${
-                    sessionChain === chain
-                      ? 'border-[var(--color-accent)] bg-[var(--color-accent)] text-black'
-                      : 'border-[var(--color-border)] text-[var(--color-muted)]'
-                  }`}
-                >
-                  {chain === 'mainnet' ? 'Mainnet' : 'Sepolia'}
-                </button>
-              ))}
-            </div>
-            {sessionChain === 'mainnet' ? (
-              <p className="text-[11px] normal-case tracking-normal text-[var(--color-warning)]">
-                Authorizing on mainnet. Real ETH required for gas.
-              </p>
-            ) : null}
-          </div>
-
-          <div className="grid gap-3">
-            <label className="space-y-1 text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
-              <span>Per-tx limit</span>
-              <input
-                value={maxFeePerTxEth}
-                onChange={(event) => setMaxFeePerTxEth(event.target.value)}
-                className="console-input w-full"
-                inputMode="decimal"
-              />
-            </label>
-            <label className="space-y-1 text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
-              <span>Budget</span>
-              <input
-                value={maxTotalSpendEth}
-                onChange={(event) => setMaxTotalSpendEth(event.target.value)}
-                className="console-input w-full"
-                inputMode="decimal"
-              />
-            </label>
-            <label className="space-y-1 text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
-              <span>Expiry hours</span>
-              <input
-                value={expiryHours}
-                onChange={(event) => setExpiryHours(event.target.value)}
-                className="console-input w-full"
-                inputMode="numeric"
-              />
-            </label>
-          </div>
-
-          <div className="border border-[var(--color-border)] p-3">
-            <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
-              Minimum balance required
-            </p>
-            {draftIntentEstimate ? (
-              <>
-                <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
-                  For {draftIntentEstimate.amount} {draftIntentEstimate.fromToken} {draftIntentEstimate.type} intent:
+        <div className="console-scroll min-h-0 flex-1 pr-1">
+          <div className="grid gap-4 lg:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)] xl:grid-cols-[minmax(0,1.2fr)_minmax(340px,0.8fr)]">
+            <div className="space-y-4">
+              <div className="console-subpanel">
+                <span className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-label)]">Contract</span>
+                <p className="mt-2 break-all text-[11px] text-[var(--color-text)]">
+                  {sessionContractForChain ?? 'Not configured'}
                 </p>
-                <div className="mt-3 grid gap-[1px] bg-[var(--color-border)]">
-                  <InfoRow
-                    label={draftIntentEstimate.type === 'swap' ? 'Swap amount' : 'Amount'}
-                    value={`${formatEthFixed(draftIntentEstimate.amountWei)} ETH`}
-                  />
-                  <InfoRow label="Gas est" value={`${formatEthFixed(draftIntentEstimate.gasEstimateWei)} ETH`} />
-                  <InfoRow
-                    label={`Platform fee (${(onChainFeeBps / 100).toFixed(1)}%)`}
-                    value={`${formatEthFixed(onChainFeeWei)} ETH`}
-                  />
-                  <InfoRow
-                    label={draftIntentEstimate.type === 'swap' ? 'Total charged' : 'Total'}
-                    value={`${formatEthFixed(draftTotalWei)} ETH`}
-                  />
+              </div>
+
+              <div className="grid gap-3 md:grid-cols-2">
+                <MetricCard
+                  label="Active"
+                  value={!displayedSessionStatus ? 'Checking...' : displayedSessionStatus.active ? 'Yes' : 'No'}
+                  tone={!displayedSessionStatus ? 'neutral' : displayedSessionStatus.active ? 'positive' : 'negative'}
+                />
+                <MetricCard
+                  label="Can Execute"
+                  value={!displayedSessionStatus ? 'Checking...' : displayedSessionStatus.canExecute ? 'Yes' : 'No'}
+                  tone={!displayedSessionStatus ? 'neutral' : displayedSessionStatus.canExecute ? 'positive' : 'negative'}
+                />
+                <MetricCard
+                  label="Deposit"
+                  value={`${displayedSessionStatus?.depositEth ?? '0'} ETH`}
+                />
+                <MetricCard
+                  label="Budget Remaining"
+                  value={`${displayedSessionStatus?.remainingEth ?? '0'} ETH`}
+                />
+                <MetricCard
+                  label="Spent"
+                  value={`${displayedSessionStatus?.spentEth ?? '0'} ETH`}
+                />
+                <MetricCard
+                  label="Max Fee / Tx"
+                  value={`${displayedSessionStatus?.maxFeePerTxEth ?? '0'} ETH`}
+                />
+                <div className="console-subpanel md:col-span-2">
+                  <span className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-label)]">Expires</span>
+                  <p className="mt-2 text-sm text-[var(--color-text)]">
+                    {!displayedSessionStatus
+                      ? 'Checking...'
+                      : displayedSessionStatus.active && displayedSessionStatus.expiresAt
+                        ? `In ${displayedSessionStatus.expiresInMinutes} minutes`
+                        : 'Not set'}
+                  </p>
+                  {displayedSessionStatus?.active && displayedSessionStatus.expiresAt ? (
+                    <p className="mt-1 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
+                      {new Date(displayedSessionStatus.expiresAt).toLocaleString()}
+                    </p>
+                  ) : null}
                 </div>
-                {draftIntentEstimate.type === 'swap' ? (
-                  <p className="mt-3 text-[11px] normal-case tracking-normal text-[var(--color-muted)]">
-                    You will receive the output for exactly {draftIntentEstimate.amount} {draftIntentEstimate.fromToken} swapped, plus gas is charged separately.
-                  </p>
-                ) : null}
-                {draftIntentEstimate.type === 'swap' && draftIntentEstimate.chain === 'sepolia' ? (
-                  <p className="mt-2 text-[11px] normal-case tracking-normal text-[var(--color-warning)]">
-                    Demo supports ETH -&gt; USDC and ETH -&gt; DAI on Sepolia. Token -&gt; ETH routes are intentionally blocked for now.
-                  </p>
-                ) : null}
-              </>
-            ) : (
-              <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
-                Enter an ETH send or ETH -&gt; token swap intent to calculate the minimum wallet funding requirement.
-              </p>
-            )}
-          </div>
+              </div>
 
-          <div className="border border-[var(--color-border)] p-3">
-            <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
-              External wallet mode
-            </p>
-            <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
-              This panel reads the connected wallet directly from the selected session contract. Deposit and session values should match the Deposit & Session panel.
-            </p>
-            <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
-              Platform fee: {(onChainFeeBps / 100).toFixed(1)}% (enforced on-chain)
-            </p>
-            <p className="mt-2 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
-              Treasury: {typeof treasuryData === 'string' ? truncateAddress(treasuryData) : 'Loading...'}
-            </p>
-          </div>
+              {displayedSessionHealth.level === 'yellow' && displayedSessionStatus ? (
+                <div className="console-alert border-[var(--color-warning)] text-[var(--color-warning)]">
+                  <span className="console-alert-label">Warning</span>
+                  <p>
+                    Current estimated fee is above 80% of the per-tx session limit. Raise the limit if you want more headroom during gas spikes.
+                  </p>
+                </div>
+              ) : null}
 
-          <div className="space-y-3">
-            {!displayedSessionStatus?.active ? (
-              <button
-                type="button"
-                onClick={authorizeExternalWalletSession}
-                disabled={activeAction !== null || !sessionContractForChain}
-                className="console-button console-button-primary w-full"
-              >
-                <ShieldCheck size={15} />
-                {activeAction === 'authorize' ? 'Authorizing...' : 'Authorize Session'}
-              </button>
-            ) : null}
-            <div className="console-alert border-[var(--color-border)] text-[var(--color-muted)]">
-              <span className="console-alert-label">External Wallet</span>
-              <p>
-                Authorize from this panel when the session is expired, then top up or revoke from the Deposit &amp; Session panel on the dashboard.
-              </p>
+              {displayedSessionHealth.level === 'red' ? (
+                <div className="console-alert border-[var(--color-danger)] text-[var(--color-danger)]">
+                  <span className="console-alert-label">Status</span>
+                  <p>
+                    {displayedSessionStatus && displayedSessionStatus.hasDeposit === false
+                      ? 'Session exists, but no deposit is available on the contract shown above.'
+                      : 'Session is expired, unavailable, or cannot execute with the current estimated fee.'}
+                  </p>
+                </div>
+              ) : null}
+
+              <div className="border border-[var(--color-border)] p-3">
+                <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+                  Minimum balance required
+                </p>
+                {draftIntentEstimate ? (
+                  <>
+                    <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
+                      For {draftIntentEstimate.amount} {draftIntentEstimate.fromToken} {draftIntentEstimate.type} intent:
+                    </p>
+                    <div className="mt-3 grid gap-[1px] bg-[var(--color-border)]">
+                      <InfoRow
+                        label={draftIntentEstimate.type === 'swap' ? 'Swap amount' : 'Amount'}
+                        value={`${formatEthFixed(draftIntentEstimate.amountWei)} ETH`}
+                      />
+                      <InfoRow label="Gas est" value={`${formatEthFixed(draftIntentEstimate.gasEstimateWei)} ETH`} />
+                      <InfoRow
+                        label={`Platform fee (${(onChainFeeBps / 100).toFixed(1)}%)`}
+                        value={`${formatEthFixed(onChainFeeWei)} ETH`}
+                      />
+                      <InfoRow
+                        label={draftIntentEstimate.type === 'swap' ? 'Total charged' : 'Total'}
+                        value={`${formatEthFixed(draftTotalWei)} ETH`}
+                      />
+                    </div>
+                    {draftIntentEstimate.type === 'swap' ? (
+                      <p className="mt-3 text-[11px] normal-case tracking-normal text-[var(--color-muted)]">
+                        You will receive the output for exactly {draftIntentEstimate.amount} {draftIntentEstimate.fromToken} swapped, plus gas is charged separately.
+                      </p>
+                    ) : null}
+                    {draftIntentEstimate.type === 'swap' && draftIntentEstimate.chain === 'sepolia' ? (
+                      <p className="mt-2 text-[11px] normal-case tracking-normal text-[var(--color-warning)]">
+                        Demo supports ETH -&gt; USDC and ETH -&gt; DAI on Sepolia. Token -&gt; ETH routes are intentionally blocked for now.
+                      </p>
+                    ) : null}
+                  </>
+                ) : (
+                  <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
+                    Enter an ETH send or ETH -&gt; token swap intent to calculate the minimum wallet funding requirement.
+                  </p>
+                )}
+              </div>
             </div>
-            <button
-              type="button"
-              onClick={disconnectWallet}
-              className="console-text-button"
-            >
-              <LogOut size={14} />
-              Disconnect
-            </button>
+
+            <div className="space-y-4 lg:sticky lg:top-0 lg:self-start">
+              <div className="console-subpanel">
+                <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+                  Session chain
+                </p>
+                <div className="mt-3 flex gap-2">
+                  {(['sepolia', 'mainnet'] as const).map((chain) => (
+                    <button
+                      key={chain}
+                      type="button"
+                      onClick={() => onSessionChainChange(chain)}
+                      className={`border px-3 py-2 text-[10px] uppercase tracking-[0.18em] ${
+                        sessionChain === chain
+                          ? 'border-[var(--color-accent)] bg-[var(--color-accent)] text-black'
+                          : 'border-[var(--color-border)] text-[var(--color-muted)]'
+                      }`}
+                    >
+                      {chain === 'mainnet' ? 'Mainnet' : 'Sepolia'}
+                    </button>
+                  ))}
+                </div>
+                {sessionChain === 'mainnet' ? (
+                  <p className="mt-3 text-[11px] normal-case tracking-normal text-[var(--color-warning)]">
+                    Authorizing on mainnet. Real ETH required for gas.
+                  </p>
+                ) : null}
+              </div>
+
+              <div className="console-subpanel">
+                <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+                  Authorization settings
+                </p>
+                <div className="mt-3 grid gap-3 sm:grid-cols-3 lg:grid-cols-1">
+                  <label className="space-y-1 text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
+                    <span>Per-tx limit</span>
+                    <input
+                      value={maxFeePerTxEth}
+                      onChange={(event) => setMaxFeePerTxEth(event.target.value)}
+                      className="console-input w-full"
+                      inputMode="decimal"
+                    />
+                  </label>
+                  <label className="space-y-1 text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
+                    <span>Budget</span>
+                    <input
+                      value={maxTotalSpendEth}
+                      onChange={(event) => setMaxTotalSpendEth(event.target.value)}
+                      className="console-input w-full"
+                      inputMode="decimal"
+                    />
+                  </label>
+                  <label className="space-y-1 text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
+                    <span>Expiry hours</span>
+                    <input
+                      value={expiryHours}
+                      onChange={(event) => setExpiryHours(event.target.value)}
+                      className="console-input w-full"
+                      inputMode="numeric"
+                    />
+                  </label>
+                </div>
+              </div>
+
+              <div className="border border-[var(--color-border)] p-3">
+                <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
+                  External wallet mode
+                </p>
+                <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
+                  This panel reads the connected wallet directly from the selected session contract. Deposit and session values should match the Deposit & Session panel.
+                </p>
+                <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
+                  Platform fee: {(onChainFeeBps / 100).toFixed(1)}% (enforced on-chain)
+                </p>
+                <p className="mt-2 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
+                  Treasury: {typeof treasuryData === 'string' ? truncateAddress(treasuryData) : 'Loading...'}
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                {!displayedSessionStatus?.active ? (
+                  <button
+                    type="button"
+                    onClick={authorizeExternalWalletSession}
+                    disabled={activeAction !== null || !sessionContractForChain}
+                    className="console-button console-button-primary w-full"
+                  >
+                    <ShieldCheck size={15} />
+                    {activeAction === 'authorize' ? 'Authorizing...' : 'Authorize Session'}
+                  </button>
+                ) : null}
+                <div className="console-alert border-[var(--color-border)] text-[var(--color-muted)]">
+                  <span className="console-alert-label">External Wallet</span>
+                  <p>
+                    Authorize from this panel when the session is expired, then top up or revoke from the Deposit &amp; Session panel on the dashboard.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={disconnectWallet}
+                  className="console-text-button"
+                >
+                  <LogOut size={14} />
+                  Disconnect
+                </button>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -2102,7 +2205,7 @@ function CommandCenter({
   const canCancel = isCancellableIntentStatus(intent.status);
 
   return (
-    <ConsolePanel title="Command Center" eyebrow="Execution State" className="min-h-0">
+    <ConsolePanel title="Command Center" eyebrow="Execution State" className="min-h-0 xl:h-full">
       <div className="flex h-full min-h-0 flex-col gap-4">
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -2198,8 +2301,8 @@ function CommandCenter({
 
 function AuditTrail({ intent }: { intent: IntentRecord }) {
   return (
-    <ConsolePanel title="Audit Trail" eyebrow="Live Terminal" className="min-h-0">
-      <div className="console-scroll h-full min-h-[560px] space-y-4 pr-1">
+    <ConsolePanel title="Audit Trail" eyebrow="Live Terminal" className="min-h-0 xl:h-full">
+      <div className="console-scroll h-full min-h-0 space-y-4 pr-1">
         {intent.audit.map((event, index) => (
           <div key={event.id} className={`terminal-line ${auditToneClass(event.type)}`} style={{ animationDelay: `${Math.min(index, 8) * 40}ms` }}>
             <div className="terminal-meta">
@@ -2216,8 +2319,8 @@ function AuditTrail({ intent }: { intent: IntentRecord }) {
 
 function CommandCenterEmpty() {
   return (
-    <ConsolePanel title="Command Center" eyebrow="Execution State" className="min-h-0">
-      <div className="flex h-full min-h-[640px] items-center justify-center px-6 py-12 text-center">
+    <ConsolePanel title="Command Center" eyebrow="Execution State" className="min-h-0 xl:h-full">
+      <div className="flex h-full min-h-0 items-center justify-center px-6 py-12 text-center">
         <div className="space-y-3">
           <div className="text-4xl text-[var(--color-accent)]">⚡</div>
           <h2 className="text-lg font-medium uppercase tracking-[0.18em] text-[var(--color-text)]">
@@ -2234,8 +2337,8 @@ function CommandCenterEmpty() {
 
 function AuditTrailEmpty() {
   return (
-    <ConsolePanel title="Audit Trail" eyebrow="Live Terminal" className="min-h-0">
-      <div className="flex h-full min-h-[640px] items-center justify-center px-6 py-12 text-center">
+    <ConsolePanel title="Audit Trail" eyebrow="Live Terminal" className="min-h-0 xl:h-full">
+      <div className="flex h-full min-h-0 items-center justify-center px-6 py-12 text-center">
         <div className="space-y-3">
           <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
             No events yet
@@ -2282,7 +2385,7 @@ function RecentCommandsPanel({
       }
       className="min-h-0 h-full"
     >
-      <div className="console-scroll grid h-full min-h-0 content-start gap-2 pr-1 xl:grid-cols-3">
+      <div className="console-scroll grid h-full min-h-0 content-start gap-2 pr-1 xl:auto-rows-max xl:grid-cols-3">
         {isLoading ? (
           <p className="text-xs uppercase tracking-[0.14em] text-[var(--color-muted)]">
             Loading intents...
@@ -2347,7 +2450,7 @@ function ConsolePanel({
   className?: string;
 }) {
   return (
-    <section className={`console-panel ${className}`}>
+    <section className={`console-panel flex h-full min-h-0 flex-col ${className}`}>
       <div className="mb-4 flex items-start justify-between gap-3 border-b border-[var(--color-border)] pb-3">
         <div>
           {eyebrow ? (
@@ -2359,7 +2462,9 @@ function ConsolePanel({
         </div>
         {action}
       </div>
-      {children}
+      <div className="min-h-0 flex-1">
+        {children}
+      </div>
     </section>
   );
 }
@@ -2379,6 +2484,32 @@ function InfoRow({
       <span className="bg-[var(--color-surface)] px-3 py-2 text-right text-xs capitalize tracking-[0.12em] text-[var(--color-text)]">
         {value}
       </span>
+    </div>
+  );
+}
+
+function MetricCard({
+  label,
+  value,
+  tone = 'default',
+}: {
+  label: string;
+  value: React.ReactNode;
+  tone?: 'default' | 'positive' | 'negative' | 'neutral';
+}) {
+  const toneClassName =
+    tone === 'positive'
+      ? 'text-emerald-400'
+      : tone === 'negative'
+        ? 'text-red-500'
+        : tone === 'neutral'
+          ? 'text-zinc-400'
+          : 'text-[var(--color-text)]';
+
+  return (
+    <div className="console-subpanel">
+      <span className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-label)]">{label}</span>
+      <p className={`mt-2 text-sm uppercase tracking-[0.1em] ${toneClassName}`}>{value}</p>
     </div>
   );
 }
