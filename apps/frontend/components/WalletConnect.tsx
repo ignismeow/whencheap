@@ -14,6 +14,9 @@ import { UiError, toWalletUiError } from '../lib/ui-errors';
 
 type TxStep = 'idle' | 'checking' | 'signing' | 'confirming' | 'registering';
 type SessionFlowState = 'DISCONNECTED' | 'CHECKING' | 'READY' | 'NEEDS_DEPOSIT' | 'NEEDS_AUTH' | 'WRONG_NETWORK';
+type PendingOutcome =
+  | { kind: 'deposit'; expectedDepositWei: bigint }
+  | { kind: 'authorize' };
 
 type SessionStatusResponse = {
   active: boolean;
@@ -84,6 +87,8 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [sessionStatus, setSessionStatus] = useState<SessionStatusResponse | null>(null);
   const [statusTick, setStatusTick] = useState(0);
+  const [pendingOutcome, setPendingOutcome] = useState<PendingOutcome | null>(null);
+  const [showRefreshHint, setShowRefreshHint] = useState(false);
 
   const hasMetaMask =
     typeof window !== 'undefined' &&
@@ -122,6 +127,16 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
     const timeout = window.setTimeout(() => setSuccessMessage(null), 2500);
     return () => window.clearTimeout(timeout);
   }, [successMessage]);
+
+  useEffect(() => {
+    if (txStep !== 'confirming') {
+      setShowRefreshHint(false);
+      return;
+    }
+
+    const timeout = window.setTimeout(() => setShowRefreshHint(true), 30_000);
+    return () => window.clearTimeout(timeout);
+  }, [txStep]);
 
   useEffect(() => {
     if (!sessionStatus) return;
@@ -211,18 +226,70 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
     setStatusTick((current) => current + 1);
   };
 
-  const waitFor = async (hash: `0x${string}`) => {
-    if (!publicClient) throw new Error('No public client');
-    setTxStep('confirming');
-    const receipt = await publicClient.waitForTransactionReceipt({
-      hash,
-      pollingInterval: 2_000,
-      timeout: 120_000,
-    });
-    if (receipt.status !== 'success') {
-      throw new Error(`Transaction reverted (tx: ${hash})`);
+  const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+  const hasConfirmationTimedOut = (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    return /timeout|timed out|wait for transaction receipt/i.test(message);
+  };
+
+  const verifyPendingOutcome = async (outcome: PendingOutcome) => {
+    if (!address || !publicClient || !sessionContract) return false;
+
+    if (outcome.kind === 'deposit') {
+      const latestDeposit = await publicClient.readContract({
+        address: sessionContract,
+        abi: whenCheapSessionAbi,
+        functionName: 'deposits',
+        args: [address],
+      });
+      return latestDeposit >= outcome.expectedDepositWei;
     }
-    return receipt;
+
+    const latestSession = await publicClient.readContract({
+      address: sessionContract,
+      abi: whenCheapSessionAbi,
+      functionName: 'sessions',
+      args: [address],
+    });
+    return Number(latestSession[3]) * 1000 > Date.now();
+  };
+
+  const resolvePendingOutcome = async (hash: `0x${string}`, outcome: PendingOutcome) => {
+    if (!publicClient) throw new Error('No public client');
+
+    setTxStep('confirming');
+    setPendingOutcome(outcome);
+
+    try {
+      const receipt = await publicClient.waitForTransactionReceipt({
+        hash,
+        pollingInterval: 2_000,
+        timeout: 60_000,
+      });
+      if (receipt.status !== 'success') {
+        throw new Error(`Transaction reverted (tx: ${hash})`);
+      }
+      return;
+    } catch (error) {
+      if (!hasConfirmationTimedOut(error)) {
+        throw error;
+      }
+
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        await sleep(5_000);
+        const resolved = await verifyPendingOutcome(outcome).catch(() => false);
+        if (resolved) {
+          return;
+        }
+      }
+
+      throw new Error(
+        'Confirmation is taking longer than expected. We refreshed the session status, but please check MetaMask or Etherscan if this persists.',
+      );
+    } finally {
+      setPendingOutcome(null);
+    }
   };
 
   const registerSessionMarker = async () => {
@@ -272,7 +339,7 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
         ],
         gas: 100_000n,
       });
-      await waitFor(hash);
+      await resolvePendingOutcome(hash, { kind: 'authorize' });
       await registerSessionMarker();
       await refreshAll();
       setSuccessMessage(sessionMetrics.hasDeposit ? 'Session extended. You are ready to create intents.' : 'Session authorized. Next: deposit ETH.');
@@ -301,15 +368,19 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
     }
 
     try {
+      const amountWei = parseEther(depositAmount);
       setTxStep('signing');
       const hash = await writeContractAsync({
         address: sessionContract,
         abi: whenCheapSessionAbi,
         functionName: 'deposit',
-        value: parseEther(depositAmount),
+        value: amountWei,
         gas: 60_000n,
       });
-      await waitFor(hash);
+      await resolvePendingOutcome(hash, {
+        kind: 'deposit',
+        expectedDepositWei: (depositWei ?? 0n) + amountWei,
+      });
       await refreshAll();
       setSuccessMessage(sessionMetrics.active ? `Deposit received. Balance is now funded.` : 'Deposit received. Next: authorize your session.');
       setDepositAmount('0.01');
@@ -595,6 +666,27 @@ export function WalletConnect({ onAuthorized }: { onAuthorized: (address: string
         <div className="console-alert console-alert-success">
           <span className="console-alert-label">Success</span>
           <p>{successMessage}</p>
+        </div>
+      ) : null}
+
+      {txStep === 'confirming' && pendingOutcome ? (
+        <div className="console-alert">
+          <span className="console-alert-label">Waiting for Confirmation</span>
+          <p>
+            {pendingOutcome.kind === 'deposit'
+              ? 'MetaMask has submitted your deposit. We are waiting for the chain to confirm it.'
+              : 'MetaMask has submitted your authorization. We are waiting for the chain to confirm it.'}
+          </p>
+          {showRefreshHint ? (
+            <button
+              type="button"
+              onClick={() => void refreshAll()}
+              className="console-text-button"
+              style={{ alignSelf: 'flex-start' }}
+            >
+              Taking too long? Refresh session status
+            </button>
+          ) : null}
         </div>
       ) : null}
 
