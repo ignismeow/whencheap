@@ -10,7 +10,6 @@ import { IntentEntity } from './intent.entity';
 import { IntentsController } from './intents.controller';
 import { IntentsService } from './intents.service';
 import { UserEntity } from '../user/user.entity';
-import { WhenCheapWallet } from '../session/wallet.entity';
 
 @Module({
   imports: [
@@ -20,7 +19,6 @@ import { WhenCheapWallet } from '../session/wallet.entity';
     SessionModule,
     TypeOrmModule.forFeature([
       UserEntity,
-      WhenCheapWallet,
       IntentEntity,
       ExecutionEntity,
       AuditEventEntity,

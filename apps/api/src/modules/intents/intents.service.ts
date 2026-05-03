@@ -10,14 +10,11 @@ import { OllamaIntentParserService } from '../agent/ollama-intent-parser.service
 import { ParsedIntent } from '../agent/parsed-intent.schema';
 import { GasOracleService } from '../gas/gas-oracle.service';
 import { KeeperHubService } from '../keeperhub/keeperhub.service';
-import { WhenCheapWallet } from '../session/wallet.entity';
 import { SessionSignerService } from '../session/session-signer.service';
 import { UserEntity } from '../user/user.entity';
 import { AuditEventEntity } from './audit-event.entity';
 import { CreateIntentDto } from './dto/create-intent.dto';
-import { GoogleAuthDto } from './dto/google-auth.dto';
-import { ManagedSessionDto } from './dto/managed-session.dto';
-import { RegisterWalletDto } from './dto/register-wallet.dto';
+import { AuthorizeWalletSessionDto } from './dto/authorize-wallet-session.dto';
 import { TestEip7702Dto } from './dto/test-eip7702.dto';
 import { ExecutionEntity } from './execution.entity';
 import { IntentEntity } from './intent.entity';
@@ -57,8 +54,6 @@ export class IntentsService implements OnModuleInit {
     private readonly config: ConfigService,
     @InjectRepository(UserEntity)
     private readonly userRepository: Repository<UserEntity>,
-    @InjectRepository(WhenCheapWallet)
-    private readonly walletRepository: Repository<WhenCheapWallet>,
     @InjectRepository(IntentEntity)
     private readonly intentRepository: Repository<IntentEntity>,
     @InjectRepository(ExecutionEntity)
@@ -204,20 +199,8 @@ export class IntentsService implements OnModuleInit {
     await this.sessionSigner.storeAuthorization(userAddress, authorization, chain);
   }
 
-  async registerWallet(dto: RegisterWalletDto) {
-    return await this.sessionSigner.registerWallet(dto);
-  }
-
-  async authenticateWithGoogle(dto: GoogleAuthDto) {
-    return await this.sessionSigner.authenticateWithGoogle(dto);
-  }
-
-  authorizeManagedWalletSession(dto: ManagedSessionDto) {
-    return this.sessionSigner.authorizeManagedWalletSession(dto);
-  }
-
-  revokeManagedWalletSession(userAddress: string, chain = 'sepolia') {
-    return this.sessionSigner.revokeManagedWalletSession(userAddress, chain);
+  authorizeExternalWalletSession(dto: AuthorizeWalletSessionDto) {
+    return this.sessionSigner.authorizeExternalWalletSession(dto);
   }
 
   async list(): Promise<IntentRecord[]> {
@@ -422,21 +405,39 @@ export class IntentsService implements OnModuleInit {
         intent.parsed.type as 'send' | 'swap',
         intent.parsed.chain ?? 'sepolia',
       );
+      const intentAmountWei = parseEther(String(intent.parsed.amount));
       const sessionOk = await this.sessionSigner.canExecuteSession(
         intent.wallet,
         feeWei,
         intent.parsed.chain ?? 'sepolia',
+        intentAmountWei,
       );
       if (!sessionOk) {
+        const sessionDetail = await this.sessionSigner.getSessionDetail(
+          intent.wallet,
+          intent.parsed.chain ?? 'sepolia',
+          feeWei,
+        );
+        const sessionMessage = sessionDetail.depositZero
+          ? 'No ETH deposited in the session contract. Deposit ETH before execution can continue.'
+          : sessionDetail.expired
+            ? 'Session expired. Re-authorize to create a new session.'
+            : sessionDetail.feeTooHigh
+              ? 'Estimated execution fee exceeds the per-transaction session limit. Re-authorize with a higher fee limit.'
+              : sessionDetail.budgetExceeded
+                ? 'Session budget exhausted. Re-authorize with a higher total spend limit.'
+                : 'Session invalid. Please re-authorize.';
+
         await this.addAudit(
           intent,
           'SESSION_INVALID',
-          'Session expired or estimated fee exceeds session limits. User must re-authorize.',
+          sessionMessage,
+          { ...sessionDetail },
         );
         await this.transition(
           intent,
           IntentStatus.NeedsReauthorization,
-          'Session limits exceeded or session expired.',
+          sessionMessage,
         );
         continue;
       }
@@ -457,60 +458,41 @@ export class IntentsService implements OnModuleInit {
         );
       }
 
-      const registeredWallet = await this.sessionSigner.getRegisteredWallet(intent.wallet);
-
-      if (intent.parsed.type === 'swap') {
-        if (!registeredWallet) {
-          await this.addAudit(
-            intent,
-            'NEEDS_AUTHORIZATION',
-            'Swap execution requires a registered managed wallet so WhenCheap can relay the EIP-7702 transaction from the user wallet.',
-          );
-          continue;
-        }
-
-        try {
-          await this.sessionSigner.ensureManagedWalletHasRequiredBalance(
-            intent.wallet,
-            intent.parsed.amount,
-            baseFeeGwei,
-            'swap',
-            intent.parsed.chain ?? 'sepolia',
-            intent.parsed.fromToken ?? 'ETH',
-          );
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          await this.addAudit(intent, 'INSUFFICIENT_BALANCE', message);
-          continue;
-        }
-
-        await this.executeSwap(intent, baseFeeGwei);
-        continue;
-      }
-
       const authorization = await this.sessionSigner.getAuthorization(
         intent.wallet,
         intent.parsed.chain ?? 'sepolia',
       );
 
-      if (registeredWallet) {
-        try {
-          await this.sessionSigner.ensureManagedWalletHasRequiredBalance(
-            intent.wallet,
-            intent.parsed.amount,
-            baseFeeGwei,
-            intent.parsed.type as 'send' | 'swap',
-            intent.parsed.chain ?? 'sepolia',
-            intent.parsed.fromToken ?? 'ETH',
+      if (intent.parsed.type === 'swap') {
+        if (authorization && this.sessionSigner.isOnChainSessionMarker(authorization)) {
+          await this.addAudit(
+            intent,
+            'ON_CHAIN_SESSION_EXECUTION',
+            'Using on-chain session marker to execute swap from the session contract deposit.',
+            { authorization },
           );
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          await this.addAudit(intent, 'INSUFFICIENT_BALANCE', message);
+          await this.executeSessionBacked(intent, baseFeeGwei);
           continue;
         }
 
-        await this.executeWithUserWallet(intent, registeredWallet, authorization, baseFeeGwei);
-      } else if (authorization && this.sessionSigner.isOnChainSessionMarker(authorization)) {
+        if (authorization) {
+          await this.addAudit(
+            intent,
+            'NEEDS_AUTHORIZATION',
+            'Swap execution requires an active on-chain session authorization and deposit. Re-authorize from Session Matrix.',
+          );
+          continue;
+        }
+
+        await this.addAudit(
+          intent,
+          'NEEDS_AUTHORIZATION',
+          'Session authorization required. Connect MetaMask and authorize a session before swap execution can continue.',
+        );
+        continue;
+      }
+
+      if (authorization && this.sessionSigner.isOnChainSessionMarker(authorization)) {
         await this.addAudit(
           intent,
           'ON_CHAIN_SESSION_EXECUTION',
@@ -531,7 +513,7 @@ export class IntentsService implements OnModuleInit {
         await this.addAudit(
           intent,
           'NEEDS_AUTHORIZATION',
-          'No EIP-7702 authorization stored. User must authorize session with EIP-7702 compatible wallet (Rabby, MetaMask Flask).',
+          'No wallet authorization stored. Connect MetaMask and authorize a session before execution can continue.',
         );
       }
     }
@@ -567,61 +549,6 @@ export class IntentsService implements OnModuleInit {
       await this.logKeeperHubExecution(intent);
     } catch (err) {
       await this.handleExecutionFailure(intent, err, 'Direct execution failed');
-    }
-  }
-
-  private async executeSwap(intent: IntentRecord, baseFeeGwei: number) {
-    try {
-      const chain = intent.parsed.chain ?? 'sepolia';
-      const fromToken = intent.parsed.fromToken;
-      const swapAmountWei = this.parseIntentAmountWei(intent.parsed.amount);
-      const feeWei = await this.sessionSigner.getPlatformFeeWei(
-        swapAmountWei,
-        chain,
-      );
-      const netSwapWei = await this.sessionSigner.getNetSwapAmountWei(
-        swapAmountWei,
-        chain,
-      );
-
-      await this.addAudit(
-        intent,
-        'SWAP_EXECUTING',
-        `Executing swap: ${intent.parsed.amount} ${fromToken} -> ${intent.parsed.toToken ?? 'USDC'} ` +
-          `via Uniswap /swap_7702 on ${chain}. ` +
-          `Net routed to swap: ${this.sessionSigner.formatTokenAmount(netSwapWei, fromToken, chain)}. ` +
-          `Platform fee: ${this.sessionSigner.formatTokenAmount(feeWei, fromToken, chain)}.`,
-        {
-          chain,
-          baseFeeGwei,
-          fromToken,
-          toToken: intent.parsed.toToken ?? 'USDC',
-          amount: intent.parsed.amount,
-          uniswapEndpoint: 'swap_7702',
-          eip7702Optimized: true,
-          feeWei: feeWei.toString(),
-          netSwapWei: netSwapWei.toString(),
-          senderModel: 'eip7702-managed-wallet',
-        },
-      );
-
-      const { txHash, uniswapEndpoint } = await this.sessionSigner.executeSwap(intent);
-      intent.txHash = txHash;
-      await this.transition(
-        intent,
-        IntentStatus.Submitted,
-        `Swap broadcast. Hash: ${txHash}`,
-        {
-          txHash,
-          uniswapEndpoint,
-          eip7702Optimized: uniswapEndpoint === 'swap_7702',
-          senderModel: 'eip7702-managed-wallet',
-          userWallet: intent.wallet,
-        },
-      );
-      await this.logKeeperHubExecution(intent);
-    } catch (err) {
-      await this.handleExecutionFailure(intent, err, 'Swap execution failed');
     }
   }
 
@@ -674,81 +601,6 @@ export class IntentsService implements OnModuleInit {
         intent,
         'NEEDS_AUTHORIZATION',
         'EIP-7702 relay failed and agent-funded fallback is disabled. User must re-authorize with EIP-7702 compatible wallet.',
-      );
-    }
-  }
-
-  private async executeWithUserWallet(
-    intent: IntentRecord,
-    encryptedKeyData: string,
-    authorization: unknown,
-    baseFeeGwei: number,
-  ) {
-    try {
-      await this.addAudit(
-        intent,
-        'USER_WALLET_EXECUTION',
-        'Using encrypted WhenCheap wallet to relay a true user-wallet-as-sender EIP-7702 transaction.',
-        { userWallet: intent.wallet, chain: intent.parsed.chain ?? 'sepolia' },
-      );
-      const txHash = await this.sessionSigner.broadcastWithUserWallet(intent, encryptedKeyData);
-      intent.txHash = txHash;
-      await this.transition(
-        intent,
-        IntentStatus.Submitted,
-        `User-wallet EIP-7702 transaction broadcast. Hash: ${txHash}.`,
-        {
-          txHash,
-          senderModel: 'eip7702-user-wallet-relayed',
-          userWallet: intent.wallet,
-          agentWallet: this.sessionSigner.agentAddress,
-        },
-      );
-      await this.logKeeperHubExecution(intent);
-    } catch (err) {
-      this.logger.warn(
-        `User-wallet EIP-7702 execution failed for intent ${intent.id}: ${String(err)}`,
-      );
-      await this.addAudit(
-        intent,
-        'USER_WALLET_EXECUTION_FAILED',
-        `Encrypted-wallet EIP-7702 failed: ${String(err)}.`,
-      );
-
-      if (authorization && this.sessionSigner.isOnChainSessionMarker(authorization)) {
-        await this.addAudit(
-          intent,
-          'USER_WALLET_FALLBACK',
-          'Falling back to on-chain session execution after encrypted-wallet EIP-7702 failure.',
-        );
-        await this.executeSessionBacked(intent, baseFeeGwei);
-        return;
-      }
-
-      if (authorization) {
-        await this.addAudit(
-          intent,
-          'USER_WALLET_FALLBACK',
-          'Falling back to stored EIP-7702 authorization after encrypted-wallet execution failure.',
-        );
-        await this.executeEIP7702(intent, authorization, baseFeeGwei);
-        return;
-      }
-
-      if (this.agentFallbackEnabled) {
-        await this.addAudit(
-          intent,
-          'AGENT_FALLBACK_USED',
-          'Encrypted-wallet EIP-7702 failed. Executing directly from agent wallet because ALLOW_AGENT_FUNDED_FALLBACK=true.',
-        );
-        await this.executeDirectly(intent, baseFeeGwei);
-        return;
-      }
-
-      await this.addAudit(
-        intent,
-        'NEEDS_AUTHORIZATION',
-        'Encrypted-wallet EIP-7702 failed and no alternate execution path is available.',
       );
     }
   }
@@ -1047,9 +899,12 @@ export class IntentsService implements OnModuleInit {
         return 'Gas oracle unavailable. Will retry next cycle.';
       case 'SESSION_CHECK_PASSED':
         return 'Session valid. Proceeding to execution.';
-      case 'SESSION_INVALID':
       case 'NEEDS_AUTHORIZATION':
         return 'Session authorization is required before execution can continue.';
+      case 'SESSION_INVALID':
+        return typeof data.message === 'string' && data.message.length > 0
+          ? data.message
+          : 'Session authorization is required before execution can continue.';
       case 'SWAP_EXECUTING':
         return `Executing swap: ${String(data.amount ?? '')} ${String(data.fromToken ?? '')} -> ${String(data.toToken ?? 'USDC')} via Uniswap.`;
       case 'SWAP_EXECUTED':
@@ -1151,15 +1006,6 @@ export class IntentsService implements OnModuleInit {
   }
 
   private async resolveUserIdByWallet(walletAddress: string): Promise<string | null> {
-    const wallet = await this.walletRepository
-      .createQueryBuilder('wallet')
-      .where('LOWER(wallet.walletAddress) = LOWER(:walletAddress)', { walletAddress })
-      .getOne();
-
-    if (wallet?.userId) {
-      return wallet.userId;
-    }
-
     const user = await this.userRepository.findOne({
       where: { identifier: walletAddress.toLowerCase() },
     });

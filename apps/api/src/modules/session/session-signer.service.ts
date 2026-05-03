@@ -1,13 +1,11 @@
-import { BadGatewayException, BadRequestException, Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import axios, { AxiosError, AxiosResponse } from 'axios';
-import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
 import { ethers } from 'ethers';
 import { Repository } from 'typeorm';
 import {
   Chain,
-  createPublicClient,
   createWalletClient,
   decodeEventLog,
   encodeFunctionData,
@@ -19,22 +17,27 @@ import {
 import { privateKeyToAccount } from 'viem/accounts';
 import { mainnet, sepolia } from 'viem/chains';
 import { IntentRecord } from '../intents/intent.types';
-import { GoogleAuthDto } from '../intents/dto/google-auth.dto';
-import { ManagedSessionDto } from '../intents/dto/managed-session.dto';
-import { RegisterWalletDto } from '../intents/dto/register-wallet.dto';
 import { TestEip7702Dto } from '../intents/dto/test-eip7702.dto';
 import { UserEntity, UserIdentifierType } from '../user/user.entity';
 import { SessionAuthorizationEntity } from './session-auth.entity';
-import { WhenCheapWallet } from './wallet.entity';
 
 const SESSION_ABI = [
+  // Session limits
   'function canExecute(address wallet, uint256 feeWei) view returns (bool)',
+  'function canExecuteWithDeposit(address wallet, uint256 feeWei, uint256 intentAmount) view returns (bool)',
   'function sessions(address wallet) view returns (uint256 maxFeePerTxWei, uint256 maxTotalSpendWei, uint256 spentWei, uint256 expiresAt)',
   'function recordSpend(address wallet, uint256 feeWei)',
   'function authorize(uint256 maxFeePerTxWei, uint256 maxTotalSpendWei, uint256 durationSeconds)',
   'function revokeSession()',
-  'function execute(address to, uint256 value, bytes data)',
-  'function executeSwap(address swapRouter, bytes swapCalldata) payable',
+  // Deposits
+  'function deposit() payable',
+  'function withdraw(uint256 amount)',
+  'function deposits(address wallet) view returns (uint256)',
+  'function remainingDeposit(address wallet) view returns (uint256)',
+  // Execution — V2: wallet is first arg, no msg.value (deducted from deposit)
+  'function execute(address wallet, address to, uint256 value, bytes data)',
+  'function executeSwap(address wallet, address swapRouter, bytes swapCalldata, uint256 amount, address outputToken)',
+  // Fee helpers
   'function agentAddress() view returns (address)',
   'function treasury() view returns (address)',
   'function feeBps() view returns (uint16)',
@@ -57,6 +60,7 @@ const WHEN_CHEAP_SESSION_EXECUTE_ABI = [
     name: 'execute',
     stateMutability: 'nonpayable',
     inputs: [
+      { name: 'wallet', type: 'address' },
       { name: 'to', type: 'address' },
       { name: 'value', type: 'uint256' },
       { name: 'data', type: 'bytes' },
@@ -65,12 +69,8 @@ const WHEN_CHEAP_SESSION_EXECUTE_ABI = [
   },
 ] as const;
 const WHEN_CHEAP_SESSION_EXECUTE_SWAP_ABI = parseAbi([
-  'function executeSwap(address swapRouter, bytes swapCalldata) payable',
+  'function executeSwap(address wallet, address swapRouter, bytes swapCalldata, uint256 amount, address outputToken)',
 ]);
-const ERC20_ABI = [
-  'function balanceOf(address owner) view returns (uint256)',
-];
-
 const GAS_UNITS = { send: 21_000, swap: 150_000 } as const;
 const SEPOLIA_CHAIN_ID = 11155111;
 const UNISWAP_NATIVE_ETH = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
@@ -146,6 +146,17 @@ interface StoredEip7702Authorization {
 interface StoredSessionAuthorizationMarker {
   type: string;
   txHash?: string;
+  externalWallet?: boolean;
+}
+
+interface SessionDetail {
+  expired: boolean;
+  depositZero: boolean;
+  budgetExceeded: boolean;
+  feeTooHigh: boolean;
+  depositEth: string;
+  expiresAt: Date | null;
+  remainingBudgetEth: string;
 }
 
 interface AuthorizationLogPayload {
@@ -155,17 +166,6 @@ interface AuthorizationLogPayload {
   txHash?: string;
   type?: string;
   [key: string]: unknown;
-}
-
-interface EncryptedWalletPayload {
-  iv: string;
-  encryptedKey: string;
-  authTag: string;
-}
-
-interface StoredWalletResult {
-  user: UserEntity;
-  wallet: WhenCheapWallet;
 }
 
 @Injectable()
@@ -186,8 +186,6 @@ export class SessionSignerService implements OnModuleInit {
     private readonly config: ConfigService,
     @InjectRepository(UserEntity)
     private readonly userRepository: Repository<UserEntity>,
-    @InjectRepository(WhenCheapWallet)
-    private readonly walletRepository: Repository<WhenCheapWallet>,
     @InjectRepository(SessionAuthorizationEntity)
     private readonly sessionRepository: Repository<SessionAuthorizationEntity>,
   ) {
@@ -217,14 +215,6 @@ export class SessionSignerService implements OnModuleInit {
     if (!this.sessionContract) {
       this.logger.warn('SESSION_CONTRACT_ADDR not set — session validation skipped');
     }
-    if (!this.hasValidEncryptionKey()) {
-      this.logger.warn(
-        'ENCRYPTION_KEY not set or invalid — WhenCheap wallet registration is unavailable',
-      );
-    }
-    if (!this.config.get<string>('GOOGLE_CLIENT_ID')) {
-      this.logger.warn('GOOGLE_CLIENT_ID not set — Google auth wallet allocation is unavailable');
-    }
     if (!this.agentFallbackEnabled) {
       this.logger.log(
         'Agent-funded fallback is disabled. broadcastIntent() will refuse to broadcast.',
@@ -236,7 +226,6 @@ export class SessionSignerService implements OnModuleInit {
 
   async onModuleInit(): Promise<void> {
     await this.ensureSessionAuthorizationChainSchema();
-    await this.migrateLegacyWalletRows();
   }
 
   get agentAddress(): string | null {
@@ -307,200 +296,45 @@ export class SessionSignerService implements OnModuleInit {
     ) > 0;
   }
 
-  async registerWallet(dto: RegisterWalletDto): Promise<{ ok: true; address: string }> {
-    if (!this.isValidPrivateKey(dto.privateKey)) {
-      throw new BadRequestException(
-        'privateKey must be a 66-character 0x-prefixed hex string',
-      );
-    }
-
-    if (!ethers.isAddress(dto.userAddress)) {
-      throw new BadRequestException('userAddress must be a valid EVM address');
-    }
-
-    const normalizedAddress = dto.userAddress.toLowerCase();
-    const userAccount = privateKeyToAccount(dto.privateKey as `0x${string}`);
-
-    if (userAccount.address.toLowerCase() !== normalizedAddress) {
-      throw new BadRequestException('Private key does not match userAddress');
-    }
-
-    const encrypted = this.encryptPrivateKey(dto.privateKey);
-    await this.storeEncryptedWallet(
-      normalizedAddress,
-      UserIdentifierType.Wallet,
-      encrypted.encryptedKey,
-      encrypted.iv,
-      encrypted.authTag,
-      userAccount.address,
-    );
-    this.logger.log(`Stored encrypted WhenCheap wallet for ${userAccount.address}`);
-
-    return { ok: true, address: userAccount.address };
-  }
-
-  async getRegisteredWallet(userAddress: string): Promise<string | null> {
-    const storedWallet = await this.getWalletByAddress(userAddress);
-    return storedWallet ? this.serializeStoredWallet(storedWallet) : null;
-  }
-
-  async getWalletByIdentifier(identifier: string): Promise<string | null> {
-    const storedWallet = await this.getEncryptedWallet(identifier);
-    return storedWallet ? this.serializeStoredWallet(storedWallet.wallet) : null;
-  }
-
-  async authenticateWithGoogle(dto: GoogleAuthDto) {
-    const googleProfile = await this.verifyGoogleCredential(dto.credential);
-    const existing =
-      (await this.getEncryptedWallet(googleProfile.email.toLowerCase())) ??
-      (await this.getEncryptedWallet(googleProfile.googleSub));
-
-    if (existing) {
-      const payload = this.extractWalletPayload(existing.wallet);
-      await this.storeEncryptedWallet(
-        googleProfile.email.toLowerCase(),
-        UserIdentifierType.Email,
-        payload.encryptedKey,
-        payload.iv,
-        payload.authTag,
-        existing.wallet.walletAddress,
-      );
-
-      return {
-        ok: true as const,
-        created: false,
-        email: googleProfile.email,
-        address: existing.wallet.walletAddress,
-      };
-    }
-
-    const wallet = ethers.Wallet.createRandom();
-    const encrypted = this.encryptPrivateKey(wallet.privateKey);
-    await this.storeEncryptedWallet(
-      googleProfile.email.toLowerCase(),
-      UserIdentifierType.Email,
-      encrypted.encryptedKey,
-      encrypted.iv,
-      encrypted.authTag,
-      wallet.address,
-    );
-    this.logger.log(`Allocated managed wallet ${wallet.address} for ${googleProfile.email}`);
-
-    return {
-      ok: true as const,
-      created: true,
-      email: googleProfile.email,
-      address: wallet.address,
-    };
-  }
-
-  async authorizeManagedWalletSession(dto: ManagedSessionDto): Promise<{ ok: true; txHash: string }> {
+  async authorizeExternalWalletSession(body: {
+    userAddress: string;
+    maxFeePerTxEth: string;
+    maxTotalSpendEth: string;
+    expiryHours: string;
+    chain?: string;
+  }): Promise<{ ok: true }> {
     try {
-      const wallet = await this.requireStoredWallet(dto.userAddress);
-      const chain = dto.chain ?? 'sepolia';
-      const sessionContractAddress = this.requireSessionContractAddress(chain);
-      const rpcUrl = this.requireRpcUrl(chain);
-      const provider = this.getProviderForChain(chain);
-      const chainConfig = this.getChainConfig(chain);
-      const account = privateKeyToAccount(wallet);
-      const balance = await provider.getBalance(account.address);
-
-      if (balance === 0n) {
-        throw new BadRequestException(
-          `Managed wallet ${account.address} has no ${this.isMainnetChain(chain) ? 'mainnet' : 'Sepolia'
-          } ETH. Fund it before authorizing a session.`,
-        );
-      }
-
-      const client = createWalletClient({
-        account,
-        chain: chainConfig.viemChain,
-        transport: http(rpcUrl),
-      });
-
-      const txHash = await client.writeContract({
-        address: sessionContractAddress,
-        abi: SESSION_VIEM_ABI,
-        functionName: 'authorize',
-        args: [
-          parseEther(dto.maxFeePerTxEth),
-          parseEther(dto.maxTotalSpendEth),
-          BigInt(dto.expiryHours) * 3600n,
-        ],
-        chain: chainConfig.viemChain,
-        account,
-      });
-
-      await provider.waitForTransaction(txHash, 1);
-      const normalizedAddress = dto.userAddress.toLowerCase();
+      const chain = body.chain ?? 'sepolia';
+      const normalizedAddress = body.userAddress.toLowerCase();
       const user = await this.resolveOrCreateWalletUser(normalizedAddress);
+
+      // Store on-chain session marker in DB
+      // This allows executeSessionBacked path to be used for execution
       await this.sessionRepository.upsert(
         {
           userId: user.id,
           walletAddress: normalizedAddress,
           chain: this.normalizeChain(chain),
           authorizationJson: JSON.stringify({
-            type: 'managed-wallet-session',
-            txHash,
+            type: 'on-chain-session',
+            externalWallet: true,
           }),
           isActive: true,
-          expiresAt: new Date(Date.now() + Number(dto.expiryHours) * 60 * 60 * 1000),
+          expiresAt: new Date(Date.now() + Number(body.expiryHours) * 60 * 60 * 1000),
         },
         ['walletAddress', 'chain'],
       );
-      return { ok: true, txHash };
+
+      this.logger.log(
+        `Stored on-chain session authorization for external wallet ${normalizedAddress} on ${chain}. ` +
+        `Limits: ${body.maxFeePerTxEth} ETH per tx, ${body.maxTotalSpendEth} ETH total, ` +
+        `${body.expiryHours} hours expiry.`,
+      );
+
+      return { ok: true };
     } catch (error) {
-      if (error instanceof BadRequestException) {
-        throw error;
-      }
-
       const message = error instanceof Error ? error.message : String(error);
-      throw new BadRequestException(`Managed wallet authorization failed: ${message}`);
-    }
-  }
-
-  async revokeManagedWalletSession(
-    userAddress: string,
-    chain = 'sepolia',
-  ): Promise<{ ok: true; txHash: string }> {
-    try {
-      const wallet = await this.requireStoredWallet(userAddress);
-      const sessionContractAddress = this.requireSessionContractAddress(chain);
-      const rpcUrl = this.requireRpcUrl(chain);
-      const provider = this.getProviderForChain(chain);
-      const chainConfig = this.getChainConfig(chain);
-      const account = privateKeyToAccount(wallet);
-      const client = createWalletClient({
-        account,
-        chain: chainConfig.viemChain,
-        transport: http(rpcUrl),
-      });
-
-      const txHash = await client.writeContract({
-        address: sessionContractAddress,
-        abi: SESSION_VIEM_ABI,
-        functionName: 'revokeSession',
-        args: [],
-        chain: chainConfig.viemChain,
-        account,
-      });
-
-      await provider.waitForTransaction(txHash, 1);
-      await this.sessionRepository
-        .createQueryBuilder()
-        .update(SessionAuthorizationEntity)
-        .set({ isActive: false })
-        .where('LOWER(walletAddress) = LOWER(:walletAddress)', { walletAddress: userAddress })
-        .andWhere('chain = :chain', { chain: this.normalizeChain(chain) })
-        .execute();
-      return { ok: true, txHash };
-    } catch (error) {
-      if (error instanceof BadRequestException) {
-        throw error;
-      }
-
-      const message = error instanceof Error ? error.message : String(error);
-      throw new BadRequestException(`Managed wallet revoke failed: ${message}`);
+      throw new BadRequestException(`External wallet session authorization failed: ${message}`);
     }
   }
 
@@ -509,14 +343,94 @@ export class SessionSignerService implements OnModuleInit {
     wallet: string,
     feeWei: bigint,
     chain = 'sepolia',
+    intentAmountWei?: bigint,
   ): Promise<boolean> {
     const sessionContract = this.getSessionContract(chain);
     if (!sessionContract) return true;
     try {
+      const authorization = await this.getAuthorization(wallet, chain);
+      if (this.isOnChainSessionMarker(authorization)) {
+        if (intentAmountWei !== undefined) {
+          return (await sessionContract.canExecuteWithDeposit(wallet, feeWei, intentAmountWei)) as boolean;
+        }
+
+        const [sessionValid, deposit] = await Promise.all([
+          sessionContract.canExecute(wallet, feeWei) as Promise<boolean>,
+          sessionContract.deposits(wallet) as Promise<bigint>,
+        ]);
+
+        if (!sessionValid) {
+          this.logger.warn(`Session invalid for ${wallet} on ${chain}`);
+          return false;
+        }
+
+        if (deposit === 0n) {
+          this.logger.warn(`No deposit found for ${wallet} on ${chain}`);
+          return false;
+        }
+
+        return true;
+      }
+
+      if (intentAmountWei !== undefined) {
+        return (await sessionContract.canExecuteWithDeposit(wallet, feeWei, intentAmountWei)) as boolean;
+      }
       return (await sessionContract.canExecute(wallet, feeWei)) as boolean;
     } catch (err) {
       this.logger.warn(`canExecute check failed for ${wallet} on ${chain}: ${String(err)}`);
       return false;
+    }
+  }
+
+  async getSessionDetail(
+    wallet: string,
+    chain = 'sepolia',
+    feeWei = 0n,
+  ): Promise<SessionDetail> {
+    const sessionContract = this.getSessionContract(chain);
+    if (!sessionContract) {
+      return {
+        expired: false,
+        depositZero: false,
+        budgetExceeded: false,
+        feeTooHigh: false,
+        depositEth: '0',
+        expiresAt: null,
+        remainingBudgetEth: '0',
+      };
+    }
+
+    try {
+      const [session, deposit] = await Promise.all([
+        sessionContract.sessions(wallet) as Promise<readonly [bigint, bigint, bigint, bigint]>,
+        sessionContract.deposits(wallet) as Promise<bigint>,
+      ]);
+
+      const [maxFeePerTxWei, maxTotalSpendWei, spentWei, expiresAt] = session;
+      const now = BigInt(Math.floor(Date.now() / 1000));
+      const remainingBudgetWei =
+        maxTotalSpendWei > spentWei ? maxTotalSpendWei - spentWei : 0n;
+
+      return {
+        expired: expiresAt === 0n || now >= expiresAt,
+        depositZero: deposit === 0n,
+        budgetExceeded: spentWei >= maxTotalSpendWei || remainingBudgetWei < feeWei,
+        feeTooHigh: feeWei > maxFeePerTxWei,
+        depositEth: formatEther(deposit),
+        expiresAt: expiresAt > 0n ? new Date(Number(expiresAt) * 1000) : null,
+        remainingBudgetEth: formatEther(remainingBudgetWei),
+      };
+    } catch (err) {
+      this.logger.warn(`getSessionDetail failed for ${wallet} on ${chain}: ${String(err)}`);
+      return {
+        expired: true,
+        depositZero: true,
+        budgetExceeded: false,
+        feeTooHigh: false,
+        depositEth: '0',
+        expiresAt: null,
+        remainingBudgetEth: '0',
+      };
     }
   }
 
@@ -577,192 +491,91 @@ export class SessionSignerService implements OnModuleInit {
     intent: IntentRecord,
     baseFeeGwei: number,
   ): Promise<string> {
-    return this.broadcastAgentWalletExecution(intent, baseFeeGwei);
-  }
+    const chain = intent.parsed.chain ?? 'sepolia';
+    const chainConfig = this.getChainConfig(chain);
+    const sessionContractAddress = this.requireSessionContractAddress(chain);
+    const agentWallet = this.requireAgentWallet(chainConfig.rpcUrl);
+    const gasPriceWei = BigInt(Math.round(baseFeeGwei * 1.2 * 1e9));
 
-  async broadcastWithUserWallet(
-    intent: IntentRecord,
-    encryptedKeyData: string,
-  ): Promise<string> {
-    const decryptedKey = this.decryptPrivateKey(encryptedKeyData);
-    const userAccount = privateKeyToAccount(decryptedKey);
-    const chainConfig = this.getChainConfig(intent.parsed.chain ?? 'sepolia');
-    const sessionContractAddress = this.requireSessionContractAddress(intent.parsed.chain ?? 'sepolia');
-    const rpcUrl = chainConfig.rpcUrl;
-    const provider = this.getProviderForChain(intent.parsed.chain ?? 'sepolia');
-
-    if (userAccount.address.toLowerCase() !== intent.wallet.toLowerCase()) {
-      throw new Error('Stored wallet does not match intent wallet');
+    // V2 deposit model: ETH comes from deposits[wallet], agent sends no ETH
+    const intentAmountWei = ethers.parseEther(String(intent.parsed.amount));
+    const depositCheck = await this.checkUserDeposit(intent.wallet, String(intent.parsed.amount), chain);
+    if (!depositCheck.sufficient) {
+      throw new Error(
+        `Insufficient deposit. Has: ${depositCheck.have} ETH, needs: ${depositCheck.need} ETH. ` +
+        `User must deposit more ETH into WhenCheapSession contract.`,
+      );
     }
 
-    const userClient = createWalletClient({
-      account: userAccount,
-      chain: chainConfig.viemChain,
-      transport: http(rpcUrl),
-    });
+    const sessionContract = new ethers.Contract(sessionContractAddress, SESSION_ABI, agentWallet);
+    const execution = await this.buildExecutionTransaction(intent, agentWallet.address);
 
-    if (chainConfig.chainId === MAINNET_CHAIN_ID) {
-      await this.ensureAgentWalletBalance(intent, chainConfig);
-    }
-
-    const freshNonce = await provider.getTransactionCount(userAccount.address, 'pending');
-    const signedAuth = await (
-      userClient as unknown as {
-        signAuthorization: (request: {
-          contractAddress: `0x${string}`;
-          nonce: number;
-        }) => Promise<unknown>;
-      }
-    ).signAuthorization({
-      contractAddress: sessionContractAddress,
-      nonce: freshNonce,
-    });
-
-    const agentAccount = privateKeyToAccount(this.requireAgentPrivateKey());
-    const agentClient = createWalletClient({
-      account: agentAccount,
-      chain: chainConfig.viemChain,
-      transport: http(rpcUrl),
-    });
+    let tx: ethers.TransactionResponse;
 
     if (intent.parsed.type === 'swap') {
-      const swapExecution = await this.buildExecutionTransaction(intent, userAccount.address);
-      return await (
-        agentClient as unknown as {
-          sendTransaction: (request: {
-            authorizationList: unknown[];
-            to: `0x${string}`;
-            data: `0x${string}`;
-            value: bigint;
-            gas: bigint;
-          }) => Promise<`0x${string}`>;
-        }
-      ).sendTransaction({
-        authorizationList: [signedAuth],
-        to: swapExecution.to,
-        data: swapExecution.data,
-        value: swapExecution.value,
-        gas: swapExecution.gasLimit ?? 400_000n,
-      });
-    }
-
-    const execution = await this.buildExecutionTransaction(intent, userAccount.address);
-    const fromToken = intent.parsed.fromToken?.toUpperCase() ?? 'ETH';
-    const isNativeETH = fromToken === 'ETH';
-    const outerTxValue =
-      execution.sessionValueWei !== undefined
-        ? execution.sessionValueWei
-        : isNativeETH
-          ? parseEther(String(intent.parsed.amount))
-          : 0n;
-    const executeCalldata = encodeFunctionData({
-      abi: WHEN_CHEAP_SESSION_EXECUTE_ABI,
-      functionName: 'execute',
-      args: [
-        execution.to as `0x${string}`,
-        outerTxValue,
-        execution.data as `0x${string}`,
-      ],
-    });
-
-    return await (
-      agentClient as unknown as {
-        sendTransaction: (request: {
-          authorizationList: unknown[];
-          to: `0x${string}`;
-          data: `0x${string}`;
-          value: bigint;
-          gas: bigint;
-        }) => Promise<`0x${string}`>;
-      }
-    ).sendTransaction({
-      authorizationList: [signedAuth],
-      to: userAccount.address,
-      data: executeCalldata,
-      value: outerTxValue,
-      gas: 200_000n,
-    });
-  }
-
-  async executeSwap(intent: IntentRecord): Promise<{
-    txHash: string;
-    uniswapEndpoint: 'swap_7702' | 'swap';
-  }> {
-    const wallet = await this.getWalletByAddress(intent.wallet);
-    if (!wallet) {
-      throw new Error(
-        `No encrypted wallet found for ${intent.wallet}. User must register a WhenCheap wallet first.`,
+      const swapCall = await this.buildSwapCallParameters(intent);
+      tx = await (sessionContract.executeSwap as (
+        wallet: string,
+        router: string,
+        swapCalldata: string,
+        amount: bigint,
+        outputToken: string,
+        overrides: ethers.Overrides,
+      ) => Promise<ethers.TransactionResponse>)(
+        intent.wallet,
+        swapCall.swapRouter,
+        swapCall.calldata,
+        intentAmountWei,
+        swapCall.outputTokenAddress,
+        { gasLimit: execution.gasLimit ?? 600_000n, gasPrice: gasPriceWei },
+      );
+    } else {
+      tx = await (sessionContract.execute as (
+        wallet: string,
+        to: string,
+        value: bigint,
+        data: string,
+        overrides: ethers.Overrides,
+      ) => Promise<ethers.TransactionResponse>)(
+        intent.wallet,
+        execution.to,
+        intentAmountWei,
+        execution.data,
+        { gasLimit: 150_000n, gasPrice: gasPriceWei },
       );
     }
 
     this.logger.log(
-      `Executing managed-wallet swap for ${intent.wallet}: ` +
-      `${intent.parsed.amount} ${intent.parsed.fromToken} -> ${intent.parsed.toToken ?? 'USDC'} ` +
-      `on ${intent.parsed.chain ?? 'sepolia'}`,
+      `Deposit-backed tx ${tx.hash} via WhenCheapSession.${intent.parsed.type === 'swap' ? 'executeSwap' : 'execute'}(). ` +
+      `Intent: ${intent.id}. Wallet: ${intent.wallet}. Agent: ${agentWallet.address}. ` +
+      `Contract: ${sessionContractAddress}. Amount: ${ethers.formatEther(intentAmountWei)} ETH`,
     );
 
-    const chain = intent.parsed.chain ?? 'sepolia';
-    const chainConfig = this.getChainConfig(chain);
-    const execution = await this.buildExecutionTransaction(intent, intent.wallet);
+    return tx.hash;
+  }
 
-    const userPrivateKey = this.decryptPrivateKey(this.serializeStoredWallet(wallet));
-    const userAccount = privateKeyToAccount(userPrivateKey as `0x${string}`);
-    const userClient = createWalletClient({
-      account: userAccount,
-      chain: chainConfig.viemChain,
-      transport: http(chainConfig.rpcUrl),
-    });
-    const publicClient = createPublicClient({
-      chain: chainConfig.viemChain,
-      transport: http(chainConfig.rpcUrl),
-    });
+  async checkUserDeposit(
+    wallet: string,
+    intentAmount: string,
+    chain = 'sepolia',
+  ): Promise<{ sufficient: boolean; have: string; need: string }> {
+    const contract = this.getSessionContract(chain);
+    if (!contract) {
+      return { sufficient: true, have: '?', need: intentAmount };
+    }
 
-    const nonce = await publicClient.getTransactionCount({
-      address: userAccount.address,
-      blockTag: 'pending',
-    });
-
-    const signedAuth = await (
-      userClient as unknown as {
-        signAuthorization: (request: {
-          contractAddress: `0x${string}`;
-          nonce: number;
-        }) => Promise<unknown>;
-      }
-    ).signAuthorization({
-      contractAddress: chainConfig.sessionContractAddr as `0x${string}`,
-      nonce,
-    });
-
-    const agentAccount = privateKeyToAccount(this.requireAgentPrivateKey());
-    const agentClient = createWalletClient({
-      account: agentAccount,
-      chain: chainConfig.viemChain,
-      transport: http(chainConfig.rpcUrl),
-    });
-
-    const txHash = await (
-      agentClient as unknown as {
-        sendTransaction: (request: {
-          authorizationList: unknown[];
-          to: `0x${string}`;
-          data: `0x${string}`;
-          value: bigint;
-          gas: bigint;
-        }) => Promise<`0x${string}`>;
-      }
-    ).sendTransaction({
-      authorizationList: [signedAuth],
-      to: execution.to,
-      data: execution.data,
-      value: execution.value,
-      gas: execution.gasLimit ?? 600_000n,
-    });
-
-    return {
-      txHash,
-      uniswapEndpoint: execution.uniswapEndpoint ?? 'swap',
-    };
+    try {
+      const depositWei = (await contract.deposits(wallet)) as bigint;
+      const needWei = ethers.parseEther(intentAmount);
+      return {
+        sufficient: depositWei >= needWei,
+        have: ethers.formatEther(depositWei),
+        need: intentAmount,
+      };
+    } catch (err) {
+      this.logger.warn(`deposits() check failed for ${wallet} on ${chain}: ${String(err)}`);
+      return { sufficient: false, have: '0', need: intentAmount };
+    }
   }
 
   private async broadcastAgentWalletExecution(
@@ -770,9 +583,7 @@ export class SessionSignerService implements OnModuleInit {
     baseFeeGwei: number,
   ): Promise<string> {
     const chainConfig = this.getChainConfig(intent.parsed.chain ?? 'sepolia');
-    if (chainConfig.chainId === MAINNET_CHAIN_ID) {
-      await this.ensureAgentWalletBalance(intent, chainConfig);
-    }
+    await this.ensureAgentWalletBalance(intent, chainConfig);
 
     const agentWallet = this.requireAgentWallet(chainConfig.rpcUrl);
     const gasPriceWei = BigInt(Math.round(baseFeeGwei * 1.2 * 1e9));
@@ -835,6 +646,7 @@ export class SessionSignerService implements OnModuleInit {
       abi: WHEN_CHEAP_SESSION_EXECUTE_ABI,
       functionName: 'execute',
       args: [
+        agentAccount.address as `0x${string}`,
         execution.to as `0x${string}`,
         execution.value,
         execution.data as `0x${string}`,
@@ -939,7 +751,7 @@ export class SessionSignerService implements OnModuleInit {
     const executeCalldata = encodeFunctionData({
       abi: WHEN_CHEAP_SESSION_EXECUTE_ABI,
       functionName: 'execute',
-      args: [dto.recipient as `0x${string}`, parseEther(dto.amount), '0x'],
+      args: [userAccount.address as `0x${string}`, dto.recipient as `0x${string}`, parseEther(dto.amount), '0x'],
     });
 
     const hash = await (
@@ -980,63 +792,6 @@ export class SessionSignerService implements OnModuleInit {
     const tx = await writable.recordSpend(wallet, feeWei);
     await tx.wait(1);
     return tx.hash as string;
-  }
-
-  async ensureManagedWalletHasRequiredBalance(
-    userWalletAddress: string,
-    intentAmount: string,
-    baseFeeGwei: number,
-    type: 'send' | 'swap',
-    chain = 'sepolia',
-    fromToken = 'ETH',
-  ): Promise<void> {
-    const wallet = await this.getWalletByAddress(userWalletAddress);
-    if (!wallet) {
-      return;
-    }
-
-    const provider = this.getProviderForChain(chain);
-    const gasBufferWei = this.estimateFeeWei(baseFeeGwei, type, chain);
-    const tokenInfo = this.resolveToken(fromToken, chain);
-    const isNative = tokenInfo.symbol.toUpperCase() === 'ETH';
-
-    if (isNative) {
-      const amountWei = parseEther(intentAmount);
-      const feeWei =
-        type === 'swap'
-          ? await this.getPlatformFeeWei(amountWei, chain)
-          : 0n;
-      const requiredWei = amountWei + feeWei + gasBufferWei;
-      const availableWei = await provider.getBalance(userWalletAddress);
-
-      if (availableWei < requiredWei) {
-        throw new BadRequestException(
-          `Insufficient ETH balance. Required: ${formatEther(requiredWei)} ETH, ` +
-          `Available: ${formatEther(availableWei)} ETH`,
-        );
-      }
-
-      return;
-    }
-
-    const tokenContract = new ethers.Contract(tokenInfo.address, ERC20_ABI, provider);
-    const amountToken = ethers.parseUnits(intentAmount, tokenInfo.decimals);
-    const availableToken = (await tokenContract.balanceOf(userWalletAddress)) as bigint;
-
-    if (availableToken < amountToken) {
-      throw new BadRequestException(
-        `Insufficient ${tokenInfo.symbol} balance. Required: ${intentAmount} ${tokenInfo.symbol}, ` +
-        `Available: ${ethers.formatUnits(availableToken, tokenInfo.decimals)} ${tokenInfo.symbol}`,
-      );
-    }
-
-    const availableEth = await provider.getBalance(userWalletAddress);
-    if (availableEth < gasBufferWei) {
-      throw new BadRequestException(
-        `Insufficient ETH for gas. Required: ${formatEther(gasBufferWei)} ETH, ` +
-        `Available: ${formatEther(availableEth)} ETH`,
-      );
-    }
   }
 
   async getPlatformFeeWei(valueWei: bigint, chain = 'sepolia'): Promise<bigint> {
@@ -1081,85 +836,6 @@ export class SessionSignerService implements OnModuleInit {
     } catch {
       return `${valueWei.toString()} ${tokenSymbol.toUpperCase()}`;
     }
-  }
-
-  async collectSwapPlatformFee(
-    walletAddress: string,
-    swapAmountWei: bigint,
-    chain = 'sepolia',
-  ): Promise<Array<{
-    recipient: string;
-    feeWei: string;
-    txHash: string;
-    feeType: 'agent' | 'treasury';
-  }>> {
-    const wallet = await this.getWalletByAddress(walletAddress);
-    if (!wallet) {
-      throw new Error(`No encrypted wallet found for ${walletAddress}`);
-    }
-
-    const sessionContract = this.getSessionContract(chain);
-    if (!sessionContract) {
-      throw new Error(`Session contract not configured for ${chain}`);
-    }
-
-    const chainConfig = this.getChainConfig(chain);
-    const agentAccount = privateKeyToAccount(this.requireAgentPrivateKey());
-    const agentClient = createWalletClient({
-      account: agentAccount,
-      chain: chainConfig.viemChain,
-      transport: http(chainConfig.rpcUrl),
-    });
-
-    const [agentRecipient, treasuryRecipient, agentFeeWei, treasuryFeeWei] = await Promise.all([
-      sessionContract.agentAddress() as Promise<string>,
-      sessionContract.treasury() as Promise<string>,
-      sessionContract.agentFeeForAmount(swapAmountWei) as Promise<bigint>,
-      sessionContract.treasuryFeeForAmount(swapAmountWei) as Promise<bigint>,
-    ]);
-
-    await new Promise((resolve) => setTimeout(resolve, 4_000));
-
-    const transfers: Array<{
-      recipient: string;
-      feeWei: string;
-      txHash: string;
-      feeType: 'agent' | 'treasury';
-    }> = [];
-
-    if (agentFeeWei > 0n) {
-      const txHash = await agentClient.sendTransaction({
-        to: agentRecipient as `0x${string}`,
-        value: agentFeeWei,
-        gas: 21_000n,
-        chain: chainConfig.viemChain,
-        account: agentAccount,
-      });
-      transfers.push({
-        recipient: agentRecipient,
-        feeWei: agentFeeWei.toString(),
-        txHash,
-        feeType: 'agent',
-      });
-    }
-
-    if (treasuryFeeWei > 0n) {
-      const txHash = await agentClient.sendTransaction({
-        to: treasuryRecipient as `0x${string}`,
-        value: treasuryFeeWei,
-        gas: 21_000n,
-        chain: chainConfig.viemChain,
-        account: agentAccount,
-      });
-      transfers.push({
-        recipient: treasuryRecipient,
-        feeWei: treasuryFeeWei.toString(),
-        txHash,
-        feeType: 'treasury',
-      });
-    }
-
-    return transfers;
   }
 
   decodeFeeCollectionFromReceipt(receipt: ethers.TransactionReceipt): Array<{
@@ -1260,60 +936,6 @@ export class SessionSignerService implements OnModuleInit {
 
   private isValidPrivateKey(pk: string): pk is `0x${string}` {
     return /^0x[0-9a-fA-F]{64}$/.test(pk);
-  }
-
-  private hasValidEncryptionKey(): boolean {
-    const rawKey = this.config.get<string>('ENCRYPTION_KEY') ?? '';
-    return /^[0-9a-fA-F]{64}$/.test(rawKey);
-  }
-
-  private requireEncryptionKey(): Buffer {
-    const rawKey = this.config.get<string>('ENCRYPTION_KEY') ?? '';
-    if (!/^[0-9a-fA-F]{64}$/.test(rawKey)) {
-      throw new Error('ENCRYPTION_KEY must be a 32-byte hex string');
-    }
-    return Buffer.from(rawKey, 'hex');
-  }
-
-  private encryptPrivateKey(privateKey: string): EncryptedWalletPayload {
-    const iv = randomBytes(12);
-    const cipher = createCipheriv('aes-256-gcm', this.requireEncryptionKey(), iv);
-    const encrypted = Buffer.concat([
-      cipher.update(Buffer.from(privateKey, 'utf8')),
-      cipher.final(),
-    ]);
-
-    return {
-      iv: iv.toString('hex'),
-      encryptedKey: encrypted.toString('hex'),
-      authTag: cipher.getAuthTag().toString('hex'),
-    };
-  }
-
-  private decryptPrivateKey(encryptedKeyData: string): `0x${string}` {
-    let payload: EncryptedWalletPayload;
-    try {
-      payload = JSON.parse(encryptedKeyData) as EncryptedWalletPayload;
-    } catch {
-      throw new Error('Stored wallet payload is invalid');
-    }
-
-    if (!payload.iv || !payload.encryptedKey || !payload.authTag) {
-      throw new Error('Stored wallet payload is incomplete');
-    }
-
-    const decipher = createDecipheriv(
-      'aes-256-gcm',
-      this.requireEncryptionKey(),
-      Buffer.from(payload.iv, 'hex'),
-    );
-    decipher.setAuthTag(Buffer.from(payload.authTag, 'hex'));
-    const decrypted = Buffer.concat([
-      decipher.update(Buffer.from(payload.encryptedKey, 'hex')),
-      decipher.final(),
-    ]).toString('utf8');
-
-    return decrypted as `0x${string}`;
   }
 
   private normalizeAuthorizationForLogging(
@@ -1425,8 +1047,50 @@ export class SessionSignerService implements OnModuleInit {
     uniswapEndpoint?: 'swap_7702' | 'swap';
   }> {
     const chain = intent.parsed.chain ?? 'sepolia';
-    const chainConfig = this.getChainConfig(chain);
     const sessionContractAddress = this.requireSessionContractAddress(chain);
+    const { fullAmount, feeWei, netAmount, swapRouter, calldata, outputTokenAddress, endpointUsed, tokenInSymbol } =
+      await this.buildSwapCallParameters(intent);
+
+    const executeSwapCalldata = encodeFunctionData({
+      abi: WHEN_CHEAP_SESSION_EXECUTE_SWAP_ABI,
+      functionName: 'executeSwap',
+      args: [
+        intent.wallet as `0x${string}`,
+        swapRouter as `0x${string}`,
+        calldata as `0x${string}`,
+        fullAmount,
+        outputTokenAddress as `0x${string}`,
+      ],
+    });
+
+    this.logger.log(
+      `Swap via session contract. Router: ${swapRouter}. ` +
+      `Full: ${this.formatTokenAmount(fullAmount, tokenInSymbol, chain)}. ` +
+      `Net: ${this.formatTokenAmount(netAmount, tokenInSymbol, chain)}. ` +
+      `Fee: ${this.formatTokenAmount(feeWei, tokenInSymbol, chain)}. Contract: ${sessionContractAddress}`,
+    );
+
+    return {
+      to: sessionContractAddress,
+      data: executeSwapCalldata,
+      value: fullAmount,
+      gasLimit: 600_000n,
+      uniswapEndpoint: endpointUsed,
+    };
+  }
+
+  private async buildSwapCallParameters(intent: IntentRecord): Promise<{
+    fullAmount: bigint;
+    feeWei: bigint;
+    netAmount: bigint;
+    swapRouter: `0x${string}`;
+    calldata: `0x${string}`;
+    outputTokenAddress: `0x${string}`;
+    endpointUsed: 'swap_7702' | 'swap';
+    tokenInSymbol: string;
+  }> {
+    const chain = intent.parsed.chain ?? 'sepolia';
+    const chainConfig = this.getChainConfig(chain);
     const tokenIn = this.resolveToken(intent.parsed.fromToken, chain);
     const tokenOut = this.resolveToken(intent.parsed.toToken ?? 'USDC', chain);
 
@@ -1453,25 +1117,15 @@ export class SessionSignerService implements OnModuleInit {
       intent.parsed.slippageBps ?? 50,
     );
 
-    const executeSwapCalldata = encodeFunctionData({
-      abi: WHEN_CHEAP_SESSION_EXECUTE_SWAP_ABI,
-      functionName: 'executeSwap',
-      args: [swapRouter as `0x${string}`, calldata as `0x${string}`],
-    });
-
-    this.logger.log(
-      `Swap via session contract. Router: ${swapRouter}. ` +
-      `Full: ${this.formatTokenAmount(fullAmount, tokenIn.symbol, chain)}. ` +
-      `Net: ${this.formatTokenAmount(netAmount, tokenIn.symbol, chain)}. ` +
-      `Fee: ${this.formatTokenAmount(feeWei, tokenIn.symbol, chain)}. Contract: ${sessionContractAddress}`,
-    );
-
     return {
-      to: sessionContractAddress,
-      data: executeSwapCalldata,
-      value: fullAmount,
-      gasLimit: 600_000n,
-      uniswapEndpoint: endpointUsed,
+      fullAmount,
+      feeWei,
+      netAmount,
+      swapRouter: swapRouter as `0x${string}`,
+      calldata: calldata as `0x${string}`,
+      outputTokenAddress: tokenOut.address as `0x${string}`,
+      endpointUsed,
+      tokenInSymbol: tokenIn.symbol,
     };
   }
 
@@ -1624,6 +1278,39 @@ export class SessionSignerService implements OnModuleInit {
       throw new Error('Uniswap API returned empty transaction data');
     }
 
+    this.logger.warn(
+      `[UNISWAP DEBUG] Quote request swapper: ${recipient}\n` +
+      `Swap response calldata length: ${swap.data.length}\n` +
+      `Swap response to: ${swap.to ?? SWAP_ROUTER_02_ADDRESS}\n` +
+      `Full swap response: ${JSON.stringify(swap, null, 2)}`,
+    );
+
+    try {
+      const universalRouter = new ethers.Interface([
+        'function execute(bytes commands, bytes[] inputs) payable',
+        'function execute(bytes commands, bytes[] inputs, uint256 deadline) payable',
+      ]);
+      const decoded = universalRouter.parseTransaction({ data: swap.data });
+      this.logger.warn(
+        `[UNISWAP DECODE] Function: ${decoded?.name ?? 'unknown'}\n` +
+        `Args: ${JSON.stringify(
+          decoded
+            ? decoded.args.toArray().map((arg) =>
+                typeof arg === 'bigint'
+                  ? arg.toString()
+                  : Array.isArray(arg)
+                    ? arg.map((item) => (typeof item === 'bigint' ? item.toString() : item))
+                    : arg,
+              )
+            : [],
+          null,
+          2,
+        )}`,
+      );
+    } catch (err) {
+      this.logger.warn(`[UNISWAP DECODE] Failed to decode: ${String(err)}`);
+    }
+
     this.logger.log(`Uniswap API swap tx built. to=${swap.to} value=${swap.value ?? '0'}`);
 
     return {
@@ -1700,32 +1387,25 @@ export class SessionSignerService implements OnModuleInit {
     intent: IntentRecord,
     chainConfig: { chainId: number; rpcUrl: string },
   ): Promise<void> {
-    if (chainConfig.chainId !== MAINNET_CHAIN_ID || !this.agentWallet) {
-      return;
-    }
+    if (!this.agentWallet) return;
 
-    const mainnetProvider = new ethers.JsonRpcProvider(chainConfig.rpcUrl);
-    const balance = await mainnetProvider.getBalance(this.agentWallet.address);
+    const provider = new ethers.JsonRpcProvider(chainConfig.rpcUrl);
+    const balance = await provider.getBalance(this.agentWallet.address);
+    const gasBuffer = ethers.parseEther('0.005');
     const required =
       intent.parsed.type === 'send'
-        ? ethers.parseEther(intent.parsed.amount) + ethers.parseEther('0.005')
-        : ethers.parseEther('0.005');
+        ? ethers.parseEther(intent.parsed.amount) + gasBuffer
+        : gasBuffer;
 
     if (balance < required) {
+      const network = chainConfig.chainId === MAINNET_CHAIN_ID ? 'mainnet' : 'Sepolia testnet';
       throw new Error(
-        `Insufficient mainnet ETH in agent wallet (${this.agentWallet.address}). ` +
-        `Have: ${ethers.formatEther(balance)} ETH. ` +
-        `Need: ${ethers.formatEther(required)} ETH.`,
+        `Insufficient ${network} ETH in agent wallet (${this.agentWallet.address}). ` +
+        `Have: ${ethers.formatEther(balance)} ETH, ` +
+        `need: ${ethers.formatEther(required)} ETH. ` +
+        `Fund the agent wallet to execute this intent.`,
       );
     }
-  }
-
-  private sanitizePermitTypes(
-    types: Record<string, Array<{ name: string; type: string }>>,
-  ): Record<string, Array<{ name: string; type: string }>> {
-    const next = { ...types };
-    delete next.EIP712Domain;
-    return next;
   }
 
   private async logAgentWalletEnsName(): Promise<void> {
@@ -1757,82 +1437,7 @@ export class SessionSignerService implements OnModuleInit {
     `);
   }
 
-  private async storeEncryptedWallet(
-    identifier: string,
-    identifierType: UserIdentifierType,
-    encryptedPrivateKey: string,
-    iv: string,
-    authTag: string,
-    walletAddress: string,
-  ): Promise<void> {
-    const normalizedIdentifier =
-      identifierType === UserIdentifierType.Wallet ? identifier.toLowerCase() : identifier;
-    let user = await this.userRepository.findOne({
-      where: { identifier: normalizedIdentifier },
-    });
-
-    if (!user) {
-      user = this.userRepository.create({
-        identifier: normalizedIdentifier,
-        identifierType,
-      });
-      user = await this.userRepository.save(user);
-    }
-
-    const checksumWallet = ethers.getAddress(walletAddress);
-    const existingWallet =
-      (await this.walletRepository.findOne({ where: { userId: user.id } })) ??
-      (await this.getWalletByAddress(checksumWallet));
-
-    const walletRecord = this.walletRepository.create({
-      id: existingWallet?.id,
-      userId: user.id,
-      walletAddress: checksumWallet.toLowerCase(),
-      encryptedPrivateKey,
-      iv,
-      authTag,
-      createdAt: existingWallet?.createdAt,
-    });
-
-    await this.walletRepository.save(walletRecord);
-  }
-
-  private async getEncryptedWallet(identifier: string): Promise<StoredWalletResult | null> {
-    const user = await this.userRepository.findOne({
-      where: { identifier },
-    });
-
-    if (!user) {
-      return null;
-    }
-
-    const wallet =
-      (await this.walletRepository.findOne({ where: { userId: user.id } })) ??
-      null;
-
-    return wallet ? { user, wallet } : null;
-  }
-
-  async getWalletByAddress(walletAddress: string): Promise<WhenCheapWallet | null> {
-    return await this.walletRepository
-      .createQueryBuilder('wallet')
-      .where('LOWER(wallet.walletAddress) = LOWER(:walletAddress)', { walletAddress })
-      .getOne();
-  }
-
-  private serializeStoredWallet(wallet: WhenCheapWallet): string {
-    return JSON.stringify(this.extractWalletPayload(wallet));
-  }
-
   private async resolveOrCreateWalletUser(walletAddress: string): Promise<UserEntity> {
-    const existingWallet = await this.getWalletByAddress(walletAddress);
-    if (existingWallet?.userId) {
-      const user = await this.userRepository.findOne({ where: { id: existingWallet.userId } });
-      if (user) {
-        return user;
-      }
-    }
-
     let user = await this.userRepository.findOne({
       where: { identifier: walletAddress.toLowerCase() },
     });
@@ -1846,178 +1451,5 @@ export class SessionSignerService implements OnModuleInit {
     }
 
     return user;
-  }
-
-  private async migrateLegacyWalletRows(): Promise<void> {
-    type LegacyWalletRow = {
-      id: string;
-      userId: string | null;
-      walletAddress: string;
-      encryptedPrivateKey: string;
-      iv: string | null;
-      authTag: string | null;
-      userIdentifier?: string | null;
-    };
-
-    const hasUserIdentifierColumn = await this.walletTableHasColumn('userIdentifier');
-    const legacyRows = (await this.walletRepository.query(
-      hasUserIdentifierColumn
-        ? 'SELECT id, "userId", "walletAddress", "encryptedPrivateKey", iv, "authTag", "userIdentifier" FROM whencheap_wallets'
-        : 'SELECT id, "userId", "walletAddress", "encryptedPrivateKey", iv, "authTag" FROM whencheap_wallets',
-    )) as LegacyWalletRow[];
-
-    let migrated = 0;
-    for (const row of legacyRows) {
-      const needsMigration = !row.userId || !row.iv || !row.authTag;
-      if (!needsMigration) {
-        continue;
-      }
-
-      const identifier = row.userIdentifier?.trim() || row.walletAddress.toLowerCase();
-      const identifierType = this.inferIdentifierType(identifier);
-      let user =
-        (await this.userRepository.findOne({ where: { identifier } })) ??
-        this.userRepository.create({ identifier, identifierType });
-
-      if (!user.id) {
-        user = await this.userRepository.save(user);
-      }
-
-      let encryptedKey = row.encryptedPrivateKey;
-      let iv = row.iv;
-      let authTag = row.authTag;
-
-      if (!iv || !authTag) {
-        const payload = JSON.parse(row.encryptedPrivateKey) as EncryptedWalletPayload;
-        encryptedKey = payload.encryptedKey;
-        iv = payload.iv;
-        authTag = payload.authTag;
-      }
-
-      await this.walletRepository.update(row.id, {
-        userId: user.id,
-        walletAddress: row.walletAddress.toLowerCase(),
-        encryptedPrivateKey: encryptedKey,
-        iv,
-        authTag,
-      });
-      migrated += 1;
-    }
-
-    if (migrated > 0) {
-      this.logger.log(`Migrated ${migrated} legacy wallet row(s) to the new PostgreSQL schema.`);
-    }
-  }
-
-  private async walletTableHasColumn(columnName: string): Promise<boolean> {
-    const rows = (await this.walletRepository.query(
-      `SELECT 1
-         FROM information_schema.columns
-        WHERE table_name = 'whencheap_wallets'
-          AND column_name = $1
-        LIMIT 1`,
-      [columnName],
-    )) as Array<Record<string, unknown>>;
-
-    return rows.length > 0;
-  }
-
-  private inferIdentifierType(identifier: string): UserIdentifierType {
-    if (identifier.includes('@')) {
-      return UserIdentifierType.Email;
-    }
-    if (ethers.isAddress(identifier)) {
-      return UserIdentifierType.Wallet;
-    }
-    return UserIdentifierType.Google;
-  }
-
-  private extractWalletPayload(wallet: WhenCheapWallet): EncryptedWalletPayload {
-    if (wallet.iv && wallet.authTag) {
-      return {
-        iv: wallet.iv,
-        encryptedKey: wallet.encryptedPrivateKey,
-        authTag: wallet.authTag,
-      };
-    }
-
-    try {
-      return JSON.parse(wallet.encryptedPrivateKey) as EncryptedWalletPayload;
-    } catch {
-      throw new Error(
-        `Wallet ${wallet.id} is missing IV/authTag and legacy payload could not be parsed`,
-      );
-    }
-  }
-
-  private async verifyGoogleCredential(
-    credential: string,
-  ): Promise<{ email: string; googleSub: string }> {
-    const clientId = this.config.get<string>('GOOGLE_CLIENT_ID') ?? '';
-    if (!clientId) {
-      throw new Error('GOOGLE_CLIENT_ID is not configured');
-    }
-
-    let response: AxiosResponse<Record<string, unknown>>;
-    try {
-      response = await axios.get('https://oauth2.googleapis.com/tokeninfo', {
-        family: 4,
-        params: { id_token: credential },
-        timeout: 15_000,
-      });
-    } catch (error) {
-      if (axios.isAxiosError(error)) {
-        const upstreamStatus = error.response?.status;
-        const upstreamBody =
-          typeof error.response?.data === 'string'
-            ? error.response.data
-            : JSON.stringify(error.response?.data ?? {});
-
-        this.logger.error(
-          `Google credential verification failed: ${error.message}${upstreamStatus ? ` (status ${upstreamStatus})` : ''
-          }${upstreamBody && upstreamBody !== '{}' ? ` body=${upstreamBody}` : ''}`,
-        );
-
-        if (upstreamStatus && upstreamStatus >= 400 && upstreamStatus < 500) {
-          throw new BadRequestException('Invalid Google credential');
-        }
-
-        throw new BadGatewayException('Google verification service is unreachable');
-      }
-
-      this.logger.error(`Google credential verification failed with non-Axios error: ${String(error)}`);
-      throw new BadGatewayException('Google verification service is unreachable');
-    }
-
-    const payload = response.data as Record<string, unknown>;
-    const audience = typeof payload.aud === 'string' ? payload.aud : '';
-    const email = typeof payload.email === 'string' ? payload.email : '';
-    const emailVerified = String(payload.email_verified ?? '').toLowerCase() === 'true';
-    const googleSub = typeof payload.sub === 'string' ? payload.sub : '';
-
-    if (audience !== clientId) {
-      throw new BadRequestException('Google token audience mismatch');
-    }
-    if (!email || !googleSub || !emailVerified) {
-      throw new BadRequestException('Google account is not verified');
-    }
-
-    return { email, googleSub };
-  }
-
-  private async requireStoredWallet(userAddress: string): Promise<`0x${string}`> {
-    const encrypted = await this.getRegisteredWallet(userAddress);
-    if (!encrypted) {
-      throw new BadRequestException(
-        `No managed wallet is stored for ${userAddress}. Sign in with Google again to re-link your wallet.`,
-      );
-    }
-
-    const decrypted = this.decryptPrivateKey(encrypted);
-    if (!this.isValidPrivateKey(decrypted)) {
-      throw new BadRequestException('Stored managed wallet key is invalid');
-    }
-
-    return decrypted;
   }
 }

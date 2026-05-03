@@ -1,6 +1,6 @@
 import { IsEthereumAddress, IsIn, IsNotEmpty, IsOptional, IsString, Matches } from 'class-validator';
 
-export class ManagedSessionDto {
+export class AuthorizeWalletSessionDto {
   @IsEthereumAddress()
   userAddress!: string;
 

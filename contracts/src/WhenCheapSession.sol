@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 
@@ -23,7 +24,8 @@ contract WhenCheapSession is ReentrancyGuard, Pausable {
     uint16 public immutable feeBps;
     uint16 public immutable agentFeeSplit;
 
-    mapping(address wallet => SessionPermission) public sessions;
+    mapping(address => SessionPermission) public sessions;
+    mapping(address => uint256) public deposits;
 
     event SessionAuthorized(
         address indexed wallet,
@@ -31,29 +33,36 @@ contract WhenCheapSession is ReentrancyGuard, Pausable {
         uint256 maxTotalSpendWei,
         uint256 expiresAt
     );
-    event SessionRevoked(address indexed wallet);
+    event SessionRevoked(address indexed wallet, uint256 refundAmount);
+    event Deposited(address indexed wallet, uint256 amount);
+    event Withdrawn(address indexed wallet, uint256 amount);
     event Executed(address indexed wallet, address indexed to, uint256 value, bytes data);
     event BatchExecuted(address indexed wallet, uint256 callCount);
     event SpendRecorded(address indexed wallet, uint256 feeWei, uint256 totalSpentWei);
     event FeeCollected(address indexed recipient, uint256 feeWei, uint256 totalValue, string feeType);
     event FeeCollectionFailed(address indexed recipient, uint256 feeWei);
+    event EmergencyWithdrawn(address indexed to, uint256 amount);
+    event TokensForwarded(address indexed token, address indexed to, uint256 amount);
+    event TokensRescued(address indexed token, address indexed to, uint256 amount);
 
     error OnlyAgent();
     error SessionExpired();
     error FeeLimitExceeded();
     error BudgetExceeded();
     error ExecutionFailed(uint256 callIndex);
-    error InsufficientValue();
+    error InsufficientDeposit(uint256 have, uint256 need);
     error ZeroAddress();
     error InvalidDuration();
     error InvalidFee();
+    error WithdrawFailed();
+    error SessionNotExpired();
 
-    constructor(
-        address _agentAddress,
-        address _treasury,
-        uint16 _feeBps,
-        uint16 _agentFeeSplit
-    ) {
+    modifier onlyAgent() {
+        if (msg.sender != agentAddress) revert OnlyAgent();
+        _;
+    }
+
+    constructor(address _agentAddress, address _treasury, uint16 _feeBps, uint16 _agentFeeSplit) {
         if (_agentAddress == address(0)) revert ZeroAddress();
         if (_treasury == address(0)) revert ZeroAddress();
         if (_feeBps > 1000) revert InvalidFee();
@@ -65,6 +74,24 @@ contract WhenCheapSession is ReentrancyGuard, Pausable {
         agentFeeSplit = _agentFeeSplit;
     }
 
+    // ── Deposits ──────────────────────────────────────────────────────────────
+
+    function deposit() external payable {
+        require(msg.value > 0, "zero deposit");
+        deposits[msg.sender] += msg.value;
+        emit Deposited(msg.sender, msg.value);
+    }
+
+    function withdraw(uint256 amount) external nonReentrant {
+        require(deposits[msg.sender] >= amount, "insufficient deposit");
+        deposits[msg.sender] -= amount;
+        (bool ok,) = msg.sender.call{value: amount}("");
+        if (!ok) revert WithdrawFailed();
+        emit Withdrawn(msg.sender, amount);
+    }
+
+    // ── Session management ────────────────────────────────────────────────────
+
     function authorize(
         uint256 maxFeePerTxWei,
         uint256 maxTotalSpendWei,
@@ -74,7 +101,6 @@ contract WhenCheapSession is ReentrancyGuard, Pausable {
         if (maxFeePerTxWei > maxTotalSpendWei) revert FeeLimitExceeded();
 
         uint256 expiresAt = block.timestamp + durationSeconds;
-
         sessions[msg.sender] = SessionPermission({
             maxFeePerTxWei: maxFeePerTxWei,
             maxTotalSpendWei: maxTotalSpendWei,
@@ -85,69 +111,94 @@ contract WhenCheapSession is ReentrancyGuard, Pausable {
         emit SessionAuthorized(msg.sender, maxFeePerTxWei, maxTotalSpendWei, expiresAt);
     }
 
-    function revokeSession() external {
+    function revokeSession() external nonReentrant {
+        uint256 refund = deposits[msg.sender];
         delete sessions[msg.sender];
-        emit SessionRevoked(msg.sender);
+
+        if (refund > 0) {
+            deposits[msg.sender] = 0;
+            (bool ok,) = msg.sender.call{value: refund}("");
+            if (!ok) revert WithdrawFailed();
+            emit Withdrawn(msg.sender, refund);
+        }
+
+        emit SessionRevoked(msg.sender, refund);
     }
 
-    function canExecute(address wallet, uint256 feeWei) public view returns (bool) {
-        SessionPermission storage s = sessions[wallet];
-        return block.timestamp < s.expiresAt
-            && feeWei <= s.maxFeePerTxWei
-            && s.spentWei + feeWei <= s.maxTotalSpendWei;
+    // ── Agent execution ───────────────────────────────────────────────────────
+
+    function execute(
+        address wallet,
+        address to,
+        uint256 value,
+        bytes calldata data
+    ) external nonReentrant whenNotPaused onlyAgent {
+        uint256 bal = deposits[wallet];
+        if (bal < value) revert InsufficientDeposit(bal, value);
+
+        deposits[wallet] -= value;
+
+        (,, uint256 net) = _collectFees(value);
+
+        (bool ok,) = to.call{value: net}(data);
+        if (!ok) revert ExecutionFailed(0);
+
+        emit Executed(wallet, to, net, data);
     }
 
-    function execute(address to, uint256 value, bytes calldata data) external payable nonReentrant whenNotPaused {
-        if (msg.sender != agentAddress) revert OnlyAgent();
-        if (msg.value < value) revert InsufficientValue();
-
-        (, , uint256 net) = _collectFees(value);
-
-        (bool success,) = to.call{value: net}(data);
-        if (!success) revert ExecutionFailed(0);
-
-        emit Executed(address(this), to, net, data);
-    }
-
-    function executeBatch(Call[] calldata calls) external payable nonReentrant whenNotPaused {
-        if (msg.sender != agentAddress) revert OnlyAgent();
-
+    function executeBatch(
+        address wallet,
+        Call[] calldata calls
+    ) external nonReentrant whenNotPaused onlyAgent {
         uint256 totalValue = 0;
         for (uint256 i = 0; i < calls.length; i++) {
             totalValue += calls[i].value;
         }
-        if (msg.value < totalValue) revert InsufficientValue();
+
+        uint256 bal = deposits[wallet];
+        if (bal < totalValue) revert InsufficientDeposit(bal, totalValue);
+
+        deposits[wallet] -= totalValue;
 
         for (uint256 i = 0; i < calls.length; i++) {
             (,, uint256 net) = _collectFees(calls[i].value);
-
-            (bool success,) = calls[i].to.call{value: net}(calls[i].data);
-            if (!success) revert ExecutionFailed(i);
-
-            emit Executed(address(this), calls[i].to, net, calls[i].data);
+            (bool ok,) = calls[i].to.call{value: net}(calls[i].data);
+            if (!ok) revert ExecutionFailed(i);
+            emit Executed(wallet, calls[i].to, net, calls[i].data);
         }
 
-        emit BatchExecuted(address(this), calls.length);
+        emit BatchExecuted(wallet, calls.length);
     }
 
     function executeSwap(
+        address wallet,
         address swapRouter,
-        bytes calldata swapCalldata
-    ) external payable nonReentrant whenNotPaused {
-        if (msg.sender != agentAddress) revert OnlyAgent();
-        if (msg.value == 0) revert InsufficientValue();
+        bytes calldata swapCalldata,
+        uint256 amount,
+        address outputToken
+    ) external nonReentrant whenNotPaused onlyAgent {
+        uint256 bal = deposits[wallet];
+        if (bal < amount) revert InsufficientDeposit(bal, amount);
 
-        (, , uint256 netAmount) = _collectFees(msg.value);
+        deposits[wallet] -= amount;
 
-        (bool success,) = swapRouter.call{value: netAmount}(swapCalldata);
-        if (!success) revert ExecutionFailed(0);
+        (,, uint256 net) = _collectFees(amount);
+        uint256 balanceBefore = IERC20(outputToken).balanceOf(address(this));
 
-        emit Executed(address(this), swapRouter, netAmount, swapCalldata);
+        (bool ok,) = swapRouter.call{value: net}(swapCalldata);
+        if (!ok) revert ExecutionFailed(0);
+
+        uint256 balanceAfter = IERC20(outputToken).balanceOf(address(this));
+        uint256 outputAmount = balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0;
+        if (outputAmount > 0) {
+            require(IERC20(outputToken).transfer(wallet, outputAmount), "token transfer failed");
+            emit TokensForwarded(outputToken, wallet, outputAmount);
+        }
+
+        emit Executed(wallet, swapRouter, net, swapCalldata);
     }
 
-    function recordSpend(address wallet, uint256 feeWei) external {
-        if (msg.sender != agentAddress) revert OnlyAgent();
-
+    function recordSpend(address wallet, uint256 feeWei) external onlyAgent {
         SessionPermission storage s = sessions[wallet];
         if (block.timestamp >= s.expiresAt) revert SessionExpired();
         if (feeWei > s.maxFeePerTxWei) revert FeeLimitExceeded();
@@ -157,10 +208,54 @@ contract WhenCheapSession is ReentrancyGuard, Pausable {
         emit SpendRecorded(wallet, feeWei, s.spentWei);
     }
 
+    // ── Admin ─────────────────────────────────────────────────────────────────
+
+    function emergencyWithdraw(address to) external onlyAgent {
+        uint256 bal = address(this).balance;
+        (bool ok,) = to.call{value: bal}("");
+        require(ok, "transfer failed");
+        emit EmergencyWithdrawn(to, bal);
+    }
+
+    function rescueERC20(address token, address to, uint256 amount) external onlyAgent {
+        if (token == address(0) || to == address(0)) revert ZeroAddress();
+        require(IERC20(token).transfer(to, amount), "token transfer failed");
+        emit TokensRescued(token, to, amount);
+    }
+
+    function pause() external onlyAgent {
+        _pause();
+    }
+
+    function unpause() external onlyAgent {
+        _unpause();
+    }
+
+    // ── View functions ────────────────────────────────────────────────────────
+
+    function canExecute(address wallet, uint256 feeWei) public view returns (bool) {
+        SessionPermission storage s = sessions[wallet];
+        return block.timestamp < s.expiresAt
+            && feeWei <= s.maxFeePerTxWei
+            && s.spentWei + feeWei <= s.maxTotalSpendWei;
+    }
+
+    function canExecuteWithDeposit(
+        address wallet,
+        uint256 feeWei,
+        uint256 intentAmount
+    ) external view returns (bool) {
+        return canExecute(wallet, feeWei) && deposits[wallet] >= intentAmount;
+    }
+
     function remainingBudget(address wallet) external view returns (uint256) {
         SessionPermission storage s = sessions[wallet];
         if (block.timestamp >= s.expiresAt) return 0;
         return s.maxTotalSpendWei - s.spentWei;
+    }
+
+    function remainingDeposit(address wallet) external view returns (uint256) {
+        return deposits[wallet];
     }
 
     function feeForAmount(uint256 value) public view returns (uint256) {
@@ -172,14 +267,11 @@ contract WhenCheapSession is ReentrancyGuard, Pausable {
     }
 
     function agentFeeForAmount(uint256 value) public view returns (uint256) {
-        uint256 total = feeForAmount(value);
-        return (total * agentFeeSplit) / 100;
+        return (feeForAmount(value) * agentFeeSplit) / 100;
     }
 
     function treasuryFeeForAmount(uint256 value) public view returns (uint256) {
-        uint256 total = feeForAmount(value);
-        uint256 agentFee = agentFeeForAmount(value);
-        return total - agentFee;
+        return feeForAmount(value) - agentFeeForAmount(value);
     }
 
     function isDelegated(address wallet) external view returns (bool) {
@@ -188,19 +280,16 @@ contract WhenCheapSession is ReentrancyGuard, Pausable {
         return code[0] == 0xef && code[1] == 0x01 && code[2] == 0x00;
     }
 
-    function pause() external {
-        if (msg.sender != agentAddress) revert OnlyAgent();
-        _pause();
-    }
+    // ── Receive / fallback ────────────────────────────────────────────────────
 
-    function unpause() external {
-        if (msg.sender != agentAddress) revert OnlyAgent();
-        _unpause();
+    receive() external payable {
+        deposits[msg.sender] += msg.value;
+        emit Deposited(msg.sender, msg.value);
     }
-
-    receive() external payable {}
 
     fallback() external payable {}
+
+    // ── Internal ──────────────────────────────────────────────────────────────
 
     function _collectFees(uint256 grossAmount)
         internal
@@ -208,12 +297,12 @@ contract WhenCheapSession is ReentrancyGuard, Pausable {
     {
         totalFee = feeForAmount(grossAmount);
         agentFee = agentFeeForAmount(grossAmount);
-        uint256 treasuryFee = treasuryFeeForAmount(grossAmount);
+        uint256 treasuryFee = totalFee - agentFee;
         netAmount = grossAmount - totalFee;
 
         if (agentFee > 0) {
-            (bool agentOk,) = agentAddress.call{value: agentFee}("");
-            if (!agentOk) {
+            (bool ok,) = agentAddress.call{value: agentFee}("");
+            if (!ok) {
                 emit FeeCollectionFailed(agentAddress, agentFee);
             } else {
                 emit FeeCollected(agentAddress, agentFee, grossAmount, "agent");
@@ -221,8 +310,8 @@ contract WhenCheapSession is ReentrancyGuard, Pausable {
         }
 
         if (treasuryFee > 0) {
-            (bool treasuryOk,) = treasury.call{value: treasuryFee}("");
-            if (!treasuryOk) {
+            (bool ok,) = treasury.call{value: treasuryFee}("");
+            if (!ok) {
                 emit FeeCollectionFailed(treasury, treasuryFee);
             } else {
                 emit FeeCollected(treasury, treasuryFee, grossAmount, "treasury");

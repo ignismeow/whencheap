@@ -95,7 +95,7 @@ export default function GasPage() {
     <main className="console-shell">
       <GasNav />
 
-      <div className="gas-page-scroll mx-auto flex h-screen max-w-[1600px] flex-col gap-4 overflow-y-auto px-4 pb-8 pt-24 sm:px-6 lg:px-8">
+      <div className="gas-page-scroll mx-auto flex min-h-screen max-w-[1600px] flex-col gap-4 px-4 pb-8 pt-24 sm:px-6 lg:px-8">
         <header className="console-panel">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
             <div className="space-y-2">
@@ -148,18 +148,18 @@ export default function GasPage() {
         <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           <MetricPanel
             label="Base Fee"
-            value={current ? `${current.baseFeeGwei.toFixed(4)} GWEI` : '...'}
+            value={current ? `${formatGwei(current.baseFeeGwei)} GWEI` : '...'}
             tone={current ? gasValueTone(current.baseFeeGwei) : 'text-[var(--color-muted)]'}
             meta={suggestion ? `${trendArrow(suggestion.trend)} ${suggestion.trend}` : 'Waiting for telemetry'}
           />
           <MetricPanel
             label="Send Cost"
-            value={suggestion ? `$${suggestion.currentCosts.sendUsd.toFixed(6)}` : '...'}
+            value={suggestion ? `$${formatUsd(suggestion.currentCosts.sendUsd)}` : '...'}
             meta="21,000 gas units"
           />
           <MetricPanel
             label="Swap Cost"
-            value={suggestion ? `$${suggestion.currentCosts.swapUsd.toFixed(6)}` : '...'}
+            value={suggestion ? `$${formatUsd(suggestion.currentCosts.swapUsd)}` : '...'}
             meta="150,000 gas units"
           />
           <MetricPanel
@@ -182,14 +182,14 @@ export default function GasPage() {
             <div className="space-y-4">
               <Sparkline snapshots={analytics?.snapshots ?? []} />
               <div className="grid gap-[1px] border border-[var(--color-border)] bg-[var(--color-border)] sm:grid-cols-3">
-                <SummaryCell label="Min 1H" value={analytics ? analytics.min1h.toFixed(4) : '...'} />
-                <SummaryCell label="Avg 1H" value={analytics ? analytics.avg1h.toFixed(4) : '...'} />
-                <SummaryCell label="Max 1H" value={analytics ? analytics.max1h.toFixed(4) : '...'} />
+                <SummaryCell label="Min 1H" value={analytics ? formatGwei(analytics.min1h) : '...'} />
+                <SummaryCell label="Avg 1H" value={analytics ? formatGwei(analytics.avg1h) : '...'} />
+                <SummaryCell label="Max 1H" value={analytics ? formatGwei(analytics.max1h) : '...'} />
               </div>
               <div className="grid gap-[1px] border border-[var(--color-border)] bg-[var(--color-border)] sm:grid-cols-3">
-                <SummaryCell label="Min 24H" value={analytics ? analytics.min24h.toFixed(4) : '...'} />
-                <SummaryCell label="Avg 24H" value={analytics ? analytics.avg24h.toFixed(4) : '...'} />
-                <SummaryCell label="Avg 7D" value={analytics ? analytics.avg7d.toFixed(4) : '...'} />
+                <SummaryCell label="Min 24H" value={analytics ? formatGwei(analytics.min24h) : '...'} />
+                <SummaryCell label="Avg 24H" value={analytics ? formatGwei(analytics.avg24h) : '...'} />
+                <SummaryCell label="Avg 7D" value={analytics ? formatGwei(analytics.avg7d) : '...'} />
               </div>
               {analytics?.hourlyPattern.length ? (
                 <div className="border border-[var(--color-border)] bg-[var(--color-surface-2)] px-4 py-3">
@@ -260,15 +260,15 @@ export default function GasPage() {
             <div className="gas-card-grid">
               <MetricPanel
                 label="Recommended Max Fee"
-                value={`$${suggestion.recommendedMaxFeeUsd.toFixed(6)}`}
+                value={`$${formatUsd(suggestion.recommendedMaxFeeUsd)}`}
                 tone="text-[var(--color-accent)]"
-                meta={`${suggestion.recommendedMaxFeeGwei.toFixed(4)} GWEI`}
+                meta={`${formatGwei(suggestion.recommendedMaxFeeGwei)} GWEI`}
               />
               <MetricPanel
                 label="Potential Saving"
                 value={`${suggestion.estimatedSavingsPct.toFixed(1)}%`}
                 tone="text-[#4dffa3]"
-                meta={`~$${suggestion.estimatedSavingsUsd.toFixed(6)}`}
+                meta={`~$${formatUsd(suggestion.estimatedSavingsUsd)}`}
               />
               <MetricPanel
                 label="Best Window"
@@ -425,8 +425,8 @@ function TierRow({
           <p className="mt-1 text-[10px] uppercase tracking-[0.14em] text-[var(--color-muted)]">{note}</p>
         </div>
         <div className="text-right">
-          <p className={`text-sm font-bold uppercase tracking-[0.08em] ${gasValueTone(gwei)}`}>{gwei.toFixed(4)} GWEI</p>
-          <p className="mt-1 text-[10px] uppercase tracking-[0.14em] text-[var(--color-muted)]">${usd.toFixed(6)} SWAP</p>
+          <p className={`text-sm font-bold uppercase tracking-[0.08em] ${gasValueTone(gwei)}`}>{formatGwei(gwei)} GWEI</p>
+          <p className="mt-1 text-[10px] uppercase tracking-[0.14em] text-[var(--color-muted)]">${formatUsd(usd)} SWAP</p>
         </div>
       </div>
     </div>
@@ -495,4 +495,21 @@ function comparisonTone(value: number) {
   if (value > 20) return 'text-[var(--color-danger)]';
   if (value < -20) return 'text-[#4dffa3]';
   return 'text-[var(--color-warning)]';
+}
+
+function formatGwei(value: number) {
+  if (!Number.isFinite(value)) return '...';
+  if (value === 0) return '0';
+  if (Math.abs(value) >= 1) return value.toFixed(4);
+  if (Math.abs(value) >= 0.001) return value.toFixed(6);
+  return value.toExponential(2);
+}
+
+function formatUsd(value: number) {
+  if (!Number.isFinite(value)) return '...';
+  if (value === 0) return '0.00';
+  if (Math.abs(value) >= 1) return value.toFixed(2);
+  if (Math.abs(value) >= 0.01) return value.toFixed(4);
+  if (Math.abs(value) >= 0.000001) return value.toFixed(8);
+  return value.toExponential(2);
 }

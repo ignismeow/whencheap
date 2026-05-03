@@ -17,19 +17,6 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE UNIQUE INDEX IF NOT EXISTS "IDX_users_identifier"
   ON users (identifier);
 
-CREATE TABLE IF NOT EXISTS whencheap_wallets (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  "userId" uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  "walletAddress" varchar(64) NOT NULL,
-  "encryptedPrivateKey" text NOT NULL,
-  iv varchar(64) NOT NULL,
-  "authTag" varchar(64) NOT NULL,
-  "createdAt" timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS "IDX_whencheap_wallets_walletAddress"
-  ON whencheap_wallets ("walletAddress");
-
 CREATE TABLE IF NOT EXISTS session_authorizations (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   "userId" uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,

@@ -49,7 +49,8 @@ body {
 }
 
 body {
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 a {
@@ -267,9 +268,11 @@ textarea::placeholder {
   grid-template-columns: minmax(320px, 380px) minmax(0, 1fr);
   gap: 16px;
   max-width: 1600px;
-  height: 100vh;
+  min-height: 100vh;
+  height: auto;
   margin: 0 auto;
-  padding: 80px 16px 16px;
+  padding: 80px 16px 24px;
+  align-items: start;
 }
 
 .console-sidebar,
@@ -289,7 +292,7 @@ textarea::placeholder {
 
 .console-main {
   min-width: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .console-intent-panel {

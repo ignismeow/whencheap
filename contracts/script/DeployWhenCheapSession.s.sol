@@ -11,12 +11,7 @@ contract DeployWhenCheapSession is Script {
         uint16 feeBps = uint16(vm.envUint("FEE_BPS"));
         uint16 agentFeeSplit = uint16(vm.envUint("AGENT_FEE_SPLIT"));
         vm.startBroadcast();
-        deployed = new WhenCheapSession(
-            agentAddress,
-            treasury,
-            feeBps,
-            agentFeeSplit
-        );
+        deployed = new WhenCheapSession(agentAddress, treasury, feeBps, agentFeeSplit);
         vm.stopBroadcast();
     }
 }

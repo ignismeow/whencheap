@@ -1,8 +1,6 @@
 import { BadRequestException, Body, Controller, Get, Logger, Param, Post, Query } from '@nestjs/common';
 import { CreateIntentDto } from './dto/create-intent.dto';
-import { GoogleAuthDto } from './dto/google-auth.dto';
-import { ManagedSessionDto } from './dto/managed-session.dto';
-import { RegisterWalletDto } from './dto/register-wallet.dto';
+import { AuthorizeWalletSessionDto } from './dto/authorize-wallet-session.dto';
 import { TestEip7702Dto } from './dto/test-eip7702.dto';
 import { IntentsService } from './intents.service';
 
@@ -46,28 +44,10 @@ export class IntentsController {
     return { ok: true };
   }
 
-  @Post('wallet')
-  async registerWallet(@Body() dto: RegisterWalletDto) {
-    this.logger.log(`POST /intents/wallet received for ${dto.userAddress}`);
-    return await this.intents.registerWallet(dto);
-  }
-
-  @Post('google-auth')
-  async authenticateWithGoogle(@Body() dto: GoogleAuthDto) {
-    this.logger.log('POST /intents/google-auth received');
-    return await this.intents.authenticateWithGoogle(dto);
-  }
-
-  @Post('wallet/authorize')
-  authorizeManagedWalletSession(@Body() dto: ManagedSessionDto) {
-    this.logger.log(`POST /intents/wallet/authorize received for ${dto.userAddress}`);
-    return this.intents.authorizeManagedWalletSession(dto);
-  }
-
-  @Post('wallet/revoke')
-  revokeManagedWalletSession(@Body() body: { userAddress: string; chain?: string }) {
-    this.logger.log(`POST /intents/wallet/revoke received for ${body.userAddress}`);
-    return this.intents.revokeManagedWalletSession(body.userAddress, body.chain ?? 'sepolia');
+  @Post('authorize-wallet-session')
+  authorizeWalletSession(@Body() dto: AuthorizeWalletSessionDto) {
+    this.logger.log(`POST /intents/authorize-wallet-session received for ${dto.userAddress}`);
+    return this.intents.authorizeExternalWalletSession(dto);
   }
 
   @Post('test-eip7702')

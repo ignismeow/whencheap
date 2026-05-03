@@ -11,7 +11,6 @@ import { IntentEntity } from './intents/intent.entity';
 import { GasModule } from './gas/gas.module';
 import { GasSnapshotEntity } from './gas/gas-snapshot.entity';
 import { SessionAuthorizationEntity } from './session/session-auth.entity';
-import { WhenCheapWallet } from './session/wallet.entity';
 import { StatsModule } from './stats.module';
 import { UserModule } from './user/user.module';
 import { UserEntity } from './user/user.entity';
@@ -28,7 +27,6 @@ import { UserEntity } from './user/user.entity';
           'postgresql://postgres:postgres@localhost:5432/whencheap',
         entities: [
           UserEntity,
-          WhenCheapWallet,
           SessionAuthorizationEntity,
           IntentEntity,
           ExecutionEntity,

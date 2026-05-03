@@ -203,9 +203,9 @@ npm install
 
 # Configure
 cp apps/api/.env.example apps/api/.env
-# Fill in: RPC_URL, AGENT_WALLET_PK, ENCRYPTION_KEY, 
+# Fill in: RPC_URL, AGENT_WALLET_PK,
 #          UNISWAP_API_KEY, ZG_API_KEY, GROQ_API_KEY,
-#          GOOGLE_CLIENT_ID, ETHERSCAN_API_KEY
+#          ETHERSCAN_API_KEY
 
 # Run
 docker compose up -d

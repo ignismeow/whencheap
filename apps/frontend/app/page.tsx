@@ -1,6 +1,7 @@
 'use client';
 
 import {
+  ChevronDown,
   Copy,
   LogOut,
   RefreshCcw,
@@ -12,13 +13,14 @@ import { useRouter } from 'next/navigation';
 import { FormEvent, KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { formatEther, parseEther } from 'viem';
 import { mainnet, sepolia } from 'viem/chains';
-import { useReadContract } from 'wagmi';
+import { useAccount, useDisconnect, usePublicClient, useReadContract, useWriteContract } from 'wagmi';
 import useSWR from 'swr';
 import {
   mainnetSessionContractAddress,
   sessionContractAddress,
   whenCheapSessionAbi,
 } from '../lib/session-contract';
+import { DepositManager } from '../components/DepositManager';
 
 type AuditEvent = {
   id: string;
@@ -80,9 +82,10 @@ type DraftIntentEstimate = {
   totalWei: bigint;
 };
 
-type ManagedIdentity = {
+type WalletIdentity = {
   email: string;
   address: `0x${string}`;
+  mode: 'external';
   created?: boolean;
 };
 
@@ -134,34 +137,11 @@ type SessionStatus = {
   expiresInMinutes: number;
   canExecute: boolean;
   estimatedFeeEth: string;
+  depositEth?: string;
+  hasDeposit?: boolean;
 };
 
 type SessionHealthLevel = 'green' | 'yellow' | 'red' | 'loading';
-
-type GoogleCredentialResponse = {
-  credential: string;
-};
-
-declare global {
-  interface Window {
-    google?: {
-      accounts: {
-        id: {
-          initialize: (options: {
-            client_id: string;
-            callback: (response: GoogleCredentialResponse) => void;
-          }) => void;
-          prompt: () => void;
-          renderButton: (
-            element: HTMLElement,
-            options: Record<string, string | number | boolean>,
-          ) => void;
-          disableAutoSelect: () => void;
-        };
-      };
-    };
-  }
-}
 
 const apiUrl = '/api';
 const fetcher = (url: string) => fetch(url).then((res) => res.json());
@@ -193,14 +173,33 @@ async function fetchGasSuggestion(preview: IntentPreviewResponse): Promise<GasSu
   return (await response.json()) as GasSuggestion;
 }
 
-const authStorageKey = 'whencheap-google-identity';
+const authStorageKey = 'whencheap-wallet-identity';
+const legacyAuthStorageKey = 'whencheap-google-identity';
 const chainStorageKey = 'whencheap-selected-chain';
+const walletAddressStorageKey = 'walletAddress';
+const walletModeStorageKey = 'walletMode';
+const disconnectNoticeStorageKey = 'whencheap-disconnect-notice';
 const EXECUTION_FEE_BPS = 30n;
 const GAS_UNITS = { send: 21_000n, swap: 150_000n } as const;
 const alchemyKey = process.env.NEXT_PUBLIC_ALCHEMY_KEY ?? '';
 
+function persistIdentity(identity: WalletIdentity) {
+  window.localStorage.setItem(authStorageKey, JSON.stringify(identity));
+  window.localStorage.removeItem(legacyAuthStorageKey);
+  window.localStorage.setItem(walletAddressStorageKey, identity.address);
+  window.localStorage.setItem(walletModeStorageKey, identity.mode);
+}
+
+function clearIdentityStorage() {
+  window.localStorage.removeItem(authStorageKey);
+  window.localStorage.removeItem(legacyAuthStorageKey);
+  window.localStorage.removeItem(walletAddressStorageKey);
+  window.localStorage.removeItem(walletModeStorageKey);
+}
+
 export default function Home() {
   const router = useRouter();
+  const { disconnectAsync } = useDisconnect();
   const [input, setInput] = useState('Send 0.001 ETH to 0x9dD40426fe0dbaF3d28B4fe7f499231e6FFd3873 when gas is under $1 in next 30 minutes'
 );
   const [selectedChain, setSelectedChain] = useState<'sepolia' | 'mainnet'>('sepolia');
@@ -209,8 +208,9 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [cancellingIntentId, setCancellingIntentId] = useState<string | null>(null);
-  const [managedIdentity, setManagedIdentity] = useState<ManagedIdentity | null>(null);
+  const [managedIdentity, setManagedIdentity] = useState<WalletIdentity | null>(null);
   const [isSessionCardOpen, setIsSessionCardOpen] = useState(false);
+  const [disconnectNotice, setDisconnectNotice] = useState<string | null>(null);
   const [ensCandidate, setEnsCandidate] = useState<string | null>(null);
   const [resolvedEnsAddress, setResolvedEnsAddress] = useState<string | null>(null);
   const [ensResolutionError, setEnsResolutionError] = useState<string | null>(null);
@@ -244,6 +244,7 @@ export default function Home() {
     [filteredIntents, selectedId]
   );
   const effectiveAddress = managedIdentity?.address;
+  const walletMode = managedIdentity?.mode ?? null;
   const draftIntentEstimate = useMemo(
     () => deriveDraftIntentEstimate(input, selectedChain, liveGasPriceWei),
     [input, selectedChain, liveGasPriceWei],
@@ -264,18 +265,38 @@ export default function Home() {
     () => deriveSessionHealth(sessionStatus),
     [sessionStatus],
   );
+  const canCreateIntent = Boolean(effectiveAddress && sessionHealth.level === 'green');
 
   useEffect(() => {
     try {
-      const raw = window.localStorage.getItem(authStorageKey);
+      const raw =
+        window.localStorage.getItem(authStorageKey) ??
+        window.localStorage.getItem(legacyAuthStorageKey);
       if (!raw) return;
-      const parsed = JSON.parse(raw) as ManagedIdentity;
-      if (parsed?.email && parsed?.address) {
-        setManagedIdentity(parsed);
+      const parsed = JSON.parse(raw) as Partial<WalletIdentity>;
+      if (parsed?.address) {
+        const identity: WalletIdentity = {
+          email: parsed.email ?? parsed.address,
+          address: parsed.address as `0x${string}`,
+          mode: 'external',
+          created: parsed.created,
+        };
+
+        setManagedIdentity(identity);
+        persistIdentity(identity);
       }
     } catch {
-      window.localStorage.removeItem(authStorageKey);
+      clearIdentityStorage();
     }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const notice = window.localStorage.getItem(disconnectNoticeStorageKey);
+      if (!notice) return;
+      setDisconnectNotice(notice);
+      window.localStorage.removeItem(disconnectNoticeStorageKey);
+    } catch {}
   }, []);
 
   useEffect(() => {
@@ -382,11 +403,26 @@ export default function Home() {
     };
   }, [selectedChain]);
 
-  function signOutManagedIdentity() {
+  async function disconnectWallet() {
+    const pendingCount = filteredIntents.filter((intent) =>
+      ['PENDING_INTENT', 'SUBMITTED', 'CONFIRMING', 'NEEDS_REAUTHORIZATION'].includes(intent.status),
+    ).length;
+    const notice =
+      pendingCount > 0
+        ? `Wallet disconnected. ${pendingCount} intent${pendingCount === 1 ? '' : 's'} will continue executing autonomously. Reconnect anytime to check status.`
+        : 'Wallet disconnected. WhenCheap keeps monitoring your session and any pending intents autonomously.';
+
     setManagedIdentity(null);
     setSelectedId(null);
-    window.localStorage.removeItem(authStorageKey);
-    window.google?.accounts.id.disableAutoSelect();
+    setIsSessionCardOpen(false);
+    setDisconnectNotice(notice);
+    try {
+      window.localStorage.setItem(disconnectNoticeStorageKey, notice);
+    } catch {}
+    clearIdentityStorage();
+    try {
+      await disconnectAsync();
+    } catch {}
   }
 
   function addAgentMessage(content: string, intentId?: string) {
@@ -524,7 +560,7 @@ export default function Home() {
 
   async function submitConfirmedIntent(previewToSubmit: PendingIntentPreview) {
     if (!effectiveAddress) {
-      throw new Error('Verify with Google first.');
+      throw new Error('Connect MetaMask first.');
     }
 
     const response = await fetch(`${apiUrl}/intents`, {
@@ -532,6 +568,8 @@ export default function Home() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         wallet: effectiveAddress,
+        walletAddress: effectiveAddress,
+        walletMode,
         input: previewToSubmit.normalizedInput,
         parsed: previewToSubmit.preview.parsed,
       }),
@@ -599,8 +637,8 @@ export default function Home() {
 
   async function handleSend() {
     if (!effectiveAddress) {
-      setError('Verify with Google first.');
-      addAgentMessage('Verify with Google first so I can create intents from your managed wallet.');
+      setError('Connect MetaMask first.');
+      addAgentMessage('Connect MetaMask first so I have an active wallet for new intents.');
       return;
     }
     if (!input.trim() || isSubmitting) return;
@@ -638,7 +676,12 @@ export default function Home() {
       const previewPromise = fetch(`${apiUrl}/intents/preview`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ wallet: effectiveAddress, input: normalizedInput })
+        body: JSON.stringify({
+          wallet: effectiveAddress,
+          walletAddress: effectiveAddress,
+          walletMode,
+          input: normalizedInput,
+        })
       }).then(async (response) => {
         if (!response.ok) {
           const body = await response.text();
@@ -704,7 +747,7 @@ export default function Home() {
   if (!managedIdentity) {
     return (
       <main className="console-shell">
-        <LandingHero onLaunch={() => router.push('/login')} />
+        <LandingHero onLaunch={() => router.push('/login')} notice={disconnectNotice} />
       </main>
     );
   }
@@ -713,13 +756,13 @@ export default function Home() {
     <main className="console-shell">
       <HeaderBar
         address={effectiveAddress}
-        email={managedIdentity.email}
         selectedChain={selectedChain}
         sessionHealth={sessionHealth}
         onToggleChain={() =>
           setSelectedChain((current) => (current === 'sepolia' ? 'mainnet' : 'sepolia'))
         }
         onOpenSessionCard={() => setIsSessionCardOpen(true)}
+        onDisconnect={() => void disconnectWallet()}
       />
 
       <div className="console-root">
@@ -765,14 +808,14 @@ export default function Home() {
                   <button
                     type="button"
                     onClick={() => void handleQuickReply('confirm')}
-                    className="flex-1 rounded-lg bg-[var(--color-accent)] py-2 text-xs font-medium text-black"
+                    className="flex-1  bg-[var(--color-accent)] py-2 text-xs font-medium text-black"
                   >
                     Confirm
                   </button>
                   <button
                     type="button"
                     onClick={() => void handleQuickReply('cancel')}
-                    className="flex-1 rounded-lg bg-zinc-700 py-2 text-xs text-white"
+                    className="flex-1 bg-zinc-700 py-2 text-xs text-white"
                   >
                     Cancel
                   </button>
@@ -781,7 +824,7 @@ export default function Home() {
 
               <div className="space-y-2 text-[11px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
                 <div className="console-subpanel">
-                  <span className="block text-[10px] text-[var(--color-label)]">Managed wallet</span>
+                  <span className="block text-[10px] text-[var(--color-label)]">Connected wallet</span>
                   <span className="mt-1 block text-[var(--color-text)]">{truncateAddress(effectiveAddress ?? '')}</span>
                 </div>
 
@@ -810,7 +853,7 @@ export default function Home() {
               <div className="space-y-2">
                 <button
                   type="submit"
-                  disabled={isSubmitting}
+                  disabled={isSubmitting || !canCreateIntent}
                   className="console-button console-button-primary w-full"
                 >
                   <Send size={15} />
@@ -819,6 +862,11 @@ export default function Home() {
                 <p className="text-[10px] normal-case tracking-normal text-[var(--color-muted)]">
                   0.3% execution fee applies on confirmed transactions.
                 </p>
+                {!canCreateIntent ? (
+                  <p className="text-[10px] normal-case tracking-normal text-[var(--color-warning)]">
+                    Authorize and fund your session before creating new intents. You can disconnect afterward and execution will continue autonomously.
+                  </p>
+                ) : null}
                 {/\bswap\b/i.test(input) && selectedChain === 'sepolia' ? (
                   <p className="text-[10px] normal-case tracking-normal text-[var(--color-warning)]">
                     Demo note: Sepolia currently supports ETH -&gt; token swaps only. Try ETH -&gt; USDC or ETH -&gt; DAI.
@@ -827,6 +875,11 @@ export default function Home() {
               </div>
             </form>
           </ConsolePanel>
+
+          {/* Deposit manager for the connected external wallet. */}
+          {managedIdentity.mode === 'external' && managedIdentity.address && (
+            <DepositManager walletAddress={managedIdentity.address} />
+          )}
 
           {/* <ConsolePanel
             title="Recent Commands"
@@ -878,7 +931,7 @@ export default function Home() {
         </aside>
 
         <section className="console-main">
-          <div className="grid h-full min-h-0 grid-rows-[minmax(0,1fr)_220px] gap-4">
+          <div className="grid min-h-0 gap-4 xl:grid-rows-[minmax(0,1fr)_minmax(260px,auto)]">
             <div className="grid min-h-0 gap-4 xl:grid-cols-[minmax(0,1.15fr)_minmax(340px,0.85fr)]">
               {selected ? (
                 <CommandCenter
@@ -914,7 +967,7 @@ export default function Home() {
             sessionHealth={sessionHealth}
             refreshSessionStatus={() => mutateSessionStatus()}
             onSessionChainChange={setSelectedChain}
-            onLogout={signOutManagedIdentity}
+            onLogout={() => void disconnectWallet()}
             onClose={() => setIsSessionCardOpen(false)}
           />
         </SessionCardModal>
@@ -923,7 +976,7 @@ export default function Home() {
   );
 }
 
-function LandingHero({ onLaunch }: { onLaunch: () => void }) {
+function LandingHero({ onLaunch, notice }: { onLaunch: () => void; notice?: string | null }) {
   return (
     <section className="hero-gateway">
       <div className="hero-grid" />
@@ -950,7 +1003,7 @@ function LandingHero({ onLaunch }: { onLaunch: () => void }) {
           Defi Intent-based automation
         </h1>
         <p className="max-w-2xl text-sm text-[var(--color-muted)]">
-          Reliable execution. Managed gas. No seed phrases required.
+          Connect MetaMask, fund a session, and let execution happen automatically when gas lines up.
         </p>
        
 
@@ -963,6 +1016,17 @@ function LandingHero({ onLaunch }: { onLaunch: () => void }) {
             [ Launch App ]
           </button>
         </div>
+
+        {notice ? (
+          <div className="mt-6 max-w-2xl border border-[var(--color-border)] bg-[rgba(255,255,255,0.02)] px-4 py-3 text-left">
+            <p className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-accent)]">
+              Autonomous Execution
+            </p>
+            <p className="mt-2 text-xs text-[var(--color-text)]">
+              {notice}
+            </p>
+          </div>
+        ) : null}
       </div>
     </section>
   );
@@ -1074,19 +1138,48 @@ function ChatMessageContent({
 
 function HeaderBar({
   address,
-  email,
   selectedChain,
   sessionHealth,
   onToggleChain,
-  onOpenSessionCard
+  onOpenSessionCard,
+  onDisconnect,
 }: {
   address?: `0x${string}`;
-  email?: string;
   selectedChain: 'sepolia' | 'mainnet';
   sessionHealth: { level: SessionHealthLevel; label: string };
   onToggleChain: () => void;
   onOpenSessionCard: () => void;
+  onDisconnect: () => void;
 }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const handlePointerDown = (event: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    return () => document.removeEventListener('mousedown', handlePointerDown);
+  }, [menuOpen]);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timeout = window.setTimeout(() => setCopied(false), 1200);
+    return () => window.clearTimeout(timeout);
+  }, [copied]);
+
+  const handleCopy = async () => {
+    if (!address) return;
+    await navigator.clipboard.writeText(address);
+    setCopied(true);
+    setMenuOpen(false);
+  };
+
   return (
     <header className="console-header">
       <div className="mx-auto flex h-[64px] w-full max-w-[1600px] items-center justify-between px-4 sm:px-6 lg:px-8">
@@ -1119,25 +1212,59 @@ function HeaderBar({
             <span className="h-2 w-2 bg-[var(--color-accent)]" />
             <span>{selectedChain === 'mainnet' ? 'Mainnet' : 'Sepolia'}</span>
           </button>
-          {email ? (
-            <button
-              type="button"
-              onClick={onOpenSessionCard}
-              className="console-chip hidden lg:flex hover:bg-[var(--color-accent)] hover:text-black focus-visible:bg-[var(--color-accent)] focus-visible:text-black focus-visible:outline-none"
-            >
-              <span className={`h-2 w-2 ${healthDotClassName(sessionHealth.level)}`} />
-              <span>{email}</span>
-            </button>
-          ) : null}
           {address ? (
-            <button
-              type="button"
-              onClick={onOpenSessionCard}
-              className="console-chip hidden sm:flex hover:bg-[var(--color-accent)] hover:text-black focus-visible:bg-[var(--color-accent)] focus-visible:text-black focus-visible:outline-none"
-            >
-              <span className={`h-2 w-2 ${healthDotClassName(sessionHealth.level)}`} />
-              <span>{truncateAddress(address)}</span>
-            </button>
+            <div className="relative hidden sm:block" ref={menuRef}>
+              <button
+                type="button"
+                onClick={() => setMenuOpen((open) => !open)}
+                className="console-chip hover:bg-[var(--color-accent)] hover:text-black focus-visible:bg-[var(--color-accent)] focus-visible:text-black focus-visible:outline-none"
+              >
+                <span className={`h-2 w-2 ${healthDotClassName(sessionHealth.level)}`} />
+                <span>{truncateAddress(address)}</span>
+                <ChevronDown size={13} />
+              </button>
+
+              {menuOpen ? (
+                <div className="absolute right-0 top-[calc(100%+8px)] z-30 min-w-[220px] border border-[var(--color-border)] bg-black p-1 shadow-[0_0_24px_rgba(0,0,0,0.45)]">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      onOpenSessionCard();
+                    }}
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-[10px] uppercase tracking-[0.16em] text-[var(--color-text)] hover:bg-[var(--color-surface)]"
+                  >
+                    Session Matrix
+                  </button>
+                  <a
+                    href={explorerAddressUrl(selectedChain, address)}
+                    target="_blank"
+                    rel="noreferrer"
+                    onClick={() => setMenuOpen(false)}
+                    className="flex w-full items-center gap-2 px-3 py-2 text-[10px] uppercase tracking-[0.16em] text-[var(--color-text)] hover:bg-[var(--color-surface)]"
+                  >
+                    View on Etherscan
+                  </a>
+                  <button
+                    type="button"
+                    onClick={() => void handleCopy()}
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-[10px] uppercase tracking-[0.16em] text-[var(--color-text)] hover:bg-[var(--color-surface)]"
+                  >
+                    {copied ? 'Address Copied' : 'Copy Address'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      onDisconnect();
+                    }}
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-[10px] uppercase tracking-[0.16em] text-[var(--color-danger)] hover:bg-[var(--color-surface)]"
+                  >
+                    Disconnect Wallet
+                  </button>
+                </div>
+              ) : null}
+            </div>
           ) : null}
         </div>
       </div>
@@ -1201,6 +1328,9 @@ function SessionCard({
   onLogout: () => void;
   onClose: () => void;
 }) {
+  const { chainId } = useAccount();
+  const { writeContractAsync } = useWriteContract();
+  const publicClient = usePublicClient();
   const [maxFeePerTxEth, setMaxFeePerTxEth] = useState('0.001');
   const [maxTotalSpendEth, setMaxTotalSpendEth] = useState('0.01');
   const [expiryHours, setExpiryHours] = useState('6');
@@ -1212,6 +1342,10 @@ function SessionCard({
   const sessionContractForChain =
     sessionChain === 'mainnet' ? mainnetSessionContractAddress : sessionContractAddress;
   const sessionChainId = sessionChain === 'mainnet' ? mainnet.id : sepolia.id;
+  const externalWalletOnSelectedChain =
+    Boolean(address) &&
+    Boolean(sessionContractForChain) &&
+    chainId === sessionChainId;
   const { data: feeBpsData } = useReadContract({
     address: sessionContractForChain,
     abi: whenCheapSessionAbi,
@@ -1240,6 +1374,42 @@ function SessionCard({
       enabled: Boolean(sessionContractForChain && draftIntentEstimate)
     }
   });
+  const { data: onChainDeposit } = useReadContract({
+    address: sessionContractForChain,
+    abi: whenCheapSessionAbi,
+    functionName: 'deposits',
+    args: address ? [address] : undefined,
+    chainId: sessionChainId,
+    query: {
+      enabled: Boolean(externalWalletOnSelectedChain && address)
+    }
+  });
+  const { data: onChainSession } = useReadContract({
+    address: sessionContractForChain,
+    abi: whenCheapSessionAbi,
+    functionName: 'sessions',
+    args: address ? [address] : undefined,
+    chainId: sessionChainId,
+    query: {
+      enabled: Boolean(externalWalletOnSelectedChain && address)
+    }
+  });
+  const { data: onChainCanExecuteWithDeposit } = useReadContract({
+    address: sessionContractForChain,
+    abi: whenCheapSessionAbi,
+    functionName: 'canExecuteWithDeposit',
+    args: address
+      ? [address, draftIntentEstimate?.gasEstimateWei ?? 0n, draftIntentEstimate?.amountWei ?? 0n]
+      : undefined,
+    chainId: sessionChainId,
+    query: {
+      enabled: Boolean(
+        externalWalletOnSelectedChain &&
+        address &&
+        draftIntentEstimate
+      )
+    }
+  });
 
   useEffect(() => {
     if (!copiedAddress) return;
@@ -1247,8 +1417,8 @@ function SessionCard({
     return () => window.clearTimeout(timeout);
   }, [copiedAddress]);
 
-  async function authorizeSession() {
-    if (!address) return;
+  async function authorizeExternalWalletSession() {
+    if (!address || !sessionContractForChain || !publicClient) return;
 
     try {
       setActiveAction('authorize');
@@ -1256,7 +1426,40 @@ function SessionCard({
       setSessionTxHash(null);
       setSessionError(null);
 
-      const response = await fetch(`${apiUrl}/intents/wallet/authorize`, {
+      if (!externalWalletOnSelectedChain) {
+        throw new Error(
+          `Switch MetaMask to ${sessionChain === 'mainnet' ? 'Ethereum Mainnet' : 'Sepolia'} before authorizing.`,
+        );
+      }
+
+      const durationSeconds = BigInt(Number(expiryHours || '0') * 60 * 60);
+      if (durationSeconds <= 0n) {
+        throw new Error('Enter a valid expiry duration.');
+      }
+
+      const hash = await writeContractAsync({
+        address: sessionContractForChain,
+        abi: whenCheapSessionAbi,
+        functionName: 'authorize',
+        args: [
+          parseEther(maxFeePerTxEth),
+          parseEther(maxTotalSpendEth),
+          durationSeconds,
+        ],
+        chainId: sessionChainId,
+      });
+
+      const receipt = await publicClient.waitForTransactionReceipt({
+        hash,
+        pollingInterval: 2_000,
+        timeout: 120_000,
+      });
+
+      if (receipt.status !== 'success') {
+        throw new Error(`Authorization reverted (${hash})`);
+      }
+
+      const response = await fetch(`${apiUrl}/intents/authorize-wallet-session`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1265,51 +1468,24 @@ function SessionCard({
           maxTotalSpendEth,
           expiryHours,
           chain: sessionChain,
-        })
+        }),
       });
 
       const rawBody = await response.text();
       const payload = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
       if (!response.ok || payload.ok !== true) {
-        throw new Error(typeof payload.message === 'string' ? payload.message : rawBody || 'Authorization failed');
+        throw new Error(
+          typeof payload.message === 'string'
+            ? payload.message
+            : rawBody || 'Failed to refresh external wallet session.',
+        );
       }
 
       setSessionMessage('Session authorized.');
-      setSessionTxHash(String(payload.txHash ?? ''));
+      setSessionTxHash(hash);
       await refreshSessionStatus();
     } catch (err) {
       setSessionError(err instanceof Error ? err.message : 'Session authorization failed');
-    } finally {
-      setActiveAction(null);
-    }
-  }
-
-  async function revokeSession() {
-    if (!address) return;
-
-    try {
-      setActiveAction('revoke');
-      setSessionMessage(null);
-      setSessionTxHash(null);
-      setSessionError(null);
-
-      const response = await fetch(`${apiUrl}/intents/wallet/revoke`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userAddress: address, chain: sessionChain })
-      });
-
-      const rawBody = await response.text();
-      const payload = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
-      if (!response.ok || payload.ok !== true) {
-        throw new Error(typeof payload.message === 'string' ? payload.message : rawBody || 'Revoke failed');
-      }
-
-      setSessionMessage('Session revoked.');
-      setSessionTxHash(String(payload.txHash ?? ''));
-      await refreshSessionStatus();
-    } catch (err) {
-      setSessionError(err instanceof Error ? err.message : 'Failed to revoke session');
     } finally {
       setActiveAction(null);
     }
@@ -1321,7 +1497,7 @@ function SessionCard({
     setSessionTxHash(null);
     setSessionError(null);
     onLogout();
-    setSessionMessage('Google session disconnected.');
+    setSessionMessage('Wallet disconnected.');
     setActiveAction(null);
   }
 
@@ -1341,11 +1517,49 @@ function SessionCard({
   const draftTotalWei = draftIntentEstimate
     ? draftIntentEstimate.amountWei + onChainFeeWei + draftIntentEstimate.gasEstimateWei
     : 0n;
+  const displayedSessionStatus = useMemo<SessionStatus | null>(() => {
+    if (!address || !onChainSession) {
+      return sessionStatus;
+    }
+
+    const expiresAtSeconds = Number(onChainSession[3]);
+    const expiresAtMs = expiresAtSeconds > 0 ? expiresAtSeconds * 1000 : 0;
+    const now = Date.now();
+    const active = expiresAtMs > now;
+    const remainingWei =
+      onChainSession[1] > onChainSession[2] ? onChainSession[1] - onChainSession[2] : 0n;
+    const hasDeposit = typeof onChainDeposit === 'bigint' && onChainDeposit > 0n;
+
+    return {
+      active,
+      maxFeePerTxEth: formatEther(onChainSession[0]),
+      maxTotalSpendEth: formatEther(onChainSession[1]),
+      spentEth: formatEther(onChainSession[2]),
+      remainingEth: formatEther(remainingWei),
+      expiresAt: active ? new Date(expiresAtMs).toISOString() : null,
+      expiresInMinutes: active ? Math.ceil((expiresAtMs - now) / 60_000) : 0,
+      canExecute: draftIntentEstimate ? Boolean(onChainCanExecuteWithDeposit) : active && hasDeposit,
+      estimatedFeeEth: formatEther(draftIntentEstimate?.gasEstimateWei ?? 0n),
+      depositEth: typeof onChainDeposit === 'bigint' ? formatEther(onChainDeposit) : '0',
+      hasDeposit,
+    };
+  }, [
+    address,
+    draftIntentEstimate,
+    onChainCanExecuteWithDeposit,
+    onChainDeposit,
+    onChainSession,
+    sessionStatus,
+  ]);
+  const displayedSessionHealth = useMemo(
+    () => deriveSessionHealth(displayedSessionStatus),
+    [displayedSessionStatus],
+  );
 
   return (
     <ConsolePanel
       title="Session Matrix"
-      eyebrow="MANAGED EXECUTION LAYER"
+      eyebrow="SESSION EXECUTION LAYER"
       className="console-glitch-panel"
       action={
         <button type="button" onClick={onClose} className="console-icon-button" aria-label="Close session details">
@@ -1358,12 +1572,14 @@ function SessionCard({
           <div className="console-subpanel">
             <span className="text-[10px] text-[var(--color-label)]">Session health</span>
             <div className="mt-2 flex items-center gap-2 text-[var(--color-text)]">
-              <span className={`h-2.5 w-2.5 ${healthDotClassName(sessionHealth.level)}`} />
-              <span>{sessionHealth.label}</span>
+              <span className={`h-2.5 w-2.5 ${healthDotClassName(displayedSessionHealth.level)}`} />
+              <span>{displayedSessionHealth.label}</span>
             </div>
           </div>
           <div className="console-subpanel">
-            <span className="text-[10px] text-[var(--color-label)]">Google identity</span>
+            <span className="text-[10px] text-[var(--color-label)]">
+              Wallet identity
+            </span>
             <p className="mt-2 break-all text-[var(--color-text)] normal-case tracking-normal">{email}</p>
           </div>
         </div>
@@ -1371,7 +1587,7 @@ function SessionCard({
         <div className="console-subpanel">
           <div className="flex items-center justify-between gap-3">
             <span className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-label)]">
-              System-generated wallet
+              Connected wallet
             </span>
             <button type="button" onClick={() => void copyAddress()} className="console-icon-button">
               <Copy size={14} />
@@ -1379,61 +1595,71 @@ function SessionCard({
           </div>
           <p className="mt-2 break-all text-sm text-[var(--color-text)]">{address}</p>
           <p className="mt-2 text-[10px] uppercase tracking-[0.16em] text-[var(--color-muted)]">
-            {copiedAddress ? 'Address copied' : 'Allocated to this Google account'}
+            {copiedAddress
+              ? 'Address copied'
+              : 'Connected from MetaMask'}
           </p>
         </div>
 
         <div className="console-scroll max-h-[70vh] space-y-4 pr-1">
+          <div className="console-subpanel">
+            <span className="text-[10px] uppercase tracking-[0.16em] text-[var(--color-label)]">Contract</span>
+            <p className="mt-2 break-all text-[11px] text-[var(--color-text)]">
+              {sessionContractForChain ?? 'Not configured'}
+            </p>
+          </div>
+
           <div className="grid gap-[1px] border border-[var(--color-border)] bg-[var(--color-border)]">
             <InfoRow
               label="ACTIVE"
               value={
                 <span
                   className={
-                    !sessionStatus
+                    !displayedSessionStatus
                       ? 'text-zinc-400'
-                      : sessionStatus.active
+                      : displayedSessionStatus.active
                         ? 'text-emerald-400'
                         : 'text-red-500'
                   }
                 >
-                  {!sessionStatus ? 'CHECKING...' : sessionStatus.active ? 'YES' : 'NO'}
+                  {!displayedSessionStatus ? 'CHECKING...' : displayedSessionStatus.active ? 'YES' : 'NO'}
                 </span>
               }
             />
             <InfoRow label="CHAIN" value={sessionChain === 'mainnet' ? 'Mainnet' : 'Sepolia'} />
-            <InfoRow label="BUDGET REMAINING" value={`${sessionStatus?.remainingEth ?? '0'} ETH`} />
-            <InfoRow label="SPENT" value={`${sessionStatus?.spentEth ?? '0'} ETH`} />
+            <InfoRow label="DEPOSIT" value={`${displayedSessionStatus?.depositEth ?? '0'} ETH`} />
+            <InfoRow label="BUDGET REMAINING" value={`${displayedSessionStatus?.remainingEth ?? '0'} ETH`} />
+            <InfoRow label="SPENT" value={`${displayedSessionStatus?.spentEth ?? '0'} ETH`} />
             <InfoRow
               label="EXPIRES"
               value={
-                !sessionStatus
+                !displayedSessionStatus
                   ? 'Checking...'
-                  : sessionStatus.active && sessionStatus.expiresAt
-                  ? `in ${sessionStatus.expiresInMinutes} minutes (${new Date(sessionStatus.expiresAt).toLocaleString()})`
+                  : displayedSessionStatus.active && displayedSessionStatus.expiresAt
+                  ? `in ${displayedSessionStatus.expiresInMinutes} minutes (${new Date(displayedSessionStatus.expiresAt).toLocaleString()})`
                   : 'Not Set'
               }
             />
-            <InfoRow label="MAX FEE/TX" value={`${sessionStatus?.maxFeePerTxEth ?? '0'} ETH`} />
+            <InfoRow label="MAX FEE/TX" value={`${displayedSessionStatus?.maxFeePerTxEth ?? '0'} ETH`} />
             <InfoRow
               label="CAN EXECUTE"
               value={
                 <span
                   className={
-                    !sessionStatus
+                    !displayedSessionStatus
                       ? 'text-zinc-400'
-                      : sessionStatus.canExecute
+                      : displayedSessionStatus.canExecute
                         ? 'text-emerald-400'
                         : 'text-red-500'
                   }
                 >
-                  {!sessionStatus ? 'CHECKING...' : sessionStatus.canExecute ? 'YES' : 'NO'}
+                  {!displayedSessionStatus ? 'CHECKING...' : displayedSessionStatus.canExecute ? 'YES' : 'NO'}
                 </span>
               }
             />
           </div>
 
-          {sessionHealth.level === 'yellow' && sessionStatus ? (
+          {displayedSessionHealth.level === 'yellow' && displayedSessionStatus ? (
             <div className="console-alert border-[var(--color-warning)] text-[var(--color-warning)]">
               <span className="console-alert-label">Warning</span>
               <p>
@@ -1442,11 +1668,13 @@ function SessionCard({
             </div>
           ) : null}
 
-          {sessionHealth.level === 'red' ? (
+          {displayedSessionHealth.level === 'red' ? (
             <div className="console-alert border-[var(--color-danger)] text-[var(--color-danger)]">
               <span className="console-alert-label">Status</span>
               <p>
-                Session is expired, unavailable, or cannot execute with the current estimated fee.
+                {displayedSessionStatus && displayedSessionStatus.hasDeposit === false
+                  ? 'Session exists, but no deposit is available on the contract shown above.'
+                  : 'Session is expired, unavailable, or cannot execute with the current estimated fee.'}
               </p>
             </div>
           ) : null}
@@ -1552,10 +1780,10 @@ function SessionCard({
 
           <div className="border border-[var(--color-border)] p-3">
             <p className="text-[10px] uppercase tracking-[0.18em] text-[var(--color-label)]">
-              Managed wallet policy
+              External wallet mode
             </p>
             <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
-              This wallet was generated for your verified Gmail. Session authorization and revocation are executed from the server using the encrypted managed key.
+              This panel reads the connected wallet directly from the selected session contract. Deposit and session values should match the Deposit & Session panel.
             </p>
             <p className="mt-3 text-[11px] uppercase tracking-[0.12em] text-[var(--color-muted)]">
               Platform fee: {(onChainFeeBps / 100).toFixed(1)}% (enforced on-chain)
@@ -1565,26 +1793,24 @@ function SessionCard({
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={authorizeSession}
-            disabled={activeAction !== null}
-            className="console-button console-button-primary w-full"
-          >
-            <ShieldCheck size={15} />
-            {activeAction === 'authorize' ? 'Creating...' : 'Create New Session'}
-          </button>
-
-          <div className="flex flex-wrap gap-3 text-[11px] uppercase tracking-[0.14em]">
-            <button
-              type="button"
-              onClick={revokeSession}
-              disabled={activeAction !== null && activeAction !== 'revoke'}
-              className="console-text-button text-[var(--color-danger)]"
-            >
-              <XCircle size={14} />
-              {activeAction === 'revoke' ? 'Revoking...' : 'Revoke Session'}
-            </button>
+          <div className="space-y-3">
+            {!displayedSessionStatus?.active ? (
+              <button
+                type="button"
+                onClick={authorizeExternalWalletSession}
+                disabled={activeAction !== null || !sessionContractForChain}
+                className="console-button console-button-primary w-full"
+              >
+                <ShieldCheck size={15} />
+                {activeAction === 'authorize' ? 'Authorizing...' : 'Authorize Session'}
+              </button>
+            ) : null}
+            <div className="console-alert border-[var(--color-border)] text-[var(--color-muted)]">
+              <span className="console-alert-label">External Wallet</span>
+              <p>
+                Authorize from this panel when the session is expired, then top up or revoke from the Deposit &amp; Session panel on the dashboard.
+              </p>
+            </div>
             <button
               type="button"
               onClick={disconnectWallet}
@@ -1823,7 +2049,7 @@ function CommandCenterEmpty() {
             Create your first command
           </h2>
           <p className="max-w-sm text-xs uppercase tracking-[0.14em] text-[var(--color-muted)]">
-            Verify with Google, use the assigned wallet, and submit a command to start execution.
+            Connect MetaMask, authorize a session, and submit a command to start execution.
           </p>
         </div>
       </div>
@@ -1881,7 +2107,7 @@ function RecentCommandsPanel({
       }
       className="min-h-0"
     >
-      <div className="console-scroll grid h-full min-h-0 gap-2 pr-1 xl:grid-cols-3">
+      <div className="console-scroll grid max-h-[340px] min-h-0 gap-2 pr-1 xl:grid-cols-3">
         {isLoading ? (
           <p className="text-xs uppercase tracking-[0.14em] text-[var(--color-muted)]">
             Loading intents...
@@ -2095,6 +2321,12 @@ function explorerTxUrl(chain: string, hash: string) {
   return isMainnetChain(chain)
     ? `https://etherscan.io/tx/${hash}`
     : `https://sepolia.etherscan.io/tx/${hash}`;
+}
+
+function explorerAddressUrl(chain: string, address: string) {
+  return isMainnetChain(chain)
+    ? `https://etherscan.io/address/${address}`
+    : `https://sepolia.etherscan.io/address/${address}`;
 }
 
 function explorerUrlForIntent(intent: IntentRecord, hash: string) {

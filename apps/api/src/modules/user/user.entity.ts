@@ -9,7 +9,6 @@ import {
 } from 'typeorm';
 import { IntentEntity } from '../intents/intent.entity';
 import { SessionAuthorizationEntity } from '../session/session-auth.entity';
-import { WhenCheapWallet } from '../session/wallet.entity';
 
 export enum UserIdentifierType {
   Google = 'google',
@@ -37,9 +36,6 @@ export class UserEntity {
 
   @UpdateDateColumn({ type: 'timestamp with time zone' })
   updatedAt!: Date;
-
-  @OneToMany(() => WhenCheapWallet, (wallet) => wallet.user)
-  wallets?: WhenCheapWallet[];
 
   @OneToMany(() => SessionAuthorizationEntity, (session) => session.user)
   sessionAuthorizations?: SessionAuthorizationEntity[];

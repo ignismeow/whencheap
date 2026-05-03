@@ -4,7 +4,6 @@ import { Repository } from 'typeorm';
 import { ExecutionEntity } from '../intents/execution.entity';
 import { IntentEntity } from '../intents/intent.entity';
 import { SessionAuthorizationEntity } from '../session/session-auth.entity';
-import { WhenCheapWallet } from '../session/wallet.entity';
 import { UserEntity } from './user.entity';
 
 @Injectable()
@@ -12,8 +11,6 @@ export class UserService {
   constructor(
     @InjectRepository(UserEntity)
     private readonly userRepository: Repository<UserEntity>,
-    @InjectRepository(WhenCheapWallet)
-    private readonly walletRepository: Repository<WhenCheapWallet>,
     @InjectRepository(SessionAuthorizationEntity)
     private readonly sessionRepository: Repository<SessionAuthorizationEntity>,
     @InjectRepository(IntentEntity)
@@ -143,14 +140,7 @@ export class UserService {
 
   private async resolveUser(identifier: string): Promise<UserEntity> {
     const normalized = identifier.trim();
-    const user =
-      (await this.userRepository.findOne({ where: { identifier: normalized } })) ??
-      (await this.walletRepository
-        .createQueryBuilder('wallet')
-        .leftJoinAndSelect('wallet.user', 'user')
-        .where('LOWER(wallet.walletAddress) = LOWER(:identifier)', { identifier: normalized })
-        .getOne()
-        .then((wallet) => wallet?.user ?? null));
+    const user = await this.userRepository.findOne({ where: { identifier: normalized } });
 
     if (!user) {
       throw new NotFoundException(`User ${identifier} not found`);
